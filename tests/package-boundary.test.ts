@@ -39,9 +39,14 @@ it("has no Vault, S03, bench, report, or automatic-injection production boundary
   expect(text).not.toContain("Planner");
 
   const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8")) as {
+    version: string;
     dependencies: Record<string, string>;
     peerDependencies: Record<string, string>;
     files: string[];
+  };
+  const lock = JSON.parse(await readFile(join(root, "package-lock.json"), "utf8")) as {
+    version: string;
+    packages: Record<string, { version?: string; peerDependencies?: Record<string, string> }>;
   };
   expect(manifest.dependencies).toEqual({
     chokidar: "5.0.0",
@@ -49,6 +54,38 @@ it("has no Vault, S03, bench, report, or automatic-injection production boundary
     minisearch: "7.2.0",
     typescript: "5.9.3",
   });
-  expect(manifest.peerDependencies).not.toHaveProperty("pi-context-vault");
-  expect(manifest.files).not.toContain("tests");
+  const exactPeers = {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    typebox: "1.3.7",
+  };
+  expect(manifest.version).toBe("0.1.0");
+  expect(manifest.peerDependencies).toEqual(exactPeers);
+  expect(lock.version).toBe("0.1.0");
+  expect(lock.packages[""]?.version).toBe("0.1.0");
+  expect(lock.packages[""]?.peerDependencies).toEqual(exactPeers);
+  expect(manifest.files).toEqual([
+    "extensions/index.ts",
+    "src/extension.ts",
+    "src/repo-map/canonical.ts",
+    "src/repo-map/graph.ts",
+    "src/repo-map/index.ts",
+    "src/repo-map/java.ts",
+    "src/repo-map/runtime.ts",
+    "src/repo-map/snapshot.ts",
+    "src/state/atomic.ts",
+    "src/state/config.ts",
+    "src/state/owned-state.ts",
+    "src/state/project-state.ts",
+    "src/telemetry.ts",
+    "docs/MIGRATION.md",
+    "docs/releases/v0.1.0.md",
+    "docs/specs/0005-bounded-repo-map-generations.md",
+    "docs/specs/0006-repo-map-file-outcomes.md",
+    "docs/specs/0007-cached-repo-map-search.md",
+    "docs/specs/0009-turn-start-snapshot-semantics.md",
+    "docs/specs/0016-repository-graph-contract.md",
+    "docs/specs/README.md",
+    "README.md",
+    "LICENSE",
+  ]);
 });

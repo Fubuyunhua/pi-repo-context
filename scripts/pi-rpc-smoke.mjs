@@ -308,15 +308,6 @@ let rpc;
 try {
   selfTestJsonlDecoder();
   if (!npmCli) throw new Error("Pi RPC smoke must run through npm");
-  const globalModules = run(process.execPath, [npmCli, "root", "--global"]).trim();
-  const globalPiRoot = join(globalModules, "@earendil-works", "pi-coding-agent");
-  const globalPiManifest = JSON.parse(readFileSync(join(globalPiRoot, "package.json"), "utf8"));
-  const globalPiCli = join(globalPiRoot, globalPiManifest.bin?.pi ?? "dist/cli.js");
-  if (globalPiManifest.version !== "0.84.1" || !existsSync(globalPiCli)) {
-    throw new Error(`Expected installed global Pi 0.84.1, received ${bounded(globalPiManifest.version, 128)}`);
-  }
-  const version = run(process.execPath, [globalPiCli, "--version"]).trim();
-  if (version !== "0.84.1") throw new Error(`Expected global Pi CLI 0.84.1, received ${bounded(version, 128)}`);
 
   const packageScratch = join(scratch, "package");
   const install = join(scratch, "install");
@@ -351,6 +342,16 @@ try {
   if (existsSync(join(install, "node_modules", "pi-context-vault"))) {
     throw new Error("Pi RPC smoke unexpectedly installed pi-context-vault");
   }
+  const installedPiRoot = join(install, "node_modules", "@earendil-works", "pi-coding-agent");
+  const installedPiManifest = JSON.parse(readFileSync(join(installedPiRoot, "package.json"), "utf8"));
+  const installedPiCli = join(installedPiRoot, installedPiManifest.bin?.pi ?? "dist/cli.js");
+  if (installedPiManifest.version !== "0.84.1" || !existsSync(installedPiCli)) {
+    throw new Error(`Expected smoke-installed Pi 0.84.1, received ${bounded(installedPiManifest.version, 128)}`);
+  }
+  const installedPiVersion = run(process.execPath, [installedPiCli, "--version"], install).trim();
+  if (installedPiVersion !== "0.84.1") {
+    throw new Error(`Expected smoke-installed Pi CLI 0.84.1, received ${bounded(installedPiVersion, 128)}`);
+  }
 
   mkdirSync(join(fixture, "src"), { recursive: true });
   writeFileSync(join(fixture, "src", "dep.ts"), "export const answer = 42;\n");
@@ -380,7 +381,7 @@ try {
   child = spawn(
     process.execPath,
     [
-      globalPiCli,
+      installedPiCli,
       "--mode",
       "rpc",
       "--offline",

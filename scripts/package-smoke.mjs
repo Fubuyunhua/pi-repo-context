@@ -7,6 +7,32 @@ const root = resolve(import.meta.dirname, "..");
 const scratch = mkdtempSync(join(tmpdir(), "pi-repo-context-package-"));
 const npmCli = process.env.npm_execpath;
 const run = (command, args, cwd = root) => execFileSync(command, args, { cwd, encoding: "utf8", stdio: "pipe" });
+const MANIFEST_FILE_ALLOWLIST = [
+  "extensions/index.ts",
+  "src/extension.ts",
+  "src/repo-map/canonical.ts",
+  "src/repo-map/graph.ts",
+  "src/repo-map/index.ts",
+  "src/repo-map/java.ts",
+  "src/repo-map/runtime.ts",
+  "src/repo-map/snapshot.ts",
+  "src/state/atomic.ts",
+  "src/state/config.ts",
+  "src/state/owned-state.ts",
+  "src/state/project-state.ts",
+  "src/telemetry.ts",
+  "docs/MIGRATION.md",
+  "docs/releases/v0.1.0.md",
+  "docs/specs/0005-bounded-repo-map-generations.md",
+  "docs/specs/0006-repo-map-file-outcomes.md",
+  "docs/specs/0007-cached-repo-map-search.md",
+  "docs/specs/0009-turn-start-snapshot-semantics.md",
+  "docs/specs/0016-repository-graph-contract.md",
+  "docs/specs/README.md",
+  "README.md",
+  "LICENSE",
+];
+const PACKED_FILE_ALLOWLIST = [...MANIFEST_FILE_ALLOWLIST, "package.json"].sort();
 
 function assertDependencyAbsent(tree, forbidden) {
   const visit = (node, ancestry) => {
@@ -23,28 +49,11 @@ function assertDependencyAbsent(tree, forbidden) {
 try {
   if (!npmCli) throw new Error("package smoke must run through npm");
   const packed = JSON.parse(run(process.execPath, [npmCli, "pack", "--json", "--pack-destination", scratch]))[0];
-  const files = new Set(packed.files.map((entry) => entry.path));
-  for (const required of [
-    "extensions/index.ts",
-    "src/extension.ts",
-    "src/repo-map/index.ts",
-    "src/repo-map/graph.ts",
-    "src/repo-map/snapshot.ts",
-    "docs/specs/0016-repository-graph-contract.md",
-    "README.md",
-    "LICENSE",
-  ])
-    if (!files.has(required)) throw new Error(`packed artifact missing ${required}`);
-  for (const forbidden of [
-    "src/artifacts/",
-    "src/observations/",
-    "src/context/",
-    "src/bench/",
-    "src/repo-context/",
-    "tests/",
-    "docs/reports/",
-  ]) {
-    if ([...files].some((file) => file.startsWith(forbidden))) throw new Error(`packed artifact includes ${forbidden}`);
+  const packedFiles = packed.files.map((entry) => entry.path).sort();
+  if (JSON.stringify(packedFiles) !== JSON.stringify(PACKED_FILE_ALLOWLIST)) {
+    throw new Error(
+      `packed file allowlist mismatch\nexpected=${JSON.stringify(PACKED_FILE_ALLOWLIST)}\nactual=${JSON.stringify(packedFiles)}`,
+    );
   }
   const install = join(scratch, "install");
   mkdirSync(install, { recursive: true });
@@ -70,6 +79,11 @@ try {
   const manifest = JSON.parse(readFileSync(join(packedRoot, "package.json"), "utf8"));
   if (manifest.name !== "pi-repo-context" || manifest.version !== "0.1.0")
     throw new Error("installed package identity mismatch");
+  if (JSON.stringify([...manifest.files].sort()) !== JSON.stringify([...MANIFEST_FILE_ALLOWLIST].sort()))
+    throw new Error("installed package manifest file allowlist mismatch");
+  const expectedPeers = { "@earendil-works/pi-coding-agent": "0.84.1", typebox: "1.3.7" };
+  if (JSON.stringify(manifest.peerDependencies) !== JSON.stringify(expectedPeers))
+    throw new Error(`installed package peer mismatch: ${JSON.stringify(manifest.peerDependencies)}`);
   if (existsSync(join(install, "node_modules", "pi-context-vault")))
     throw new Error("package smoke unexpectedly installed pi-context-vault");
 

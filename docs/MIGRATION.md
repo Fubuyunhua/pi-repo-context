@@ -1,18 +1,20 @@
 # Migration from the pre-split Context Vault repository map
 
-This document describes the approved split transition. It does not claim that the separate Phase 5 cleanup
-of `pi-context-vault` has already shipped.
+This document describes the current **release-candidate boundary**. Repo Context `0.1.0` and the observation-only
+Context Vault `0.3.0` candidate are unpublished; neither split release is claimed to exist until its reviewed immutable
+tag exists.
 
-## Safe coexistence during migration
+## Safe transition
 
-A pre-split Context Vault monolith and Repo Context must not both run repository-map watchers or own the
-legacy Tool in the same session. Before installing/enabling Repo Context beside the monolith:
+A pre-split Context Vault monolith and Repo Context must not both own repository-map Tools or run repository watchers in
+the same session. Before starting Repo Context beside or instead of the monolith:
 
 1. Set `repoMapEnabled` to `false` and `mapInjectionMode` to `"off"` in `.pi/context-vault.json`.
-2. Restart Pi into a new session.
+2. Stop the old session and restart Pi into a new session.
 3. Configure Repo Context independently in `.pi/repo-context.json`.
 
-Repo Context never reads the old config file and provides no automatic context injection.
+Do not treat disabling only one setting, hot-loading the split plugin, or retaining the old session as safe coexistence.
+Repo Context is Tool-first and provides no automatic context injection.
 
 ## Configuration mapping
 
@@ -27,6 +29,19 @@ Repo Context never reads the old config file and provides no automatic context i
 
 `mapInjectionMode` has no Repo Context equivalent.
 
+## Candidate ownership boundary
+
+Repo Context owns `repo_context_search`, `repo_context_status`, `/repo-context status|rebuild|doctor`, and the
+deprecated `context_vault_repo_map` `0.1.x` alias. The alias is planned for removal in Repo Context `0.2.0`.
+
+The observation-only Context Vault `0.3.0` candidate owns `/context-vault rebuild` as a non-executing migration stub
+that directs users to `/repo-context rebuild`. Its `/context-vault gc` collects only Vault artifacts, metadata, and
+leases; it does not collect Repo Context or legacy Repo Map state. These statements describe local candidates, not
+published split releases. Check an installed pre-split Vault's own documentation rather than assuming the candidate
+boundary applies to it.
+
+Neither candidate defines a cross-plugin API or runtime dependency.
+
 ## State and cold rebuild
 
 Repo Context writes only below:
@@ -35,33 +50,15 @@ Repo Context writes only below:
 ${PI_CODING_AGENT_DIR}/pi-repo-context/projects/<projectId>/repo-map
 ```
 
-It never reads, adopts, moves, prunes, or deletes the legacy derived state below the Context Vault root. Its
-first startup cold-builds from source. Observation artifacts and metadata remain entirely owned by Context
-Vault.
-
-## Tools and commands
-
-Use `repo_context_search`, `repo_context_status`, and `/repo-context status|rebuild|doctor`.
-`context_vault_repo_map` is a deprecated Repo Context 0.1.x alias planned for removal in 0.2.0.
-
-The approved future post-split Context Vault compatibility release will make `/context-vault rebuild` a
-non-executing migration stub with this response:
-
-```text
-Repository rebuild has moved to pi-repo-context.
-Install pi-repo-context and use /repo-context rebuild.
-```
-
-That Vault-side change belongs to Phase 5 and is **not implemented by Repo Context Phase 3**. Likewise, the
-approved future `/context-vault gc` will collect only Vault artifacts/metadata/leases; until Vault Phase 5 is
-implemented, consult the installed Vault version rather than assuming that changed scope.
+It never reads, adopts, moves, prunes, or deletes legacy derived state below the Context Vault root. Its first startup
+cold-builds from repository source. Observation artifacts and metadata remain entirely owned by Context Vault. Keep
+both state roots during migration and rollback.
 
 ## Rollback
 
-1. Stop, disable, or uninstall Repo Context without deleting its state.
+1. Stop and disable Repo Context without deleting its state.
 2. Restart Pi.
-3. If required, re-enable the pre-split monolith's repository settings in `.pi/context-vault.json`.
-4. Restart Pi again before using the legacy Tool/watcher.
+3. If repository behavior must be restored, use the reviewed pre-split monolith, re-enable its repository settings,
+   and restart Pi again before using its Tool or watcher.
 
-No state conversion is required because the roots never overlap. Rollback must not delete either state root
-or any Observation artifact.
+No state conversion or deletion is required because the roots do not overlap.

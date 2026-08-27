@@ -23,3 +23,5 @@ jobs:
         run: npm run test:coverage
       - if: matrix.os == 'ubuntu-latest' && matrix.node == 24
         run: npm run test:package
+      - if: matrix.os == 'ubuntu-latest' && matrix.node == 24
+        run: npm run test:pi

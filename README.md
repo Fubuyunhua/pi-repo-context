@@ -8,11 +8,24 @@ It is independent of `pi-context-vault` and does not require that package to be 
 
 ## Install
 
+**Release candidate / unpublished:** no `v0.1.0` tag or release is claimed to exist. After an immutable, reviewed
+`v0.1.0` tag exists, the release install command will be:
+
 ```bash
-pi install git:github.com/Fubuyunhua/pi-repo-context
+pi install git:github.com/Fubuyunhua/pi-repo-context@v0.1.0
 ```
 
-The first release is Tool-first. It performs **no automatic repository-context injection**.
+Do not use that command as release evidence before the tag exists. For local development instead:
+
+```bash
+git clone https://github.com/Fubuyunhua/pi-repo-context.git
+cd pi-repo-context
+npm ci
+pi -e ./extensions/index.ts
+```
+
+The `0.1.0` candidate is Tool-first. It performs **no automatic repository-context injection**. See the
+[unpublished release-candidate note](docs/releases/v0.1.0.md).
 
 ## Tools
 
@@ -87,13 +100,12 @@ paths and checks again around operations, but does not claim to protect against 
 ancestor-rename race.
 
 Before running this plugin beside a pre-split Context Vault monolith, set `repoMapEnabled:false` and
-`mapInjectionMode:"off"` in the legacy configuration and restart Pi. See
-[`docs/MIGRATION.md`](docs/MIGRATION.md) for exact coexistence, cold-rebuild, rollback, future Vault rebuild
-stub, and Vault-GC scope notes. Vault-side Phase 5 changes described there are not implemented by this plugin.
+`mapInjectionMode:"off"` in the legacy configuration and restart Pi. See [`docs/MIGRATION.md`](docs/MIGRATION.md) for the exact coexistence, cold-rebuild, ownership, and rollback
+boundary with the observation-only Vault `0.3.0` candidate.
 
 ## Scope
 
-This release does not implement Planner, deterministic context Renderer, Projection Cache, semantic
+This release candidate does not implement Planner, deterministic context Renderer, Projection Cache, semantic
 `repo_context` graph expansion, Provider experiments, automatic capsules, or cross-plugin APIs.
 Repository Graph v1 remains derived and in memory.
 
@@ -105,6 +117,7 @@ npm run check
 npm test
 npm run test:watcher
 npm run test:package
+npm run test:pi
 npm run test:coverage
 ```
 
