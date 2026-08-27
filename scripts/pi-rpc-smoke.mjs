@@ -2,12 +2,14 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -43,6 +45,21 @@ function safePiEnvironment(agentRoot, homeRoot) {
     PI_OFFLINE: "1",
     NO_COLOR: "1",
   };
+}
+
+function treeDigest(rootPath) {
+  const digest = createHash("sha256");
+  const visit = (path) => {
+    for (const name of readdirSync(path).sort()) {
+      const child = join(path, name);
+      const info = lstatSync(child);
+      digest.update(`${child.slice(rootPath.length)}\0${info.mode}\0${info.size}\0`);
+      if (info.isDirectory()) visit(child);
+      else digest.update(readFileSync(child));
+    }
+  };
+  visit(rootPath);
+  return digest.digest("hex");
 }
 
 function assertDependencyAbsent(tree, forbidden) {
@@ -304,9 +321,13 @@ try {
   const packageScratch = join(scratch, "package");
   const install = join(scratch, "install");
   const fixture = join(scratch, "fixture");
-  const agentRoot = join(scratch, "agent");
+  const physicalAgentRoot = join(scratch, "physical-agent");
+  const agentRoot = join(scratch, "agent-link");
   const homeRoot = join(scratch, "home");
-  for (const path of [packageScratch, install, fixture, agentRoot, homeRoot]) mkdirSync(path, { recursive: true });
+  for (const path of [packageScratch, install, fixture, physicalAgentRoot, homeRoot]) {
+    mkdirSync(path, { recursive: true });
+  }
+  symlinkSync(physicalAgentRoot, agentRoot, process.platform === "win32" ? "junction" : "dir");
   writeFileSync(join(install, "package.json"), '{"name":"repo-context-rpc-smoke","private":true}\n');
 
   const packed = JSON.parse(run(process.execPath, [npmCli, "pack", "--json", "--pack-destination", packageScratch]))[0];
@@ -342,6 +363,18 @@ try {
     join(fixture, ".pi", "repo-context.json"),
     `${JSON.stringify({ enabled: true, debounceMs: 20, generationRetention: 2, quotaBytes: 8 * 1024 * 1024 }, null, 2)}\n`,
   );
+
+  const projectRoot = realpathSync(fixture);
+  const projectId = createHash("sha256").update(projectRoot).digest("hex").slice(0, 32);
+  const vaultRoot = join(physicalAgentRoot, "context-vault");
+  const vaultArtifacts = join(vaultRoot, "artifacts");
+  const vaultMetadata = join(vaultRoot, "metadata");
+  const legacyMap = join(vaultRoot, "projects", projectId, "repo-map");
+  for (const target of [vaultArtifacts, vaultMetadata, legacyMap]) {
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, "byte-seeded-vault-sentinel.bin"), Buffer.from([0, 255, 86, 65, 85, 76, 84, 10]));
+  }
+  const vaultBefore = treeDigest(vaultRoot);
 
   const extensionPath = join(install, "node_modules", "pi-repo-context", "extensions", "index.ts");
   child = spawn(
@@ -411,8 +444,6 @@ try {
   }
   assertHealthyStatus(doctor.repoContext, "doctor Repo Context status");
 
-  const projectRoot = realpathSync(fixture);
-  const projectId = createHash("sha256").update(projectRoot).digest("hex").slice(0, 32);
   const mapRoot = join(agentRoot, "pi-repo-context", "projects", projectId, "repo-map");
   const activePath = join(mapRoot, "active.json");
   if (!existsSync(activePath)) throw new Error("Pi Repo Context did not create its new-root active generation");
@@ -421,8 +452,9 @@ try {
   if (!Number.isSafeInteger(active.generation) || generations.length === 0) {
     throw new Error("Pi Repo Context new-root generation is incomplete");
   }
-  if (existsSync(join(agentRoot, "context-vault")))
-    throw new Error("Pi Repo Context accessed the legacy Context Vault root");
+  if (treeDigest(vaultRoot) !== vaultBefore) {
+    throw new Error("Pi Repo Context mutated byte-seeded Context Vault artifacts, metadata, or legacy Repo Map state");
+  }
 
   child.stdin.end();
   const exit = await rpc.waitForClose();

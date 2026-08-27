@@ -70,6 +70,22 @@ Legacy Repo Map generations below the Context Vault state root are not read, mov
 The first run cold-builds from source with generator provenance `pi-repo-context` / `0.1.0` while keeping
 persisted structural schema version 1.
 
+### State isolation
+
+`PI_CODING_AGENT_DIR` is the trusted boundary and may itself be a symlink. Repo Context resolves that boundary
+once, creates and uses only canonical owned-component paths beneath the captured target, and records separate
+canonical path and device/inode identities for `pi-repo-context`, `projects`, the project ID, `repo-map`, and
+`generations`. Repointing the configured symlink cannot redirect later state work. Every state operation revalidates those identities and rejects
+static or post-start symlink/non-directory replacements. Active pointers, generation snapshots, and lock
+entries must have their expected entry type; state-file reads use no-follow regular-file handles where the
+platform supports them, and writes use checked atomic replacement.
+
+Node does not expose a portable `openat`/directory-relative filesystem API. A same-account or privileged process
+able to rename a canonical owned ancestor in the interval between identity validation and a path-based operation
+therefore retains a very narrow TOCTOU opportunity. Repo Context closes ordinary static and post-start replacement
+paths and checks again around operations, but does not claim to protect against that same-account/privileged
+ancestor-rename race.
+
 Before running this plugin beside a pre-split Context Vault monolith, set `repoMapEnabled:false` and
 `mapInjectionMode:"off"` in the legacy configuration and restart Pi. See
 [`docs/MIGRATION.md`](docs/MIGRATION.md) for exact coexistence, cold-rebuild, rollback, future Vault rebuild

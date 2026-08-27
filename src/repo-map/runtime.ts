@@ -1,10 +1,19 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readdir, readFile, realpath, stat, unlink } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import chokidar, { type FSWatcher } from "chokidar";
-import { atomicWriteFile, withFileLock } from "../state/atomic.js";
+import { withFileLock } from "../state/atomic.js";
+import {
+  inspectRegularFile,
+  type RegularFileIdentity,
+  RepoStateBoundary,
+  readOwnedRegularFile,
+  unlinkOwnedRegularFile,
+  validateOwnedWriteTarget,
+  writeOwnedAtomicFile,
+} from "../state/owned-state.js";
 import type { Telemetry } from "../telemetry.js";
 import {
   buildRepoMap,
@@ -107,7 +116,8 @@ export interface RepoMapRuntimeOptions {
   watch?: boolean;
   watcherFactory?: (root: string) => RepoMapWatcher;
   scheduler?: RepoMapScheduler;
-  atomicWriter?: typeof atomicWriteFile;
+  /** Test-only fault/concurrency hook invoked before the hardened state writer. */
+  beforeStateWrite?: (path: string, content: string | Uint8Array) => Promise<void>;
   /** Injectable file operations used by incremental indexing. */
   indexFileSystem?: RepoMapFileSystem;
   /** Injectable Git subprocess dependency used by deterministic telemetry tests. */
@@ -488,6 +498,7 @@ interface GenerationFile {
   generation: number;
   path: string;
   bytes: number;
+  identity: RegularFileIdentity;
 }
 
 interface CachedFileOutcome {
@@ -515,7 +526,7 @@ export class RepoMapRuntime {
   > &
     RepoMapRuntimeOptions;
   readonly #scheduler: RepoMapScheduler;
-  readonly #atomicWriter: typeof atomicWriteFile;
+  readonly #beforeStateWrite?: (path: string, content: string | Uint8Array) => Promise<void>;
   readonly #telemetry?: Telemetry;
   readonly #monotonicNow: () => number;
   readonly #gitRunner: RepoMapGitRunner;
@@ -547,6 +558,7 @@ export class RepoMapRuntime {
   #flushChain: Promise<void> = Promise.resolve();
   #baseBuildFailed = false;
   #checkpointPublicationFailed = false;
+  #stateBoundary?: RepoStateBoundary;
   readonly #checkpoints = new RepositoryCheckpointStore();
 
   constructor(options: RepoMapRuntimeOptions) {
@@ -570,7 +582,7 @@ export class RepoMapRuntime {
       watch: options.watch ?? true,
     };
     this.#scheduler = options.scheduler ?? defaultScheduler;
-    this.#atomicWriter = options.atomicWriter ?? atomicWriteFile;
+    this.#beforeStateWrite = options.beforeStateWrite;
     this.#telemetry = options.telemetry;
     this.#monotonicNow = options.monotonicNow ?? performance.now.bind(performance);
     this.#gitRunner = options.gitRunner ?? defaultGitRunner;
@@ -580,7 +592,8 @@ export class RepoMapRuntime {
 
   async start(): Promise<void> {
     this.#projectRoot = await realpath(resolve(this.#options.projectRoot));
-    await mkdir(this.#options.stateRoot, { recursive: true, mode: 0o700 });
+    this.#stateBoundary = await RepoStateBoundary.create(this.#options.stateRoot);
+    await this.#assertStateBoundary();
     await this.#reconcileGenerationBytes();
     await this.#hydratePriorGeneration();
     if (this.#options.watch) {
@@ -596,6 +609,12 @@ export class RepoMapRuntime {
   }
 
   notify(event: RepoMapChangeEvent, changedPath: string): void {
+    try {
+      this.#assertStateBoundarySync();
+    } catch (error) {
+      this.#degrade(error);
+      return;
+    }
     const path = slash(isAbsolute(changedPath) ? relative(this.#projectRoot, changedPath) : changedPath);
     if (!path || path.startsWith("../") || isRepoMapPathExcluded(path, this.#options.exclude)) return;
     this.#pending.add(path);
@@ -652,6 +671,7 @@ export class RepoMapRuntime {
   }
 
   async #flush(): Promise<void> {
+    await this.#assertStateBoundary();
     if (this.#scheduled !== undefined) {
       this.#scheduler.cancel(this.#scheduled);
       this.#scheduled = undefined;
@@ -710,12 +730,18 @@ export class RepoMapRuntime {
   }
 
   captureCurrent(): RepositorySnapshotHandle {
+    try {
+      this.#assertStateBoundarySync();
+    } catch {
+      throw new RepositorySnapshotUnavailableError("ensure-fresh-failed");
+    }
     return this.#checkpoints.captureCurrent();
   }
 
   /** Rebuild the base snapshot and atomically activate it as a new generation. */
   async rebuild(): Promise<void> {
     const operation = this.#flushChain.then(async () => {
+      await this.#assertStateBoundary();
       await this.#rebuildBase();
       await this.#flush();
       this.#publishCheckpoint();
@@ -754,7 +780,8 @@ export class RepoMapRuntime {
     options: RepoMapQueryOptions,
     liveFallback: boolean,
   ): Promise<RepoMapRuntimeQuery> {
-    // Capture all query-visible state before the first await. Automatic
+    await this.#assertStateBoundary();
+    // Capture all query-visible state only after the state boundary check. Automatic
     // queryCurrent calls derive fallback excerpts only from this indexed
     // snapshot; explicit live queries may additionally read source/Git bytes.
     const files = this.#effective?.files ?? [];
@@ -842,6 +869,11 @@ export class RepoMapRuntime {
     dirtyFiles: string[];
     maintenance?: RepoMapMaintenanceResult | { error: string };
   } {
+    try {
+      this.#assertStateBoundarySync();
+    } catch (error) {
+      this.#degrade(error);
+    }
     return {
       freshness: this.#freshness,
       generation: this.#generation,
@@ -856,10 +888,16 @@ export class RepoMapRuntime {
 
   async maintenance(): Promise<RepoMapMaintenanceResult> {
     try {
-      const result = await withFileLock(join(this.#options.stateRoot, "activation.lock"), async () => {
-        const active = await loadActiveRepoMapGeneration(this.#options.stateRoot);
-        return this.#pruneUnlocked(active.generation);
-      });
+      await this.#assertStateBoundary();
+      const result = await withFileLock(
+        join(this.#boundary().stateRoot, "activation.lock"),
+        async () => {
+          await this.#assertStateBoundary();
+          const active = await this.#loadActiveGeneration();
+          return this.#pruneUnlocked(active.generation);
+        },
+        { guard: () => this.#assertStateBoundary(), rejectUnsafeTarget: true },
+      );
       this.#maintenance = result;
       return result;
     } catch (error) {
@@ -875,6 +913,8 @@ export class RepoMapRuntime {
     this.#scheduled = undefined;
     await this.#watcher?.close();
     this.#watcher = undefined;
+    if (!this.#stateBoundary) return;
+    await this.#assertStateBoundary();
     await this.flush();
   }
 
@@ -1071,9 +1111,10 @@ export class RepoMapRuntime {
   }
 
   async #hydratePriorGeneration(): Promise<void> {
+    await this.#assertStateBoundary();
     let active: RepoMapGeneration;
     try {
-      active = await loadActiveRepoMapGeneration(this.#options.stateRoot);
+      active = await this.#loadActiveGeneration();
     } catch {
       // Rebuild remains authoritative when there is no valid persisted prior.
       return;
@@ -1147,6 +1188,7 @@ export class RepoMapRuntime {
   }
 
   async #rebuildBase(): Promise<boolean> {
+    await this.#assertStateBoundary();
     // Build into detached local state first. A builder failure must not replace
     // hydrated or previously published content with an incomplete rebuild.
     const previousBase = this.#base;
@@ -1223,63 +1265,70 @@ export class RepoMapRuntime {
 
   async #activate(): Promise<void> {
     if (!this.#effective) throw new Error("repository map is unavailable");
-    await withFileLock(join(this.#options.stateRoot, "activation.lock"), async () => {
-      let active: RepoMapGeneration | undefined;
-      try {
-        active = await loadActiveRepoMapGeneration(this.#options.stateRoot);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-      const files = await this.#listGenerationFiles();
-      const candidateGeneration =
-        Math.max(this.#generation, active?.generation ?? 0, ...files.map((file) => file.generation)) + 1;
-      const candidate: RepoMapGeneration = {
-        schemaVersion: 1,
-        generation: candidateGeneration,
-        gitHead: this.#head,
-        dirtyFiles: [...this.#dirty]
-          .sort(([left], [right]) => left.localeCompare(right))
-          .map(([path, contentHash]) => ({ path, contentHash })),
-        workspaceRevision: revision(this.#head, this.#dirty),
-        freshness: this.#freshness,
-        pendingFiles: [...this.#pending].sort(),
-        snapshot: this.#effective as RepoMapSnapshot,
-        activatedAt: (this.#options.now ?? (() => new Date()))().toISOString(),
-      };
-      if (active && semanticGeneration(active) === semanticGeneration(candidate)) {
-        this.#generation = active.generation;
-        await this.#maintainUnlockedNonFatal();
-        return;
-      }
+    await this.#assertStateBoundary();
+    await withFileLock(
+      join(this.#boundary().stateRoot, "activation.lock"),
+      async () => {
+        await this.#assertStateBoundary();
+        let active: RepoMapGeneration | undefined;
+        try {
+          active = await this.#loadActiveGeneration();
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        const files = await this.#listGenerationFiles();
+        const candidateGeneration =
+          Math.max(this.#generation, active?.generation ?? 0, ...files.map((file) => file.generation)) + 1;
+        const candidate: RepoMapGeneration = {
+          schemaVersion: 1,
+          generation: candidateGeneration,
+          gitHead: this.#head,
+          dirtyFiles: [...this.#dirty]
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([path, contentHash]) => ({ path, contentHash })),
+          workspaceRevision: revision(this.#head, this.#dirty),
+          freshness: this.#freshness,
+          pendingFiles: [...this.#pending].sort(),
+          snapshot: this.#effective as RepoMapSnapshot,
+          activatedAt: (this.#options.now ?? (() => new Date()))().toISOString(),
+        };
+        if (active && semanticGeneration(active) === semanticGeneration(candidate)) {
+          this.#generation = active.generation;
+          await this.#maintainUnlockedNonFatal();
+          return;
+        }
 
-      const generationPath = join(this.#options.stateRoot, "generations", `${candidateGeneration}.json`);
-      const serialized = `${JSON.stringify(candidate)}\n`;
-      const generationBytes = Buffer.byteLength(serialized, "utf8");
-      const writeStartedAt = monotonicReading(this.#monotonicNow);
-      try {
-        await this.#atomicWriter(generationPath, serialized);
-        recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordGenerationFileWritten(generationBytes));
-        await this.#atomicWriter(
-          join(this.#options.stateRoot, "active.json"),
-          `${JSON.stringify({
-            generation: candidateGeneration,
-            path: slash(relative(this.#options.stateRoot, generationPath)),
-          })}\n`,
-        );
-        recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordGenerationActivated());
-      } finally {
-        recordTelemetry(this.#telemetry, (telemetry) =>
-          telemetry.recordGenerationWrite(monotonicDuration(this.#monotonicNow, writeStartedAt)),
-        );
-      }
-      this.#generation = candidateGeneration;
-      await this.#maintainUnlockedNonFatal();
-    });
+        const generationPath = join(this.#boundary().generationsRoot, `${candidateGeneration}.json`);
+        const serialized = `${JSON.stringify(candidate)}\n`;
+        const generationBytes = Buffer.byteLength(serialized, "utf8");
+        const writeStartedAt = monotonicReading(this.#monotonicNow);
+        try {
+          await this.#writeStateFile(generationPath, serialized);
+          recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordGenerationFileWritten(generationBytes));
+          await this.#writeStateFile(
+            join(this.#boundary().stateRoot, "active.json"),
+            `${JSON.stringify({
+              generation: candidateGeneration,
+              path: slash(relative(this.#boundary().stateRoot, generationPath)),
+            })}\n`,
+          );
+          recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordGenerationActivated());
+        } finally {
+          recordTelemetry(this.#telemetry, (telemetry) =>
+            telemetry.recordGenerationWrite(monotonicDuration(this.#monotonicNow, writeStartedAt)),
+          );
+        }
+        this.#generation = candidateGeneration;
+        await this.#maintainUnlockedNonFatal();
+      },
+      { guard: () => this.#assertStateBoundary(), rejectUnsafeTarget: true },
+    );
   }
 
   async #maintainUnlockedNonFatal(): Promise<void> {
     try {
-      const active = await loadActiveRepoMapGeneration(this.#options.stateRoot);
+      await this.#assertStateBoundary();
+      const active = await this.#loadActiveGeneration();
       this.#maintenance = await this.#pruneUnlocked(active.generation);
     } catch (error) {
       this.#maintenance = { error: error instanceof Error ? error.message : String(error) };
@@ -1299,7 +1348,8 @@ export class RepoMapRuntime {
   }
 
   async #listGenerationFiles(): Promise<GenerationFile[]> {
-    const generationsRoot = join(this.#options.stateRoot, "generations");
+    await this.#assertStateBoundary();
+    const generationsRoot = this.#boundary().generationsRoot;
     let names: string[];
     try {
       names = await readdir(generationsRoot);
@@ -1314,9 +1364,10 @@ export class RepoMapRuntime {
       const generation = Number(match[1]);
       if (!Number.isSafeInteger(generation) || generation <= 0) continue;
       const path = join(generationsRoot, name);
-      const info = await stat(path);
-      if (info.isFile()) files.push({ generation, path, bytes: info.size });
+      const identity = await inspectRegularFile(this.#boundary(), path);
+      files.push({ generation, path, bytes: Number(identity.size), identity });
     }
+    await this.#assertStateBoundary();
     return files.sort((left, right) => left.generation - right.generation);
   }
 
@@ -1346,7 +1397,7 @@ export class RepoMapRuntime {
     const remove = async (file: GenerationFile): Promise<void> => {
       if (file.generation === activeGeneration) return;
       try {
-        await unlink(file.path);
+        await unlinkOwnedRegularFile(this.#boundary(), file.path, file.identity);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
@@ -1381,6 +1432,30 @@ export class RepoMapRuntime {
     };
   }
 
+  #boundary(): RepoStateBoundary {
+    if (!this.#stateBoundary) throw new Error("Repo Context state boundary is not initialized");
+    return this.#stateBoundary;
+  }
+
+  async #assertStateBoundary(): Promise<void> {
+    await this.#boundary().validate();
+  }
+
+  #assertStateBoundarySync(): void {
+    this.#boundary().validateSync();
+  }
+
+  async #loadActiveGeneration(): Promise<RepoMapGeneration> {
+    return loadActiveRepoMapGenerationWithBoundary(this.#boundary());
+  }
+
+  async #writeStateFile(path: string, content: string | Uint8Array): Promise<void> {
+    const boundary = this.#boundary();
+    await validateOwnedWriteTarget(boundary, path);
+    await this.#beforeStateWrite?.(path, content);
+    await writeOwnedAtomicFile(boundary, path, content);
+  }
+
   #degrade(error: unknown): void {
     recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordMaintenanceFailure());
     this.#freshness = "stale";
@@ -1389,9 +1464,15 @@ export class RepoMapRuntime {
 }
 
 export async function loadActiveRepoMapGeneration(stateRoot: string): Promise<RepoMapGeneration> {
-  const pointer = await readActivePointer(stateRoot);
-  const generationPath = resolve(stateRoot, pointer.path);
-  const serialized = await readFile(generationPath, "utf8");
+  const boundary = await RepoStateBoundary.captureExisting(stateRoot);
+  return loadActiveRepoMapGenerationWithBoundary(boundary);
+}
+
+async function loadActiveRepoMapGenerationWithBoundary(boundary: RepoStateBoundary): Promise<RepoMapGeneration> {
+  await boundary.validate();
+  const pointer = await readActivePointer(boundary);
+  const generationPath = resolve(boundary.stateRoot, pointer.path);
+  const serialized = (await readOwnedRegularFile(boundary, generationPath)).toString("utf8");
   let value: unknown;
   try {
     value = JSON.parse(serialized);
@@ -1399,6 +1480,7 @@ export async function loadActiveRepoMapGeneration(stateRoot: string): Promise<Re
     throw new Error(INVALID_GENERATION_MESSAGE);
   }
   if (!isRepoMapGeneration(value, pointer.generation)) throw new Error(INVALID_GENERATION_MESSAGE);
+  await boundary.validate();
   return value;
 }
 
@@ -1407,8 +1489,9 @@ interface ActiveGenerationPointer {
   path: string;
 }
 
-async function readActivePointer(stateRoot: string): Promise<ActiveGenerationPointer> {
-  const serialized = await readFile(join(stateRoot, "active.json"), "utf8");
+async function readActivePointer(boundary: RepoStateBoundary): Promise<ActiveGenerationPointer> {
+  const stateRoot = boundary.stateRoot;
+  const serialized = (await readOwnedRegularFile(boundary, join(stateRoot, "active.json"))).toString("utf8");
   let pointer: unknown;
   try {
     pointer = JSON.parse(serialized);

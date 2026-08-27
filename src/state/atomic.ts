@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { type BigIntStats, constants } from "node:fs";
-import { lstat, mkdir, open, readdir, rename, rmdir, unlink, utimes } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, rename, rmdir, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -32,6 +32,10 @@ interface LockOwnerMetadata {
 interface PreparedLock {
   directory: string;
   ownerFilename: string;
+  directoryDev: bigint;
+  directoryIno: bigint;
+  ownerDev: bigint;
+  ownerIno: bigint;
 }
 
 type OwnerRecordRead =
@@ -117,6 +121,10 @@ export interface FileLockOptions {
   retryMs?: number;
   staleMs?: number;
   timeoutMs?: number;
+  /** Revalidates the caller-owned directory boundary around every lock phase. */
+  guard?: () => Promise<void>;
+  /** Product-owned lock targets reject unexpected fixed entries immediately. */
+  rejectUnsafeTarget?: boolean;
 }
 
 function encodeOwner(metadata: LockOwnerMetadata): string {
@@ -154,6 +162,10 @@ async function prepareLock(path: string, owner: string): Promise<PreparedLock> {
   const ownerFilename = `owner-${owner}.json`;
   const ownerPath = join(directory, ownerFilename);
   await mkdir(directory, { mode: 0o700 });
+  const directoryInfo = await lstat(directory, { bigint: true });
+  if (directoryInfo.isSymbolicLink() || !directoryInfo.isDirectory()) {
+    throw new Error(`Unsafe prepared state lock directory: ${directory}`);
+  }
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     handle = await open(ownerPath, "wx", 0o600);
@@ -167,10 +179,19 @@ async function prepareLock(path: string, owner: string): Promise<PreparedLock> {
       }),
     );
     await handle.sync();
+    const ownerInfo = await handle.stat({ bigint: true });
+    if (!ownerInfo.isFile()) throw new Error(`Unsafe state lock owner file: ${ownerPath}`);
     await handle.close();
     handle = undefined;
     await syncDirectory(directory);
-    return { directory, ownerFilename };
+    return {
+      directory,
+      ownerFilename,
+      directoryDev: directoryInfo.dev,
+      directoryIno: directoryInfo.ino,
+      ownerDev: ownerInfo.dev,
+      ownerIno: ownerInfo.ino,
+    };
   } catch (error) {
     await handle?.close().catch(() => undefined);
     await unlink(ownerPath).catch(() => undefined);
@@ -398,9 +419,55 @@ function isRenameContention(error: unknown): boolean {
   return errorCode(error) === "EPERM" || errorCode(error) === "ENOTDIR";
 }
 
-async function releaseOwnedLock(path: string, ownerFilename: string): Promise<void> {
+async function assertOwnedLock(path: string, prepared: PreparedLock): Promise<void> {
+  let directory: BigIntStats;
   try {
-    await unlink(join(path, ownerFilename));
+    directory = await lstat(path, { bigint: true });
+  } catch {
+    throw new Error(`State lock directory identity changed: ${path}`);
+  }
+  if (
+    directory.isSymbolicLink() ||
+    !directory.isDirectory() ||
+    directory.dev !== prepared.directoryDev ||
+    directory.ino !== prepared.directoryIno
+  ) {
+    throw new Error(`State lock directory identity changed: ${path}`);
+  }
+  const ownerPath = join(path, prepared.ownerFilename);
+  let owner: BigIntStats;
+  try {
+    owner = await lstat(ownerPath, { bigint: true });
+  } catch {
+    throw new Error(`State lock owner identity changed: ${ownerPath}`);
+  }
+  if (owner.isSymbolicLink() || !owner.isFile() || owner.dev !== prepared.ownerDev || owner.ino !== prepared.ownerIno) {
+    throw new Error(`State lock owner identity changed: ${ownerPath}`);
+  }
+}
+
+async function heartbeatOwnedLock(path: string, prepared: PreparedLock): Promise<void> {
+  await assertOwnedLock(path, prepared);
+  const ownerPath = join(path, prepared.ownerFilename);
+  let flags = constants.O_RDONLY;
+  if (process.platform !== "win32" && typeof constants.O_NOFOLLOW === "number") flags |= constants.O_NOFOLLOW;
+  const handle = await open(ownerPath, flags);
+  try {
+    const owner = await handle.stat({ bigint: true });
+    if (!owner.isFile() || owner.dev !== prepared.ownerDev || owner.ino !== prepared.ownerIno) {
+      throw new Error(`State lock owner identity changed: ${ownerPath}`);
+    }
+    const now = new Date();
+    await handle.utimes(now, now);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function releaseOwnedLock(path: string, prepared: PreparedLock): Promise<void> {
+  await assertOwnedLock(path, prepared);
+  try {
+    await unlink(join(path, prepared.ownerFilename));
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error;
   }
@@ -437,8 +504,11 @@ export async function withFileLock<T>(
 
   const startedAt = Date.now();
   const owner = randomUUID();
+  await options.guard?.();
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await options.guard?.();
   await cleanAbandonedPreparations(path).catch(() => undefined);
+  await options.guard?.();
   const prepared = await prepareLock(path, owner);
   const waitForRetry = async (): Promise<void> => {
     if (Date.now() - startedAt >= timeoutMs) throw new Error(`Timed out waiting for state lock: ${path}`);
@@ -447,18 +517,25 @@ export async function withFileLock<T>(
 
   try {
     while (true) {
+      await options.guard?.();
       const target = await inspectFixedLockTarget(path);
       if (target !== "missing") {
         // Never pass an existing fixed target to rename: on Windows, rename can
         // replace a legacy file. Directories are ordinary contention; every
         // other object (including symlinks) remains untouched and fails safe.
+        if (target === "unsafe" && options.rejectUnsafeTarget) {
+          throw new Error(`Unsafe state lock target: ${path}`);
+        }
         if (target === "directory" && (await recoverStaleLock(path, staleMs))) continue;
         await waitForRetry();
         continue;
       }
 
       try {
+        await options.guard?.();
         await rename(prepared.directory, path);
+        await options.guard?.();
+        await assertOwnedLock(path, prepared);
         break;
       } catch (error) {
         if (!isRenameContention(error)) throw error;
@@ -473,26 +550,38 @@ export async function withFileLock<T>(
   }
 
   try {
+    await options.guard?.();
+    await assertOwnedLock(path, prepared);
     await syncParentDirectory(path);
+    await options.guard?.();
+    await assertOwnedLock(path, prepared);
   } catch (error) {
-    await releaseOwnedLock(path, prepared.ownerFilename);
+    await options.guard?.();
+    await releaseOwnedLock(path, prepared);
     throw error;
   }
 
-  const ownerPath = join(path, prepared.ownerFilename);
   const heartbeat = setInterval(
     () => {
-      const now = new Date();
-      void utimes(ownerPath, now, now).catch(() => undefined);
+      void heartbeatOwnedLock(path, prepared).catch(() => undefined);
     },
     Math.max(10, Math.floor(staleMs / 3)),
   );
   heartbeat.unref();
 
   try {
-    return await operation();
+    await options.guard?.();
+    await assertOwnedLock(path, prepared);
+    const result = await operation();
+    await options.guard?.();
+    await assertOwnedLock(path, prepared);
+    return result;
   } finally {
     clearInterval(heartbeat);
-    await releaseOwnedLock(path, prepared.ownerFilename);
+    // A failed boundary guard must prevent cleanup from unlinking through a
+    // replaced parent. The replacement is intentionally left untouched.
+    await options.guard?.();
+    await releaseOwnedLock(path, prepared);
+    await options.guard?.();
   }
 }

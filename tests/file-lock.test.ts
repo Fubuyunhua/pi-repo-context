@@ -568,29 +568,31 @@ describe("race-safe file locks", () => {
     await expect(readFile(ownerPath, "utf8")).resolves.toBe("replacement must not be trusted");
   });
 
-  it("heartbeats the exact owner and releases without touching a replacement", async () => {
+  it("heartbeats the exact owner, rejects a lock replacement, and leaves it untouched", async () => {
     const root = await tempRoot();
     const lockPath = join(root, "writer.lock");
     let originalOwner = "";
     let replacementPath = "";
     const beforeReplacement = new Date(Date.now() - 60_000);
 
-    await withFileLock(
-      lockPath,
-      async () => {
-        [originalOwner] = await readdir(lockPath);
-        await new Promise((resolve) => setTimeout(resolve, 45));
-        expect(Date.now() - (await stat(join(lockPath, originalOwner))).mtimeMs).toBeLessThan(40);
-        await unlink(join(lockPath, originalOwner));
-        await realRmdir(lockPath);
-        await mkdir(lockPath);
-        replacementPath = join(lockPath, "owner-00000000-0000-4000-8000-000000000007.json");
-        await writeFile(replacementPath, "replacement");
-        await utimes(replacementPath, beforeReplacement, beforeReplacement);
-        await new Promise((resolve) => setTimeout(resolve, 45));
-      },
-      { staleMs: 60 },
-    );
+    await expect(
+      withFileLock(
+        lockPath,
+        async () => {
+          [originalOwner] = await readdir(lockPath);
+          await new Promise((resolve) => setTimeout(resolve, 45));
+          expect(Date.now() - (await stat(join(lockPath, originalOwner))).mtimeMs).toBeLessThan(40);
+          await unlink(join(lockPath, originalOwner));
+          await realRmdir(lockPath);
+          await mkdir(lockPath);
+          replacementPath = join(lockPath, "owner-00000000-0000-4000-8000-000000000007.json");
+          await writeFile(replacementPath, "replacement");
+          await utimes(replacementPath, beforeReplacement, beforeReplacement);
+          await new Promise((resolve) => setTimeout(resolve, 45));
+        },
+        { staleMs: 60 },
+      ),
+    ).rejects.toThrow("State lock");
 
     expect(Math.abs((await stat(replacementPath)).mtimeMs - beforeReplacement.getTime())).toBeLessThan(2);
     await expect(readFile(replacementPath, "utf8")).resolves.toBe("replacement");

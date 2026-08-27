@@ -13,7 +13,6 @@ import {
   type RepoMapScheduler,
   type RepoMapWatcher,
 } from "../src/repo-map/runtime.js";
-import { atomicWriteFile } from "../src/state/atomic.js";
 import { Telemetry } from "../src/telemetry.js";
 
 function tickingClock(): () => number {
@@ -326,13 +325,12 @@ describe("incremental repository map runtime", () => {
       projectRoot: root,
       stateRoot,
       watch: false,
-      atomicWriter: async (path, content) => {
+      beforeStateWrite: async (path) => {
         if (gateActivation && path === join(stateRoot, "active.json")) {
           gateActivation = false;
           activationWrite.resolve();
           await releaseActivation.promise;
         }
-        await atomicWriteFile(path, content);
       },
       indexFileSystem: {
         lstat,
@@ -814,9 +812,8 @@ describe("incremental repository map runtime", () => {
       stateRoot,
       watch: false,
       mapGenerationRetention: 1,
-      atomicWriter: async (path, content) => {
+      beforeStateWrite: async (path) => {
         if (failActive && path.endsWith("active.json")) throw new Error("simulated activation crash");
-        await atomicWriteFile(path, content);
       },
       telemetry,
     });
@@ -1533,9 +1530,8 @@ describe("incremental repository map runtime", () => {
       watch: false,
       telemetry,
       monotonicNow: tickingClock(),
-      atomicWriter: async (path, content) => {
+      beforeStateWrite: async (path) => {
         if (failActivation && path.endsWith("active.json")) throw new Error("simulated activation failure");
-        await atomicWriteFile(path, content);
       },
     });
     await runtime.start();
@@ -1614,9 +1610,8 @@ describe("incremental repository map runtime", () => {
       watch: false,
       telemetry: writeTelemetry,
       monotonicNow: tickingClock(),
-      atomicWriter: async (path, content) => {
+      beforeStateWrite: async (path) => {
         if (failGenerationWrite && path.endsWith("active.json")) throw new Error("simulated pointer failure");
-        await atomicWriteFile(path, content);
       },
     });
     await writeRuntime.start();
@@ -1750,9 +1745,8 @@ describe("incremental repository map runtime", () => {
       monotonicNow() {
         throw new Error("simulated clock failure");
       },
-      atomicWriter: async (path, content) => {
+      beforeStateWrite: async (path) => {
         if (failActivation && path.endsWith("active.json")) throw new Error("simulated activation failure");
-        await atomicWriteFile(path, content);
       },
     });
     await runtime.start();

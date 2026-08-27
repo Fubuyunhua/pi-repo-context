@@ -6,7 +6,6 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildRepoMap } from "../src/repo-map/index.js";
 import { type RepoMapGitRunner, RepoMapRuntime } from "../src/repo-map/runtime.js";
-import { atomicWriteFile } from "../src/state/atomic.js";
 import { Telemetry } from "../src/telemetry.js";
 
 const execFileAsync = promisify(execFile);
@@ -387,9 +386,8 @@ describe("repository map runtime snapshot capture", () => {
       projectRoot: root,
       stateRoot,
       watch: false,
-      atomicWriter: async (path, content) => {
+      beforeStateWrite: async (path) => {
         if (failActivation && path === join(stateRoot, "active.json")) throw new Error("SECRET activation failure");
-        await atomicWriteFile(path, content);
       },
     });
     await runtime.start();
