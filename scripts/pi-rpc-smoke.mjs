@@ -45,27 +45,27 @@ function safePiEnvironment(agentRoot, homeRoot) {
   };
 }
 
-class RpcClient {
-  constructor(child) {
-    this.child = child;
+function assertDependencyAbsent(tree, forbidden) {
+  const visit = (node, ancestry) => {
+    if (node?.name === forbidden) throw new Error(`Dependency tree contains ${forbidden} at ${ancestry}`);
+    for (const [name, dependency] of Object.entries(node?.dependencies ?? {})) {
+      const next = `${ancestry}>${name}`;
+      if (name === forbidden) throw new Error(`Dependency tree contains ${forbidden} at ${next}`);
+      visit(dependency, next);
+    }
+  };
+  visit(tree, "root");
+}
+
+class StrictLfJsonlDecoder {
+  constructor(onRecord) {
+    this.onRecord = onRecord;
     this.buffer = "";
-    this.records = [];
-    this.pending = new Map();
-    this.failure = undefined;
-    this.stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => this.consume(chunk));
-    child.stderr.on("data", (chunk) => {
-      this.stderr = bounded(this.stderr + chunk);
-    });
-    child.on("error", (error) => this.fail(error));
-    child.on("exit", (code, signal) => {
-      if (this.pending.size > 0) this.fail(new Error(`Pi exited before RPC response (code=${code}, signal=${signal})`));
-    });
+    this.finished = false;
   }
 
   consume(chunk) {
+    if (this.finished) throw new Error("RPC decoder received data after stdout end");
     this.buffer += chunk;
     for (;;) {
       const boundary = this.buffer.indexOf("\n");
@@ -73,20 +73,101 @@ class RpcClient {
       let line = this.buffer.slice(0, boundary);
       this.buffer = this.buffer.slice(boundary + 1);
       if (line.endsWith("\r")) line = line.slice(0, -1);
-      if (line.length === 0) continue;
+      if (line.length === 0) throw new Error("Pi RPC emitted an empty JSONL record");
+      let record;
       try {
-        const record = JSON.parse(line);
-        this.records.push(record);
-        if (record.type === "response" && typeof record.id === "string") {
-          const waiter = this.pending.get(record.id);
-          if (waiter) {
-            this.pending.delete(record.id);
-            clearTimeout(waiter.timer);
-            waiter.resolve(record);
-          }
-        }
+        record = JSON.parse(line);
       } catch (error) {
-        this.fail(new Error(`Invalid Pi RPC JSONL record: ${bounded(line, 1024)} (${error})`));
+        throw new Error(`Invalid Pi RPC JSONL record: ${bounded(line, 1024)} (${error})`);
+      }
+      this.onRecord(record);
+    }
+  }
+
+  finish() {
+    if (this.finished) return;
+    this.finished = true;
+    if (this.buffer.length !== 0) {
+      throw new Error(`Pi RPC stdout ended with an unterminated record: ${bounded(this.buffer, 1024)}`);
+    }
+  }
+}
+
+function assertThrows(action, expected) {
+  try {
+    action();
+  } catch (error) {
+    if (String(error).includes(expected)) return;
+    throw new Error(`Expected failure containing ${expected}, received ${error}`);
+  }
+  throw new Error(`Expected failure containing ${expected}`);
+}
+
+function selfTestJsonlDecoder() {
+  const records = [];
+  const valid = new StrictLfJsonlDecoder((record) => records.push(record));
+  valid.consume('{"ok":true}\r\n');
+  valid.finish();
+  if (records.length !== 1 || records[0]?.ok !== true) throw new Error("strict JSONL valid-record self-test failed");
+
+  assertThrows(() => new StrictLfJsonlDecoder(() => undefined).consume("\n"), "empty JSONL record");
+  assertThrows(() => new StrictLfJsonlDecoder(() => undefined).consume("{]\n"), "Invalid Pi RPC JSONL record");
+  const truncated = new StrictLfJsonlDecoder(() => undefined);
+  truncated.consume('{"incomplete":true}');
+  assertThrows(() => truncated.finish(), "unterminated record");
+}
+
+class RpcClient {
+  constructor(child) {
+    this.child = child;
+    this.records = [];
+    this.pending = new Map();
+    this.failure = undefined;
+    this.stderr = "";
+    this.stdoutEnded = false;
+    this.decoder = new StrictLfJsonlDecoder((record) => this.accept(record));
+    this.closePromise = new Promise((resolvePromise) => {
+      child.once("close", (code, signal) => {
+        if (!this.stdoutEnded) this.fail(new Error("Pi RPC process closed before stdout ended"));
+        if (this.pending.size > 0)
+          this.fail(new Error(`Pi closed before RPC response (code=${code}, signal=${signal})`));
+        resolvePromise({ code, signal });
+      });
+    });
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      try {
+        this.decoder.consume(chunk);
+      } catch (error) {
+        this.fail(error);
+      }
+    });
+    child.stdout.on("end", () => {
+      this.stdoutEnded = true;
+      try {
+        this.decoder.finish();
+      } catch (error) {
+        this.fail(error);
+      }
+    });
+    child.stdout.on("error", (error) => this.fail(new Error(`Pi RPC stdout failed: ${error}`)));
+    child.stderr.on("data", (chunk) => {
+      this.stderr = bounded(this.stderr + chunk);
+    });
+    child.stderr.on("error", (error) => this.fail(new Error(`Pi RPC stderr failed: ${error}`)));
+    child.on("error", (error) => this.fail(error));
+  }
+
+  accept(record) {
+    this.records.push(record);
+    if (record.type === "response" && typeof record.id === "string") {
+      const waiter = this.pending.get(record.id);
+      if (waiter) {
+        this.pending.delete(record.id);
+        clearTimeout(waiter.timer);
+        waiter.resolve(record);
       }
     }
   }
@@ -101,8 +182,12 @@ class RpcClient {
     this.pending.clear();
   }
 
+  assertHealthy() {
+    if (this.failure) throw this.failure;
+  }
+
   request(type, fields = {}) {
-    if (this.failure) return Promise.reject(this.failure);
+    this.assertHealthy();
     const id = `rpc-${this.records.length}-${this.pending.size}`;
     return new Promise((resolvePromise, rejectPromise) => {
       const timer = setTimeout(() => {
@@ -119,6 +204,25 @@ class RpcClient {
       });
     });
   }
+
+  async waitForClose() {
+    return await new Promise((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(
+        () => rejectPromise(new Error("Pi RPC process did not terminate promptly")),
+        EXIT_TIMEOUT_MS,
+      );
+      this.closePromise.then(
+        (result) => {
+          clearTimeout(timer);
+          resolvePromise(result);
+        },
+        (error) => {
+          clearTimeout(timer);
+          rejectPromise(error);
+        },
+      );
+    });
+  }
 }
 
 function expectSuccess(response, command) {
@@ -127,26 +231,65 @@ function expectSuccess(response, command) {
   }
 }
 
-async function waitForExit(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return { code: child.exitCode, signal: child.signalCode };
-  return await new Promise((resolvePromise, rejectPromise) => {
-    const timer = setTimeout(
-      () => rejectPromise(new Error("Pi RPC process did not terminate promptly after stdin EOF")),
-      EXIT_TIMEOUT_MS,
-    );
-    child.once("exit", (code, signal) => {
-      clearTimeout(timer);
-      resolvePromise({ code, signal });
-    });
-  });
-}
-
 function notificationsSince(records, offset) {
   return records.slice(offset).filter((record) => record.type === "extension_ui_request" && record.method === "notify");
 }
 
+function parseSingleSuccessfulNotification(records, offset, label) {
+  const notifications = notificationsSince(records, offset);
+  if (notifications.length !== 1)
+    throw new Error(`${label} emitted ${notifications.length} notifications instead of exactly one`);
+  const notification = notifications[0];
+  if (notification.notifyType === "error") throw new Error(`${label} emitted an error notification`);
+  if (notification.notifyType !== "info")
+    throw new Error(`${label} did not emit the exact informational success notification`);
+  try {
+    return JSON.parse(notification.message);
+  } catch (error) {
+    throw new Error(`${label} notification is not JSON: ${error}`);
+  }
+}
+
+function assertHealthyStatus(status, label) {
+  if (
+    status?.extension?.id !== "repo-context" ||
+    status.initialized !== true ||
+    status.enabled !== true ||
+    status.available !== true ||
+    status.degraded !== false
+  ) {
+    throw new Error(`${label} is not initialized, enabled, available, and healthy`);
+  }
+  const repoMap = status.components?.repoMap;
+  if (
+    repoMap?.available !== true ||
+    !["fresh", "dirty"].includes(repoMap.freshness) ||
+    !Number.isSafeInteger(repoMap.generation) ||
+    repoMap.generation < 1 ||
+    typeof repoMap.workspaceRevision !== "string" ||
+    repoMap.workspaceRevision.length === 0 ||
+    repoMap.error !== undefined ||
+    repoMap.maintenance?.error !== undefined ||
+    !Array.isArray(status.failures) ||
+    status.failures.length !== 0
+  ) {
+    throw new Error(`${label} contains unavailable, incoherent, or error Repo Map status`);
+  }
+  return status;
+}
+
+async function runCommand(rpc, subcommand) {
+  const offset = rpc.records.length;
+  const response = await rpc.request("prompt", { message: `/repo-context ${subcommand}` });
+  expectSuccess(response, "prompt");
+  rpc.assertHealthy();
+  return parseSingleSuccessfulNotification(rpc.records, offset, `/repo-context ${subcommand}`);
+}
+
 let child;
+let rpc;
 try {
+  selfTestJsonlDecoder();
   if (!npmCli) throw new Error("Pi RPC smoke must run through npm");
   const globalModules = run(process.execPath, [npmCli, "root", "--global"]).trim();
   const globalPiRoot = join(globalModules, "@earendil-works", "pi-coding-agent");
@@ -182,6 +325,8 @@ try {
     ],
     install,
   );
+  const dependencyTree = JSON.parse(run(process.execPath, [npmCli, "ls", "--all", "--json"], install));
+  assertDependencyAbsent(dependencyTree, "pi-context-vault");
   if (existsSync(join(install, "node_modules", "pi-context-vault"))) {
     throw new Error("Pi RPC smoke unexpectedly installed pi-context-vault");
   }
@@ -199,7 +344,6 @@ try {
   );
 
   const extensionPath = join(install, "node_modules", "pi-repo-context", "extensions", "index.ts");
-  const childEnv = safePiEnvironment(agentRoot, homeRoot);
   child = spawn(
     process.execPath,
     [
@@ -217,9 +361,9 @@ try {
       "--extension",
       extensionPath,
     ],
-    { cwd: fixture, env: childEnv, stdio: ["pipe", "pipe", "pipe"] },
+    { cwd: fixture, env: safePiEnvironment(agentRoot, homeRoot), stdio: ["pipe", "pipe", "pipe"] },
   );
-  const rpc = new RpcClient(child);
+  rpc = new RpcClient(child);
 
   const commandsResponse = await rpc.request("get_commands");
   expectSuccess(commandsResponse, "get_commands");
@@ -245,19 +389,27 @@ try {
     throw new Error("Repo Context did not publish its Pi status during startup");
   }
 
-  for (const subcommand of ["status", "rebuild", "doctor"]) {
-    const offset = rpc.records.length;
-    const response = await rpc.request("prompt", { message: `/repo-context ${subcommand}` });
-    expectSuccess(response, "prompt");
-    const notifications = notificationsSince(rpc.records, offset);
-    if (notifications.length === 0) throw new Error(`/repo-context ${subcommand} emitted no Pi notification`);
-    const serialized = JSON.stringify(notifications);
-    if (subcommand !== "rebuild" && !serialized.includes("repo-context")) {
-      throw new Error(`/repo-context ${subcommand} notification lacks Repo Context identity`);
+  const initialStatus = assertHealthyStatus(await runCommand(rpc, "status"), "initial status");
+  const rebuildStatus = assertHealthyStatus(await runCommand(rpc, "rebuild"), "rebuild success");
+  const coherentStatus = assertHealthyStatus(await runCommand(rpc, "status"), "post-rebuild status");
+  for (const field of ["generation", "workspaceRevision", "gitHead", "freshness"]) {
+    if (coherentStatus.components.repoMap[field] !== rebuildStatus.components.repoMap[field]) {
+      throw new Error(`Post-rebuild status changed coherent field ${field}`);
     }
   }
-  if (rpc.records.some((record) => record.type === "extension_error"))
-    throw new Error("Pi emitted extension_error during commands");
+  if (rebuildStatus.components.repoMap.generation < initialStatus.components.repoMap.generation) {
+    throw new Error("Rebuild generation regressed");
+  }
+  const doctor = await runCommand(rpc, "doctor");
+  if (
+    doctor?.status !== "healthy" ||
+    doctor.automaticInjection !== false ||
+    doctor.legacyStateAccess !== false ||
+    JSON.stringify(doctor).includes('"error"')
+  ) {
+    throw new Error("Doctor did not report exact healthy no-error state");
+  }
+  assertHealthyStatus(doctor.repoContext, "doctor Repo Context status");
 
   const projectRoot = realpathSync(fixture);
   const projectId = createHash("sha256").update(projectRoot).digest("hex").slice(0, 32);
@@ -273,17 +425,25 @@ try {
     throw new Error("Pi Repo Context accessed the legacy Context Vault root");
 
   child.stdin.end();
-  const exit = await waitForExit(child);
+  const exit = await rpc.waitForClose();
+  rpc.assertHealthy();
   if (exit.code !== 0 || exit.signal !== null) {
     throw new Error(`Pi RPC process exited unexpectedly (code=${exit.code}, signal=${exit.signal})`);
   }
+  if (rpc.records.some((record) => record.type === "extension_error")) {
+    throw new Error("Pi emitted extension_error during startup, commands, or session shutdown");
+  }
   child = undefined;
+  rpc = undefined;
 
   // RPC v0.84.1 exposes slash commands but not registered Tool definitions. Exact Tool registration is
   // independently checked by scripts/package-smoke.mjs against the same packed extension entrypoint.
-  console.log("pi-rpc-startup-commands-state-shutdown-ok");
+  console.log("pi-rpc-healthy-commands-state-framing-shutdown-ok");
   console.log("rpc-tool-list-not-exposed-package-smoke-covers-tools");
 } finally {
-  if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  if (child) {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (rpc) await rpc.waitForClose();
+  }
   rmSync(scratch, { recursive: true, force: true });
 }

@@ -7,6 +7,19 @@ const root = resolve(import.meta.dirname, "..");
 const scratch = mkdtempSync(join(tmpdir(), "pi-repo-context-package-"));
 const npmCli = process.env.npm_execpath;
 const run = (command, args, cwd = root) => execFileSync(command, args, { cwd, encoding: "utf8", stdio: "pipe" });
+
+function assertDependencyAbsent(tree, forbidden) {
+  const visit = (node, ancestry) => {
+    if (node?.name === forbidden) throw new Error(`dependency tree contains ${forbidden} at ${ancestry}`);
+    for (const [name, dependency] of Object.entries(node?.dependencies ?? {})) {
+      const next = `${ancestry}>${name}`;
+      if (name === forbidden) throw new Error(`dependency tree contains ${forbidden} at ${next}`);
+      visit(dependency, next);
+    }
+  };
+  visit(tree, "root");
+}
+
 try {
   if (!npmCli) throw new Error("package smoke must run through npm");
   const packed = JSON.parse(run(process.execPath, [npmCli, "pack", "--json", "--pack-destination", scratch]))[0];
@@ -51,6 +64,8 @@ try {
     ],
     install,
   );
+  const dependencyTree = JSON.parse(run(process.execPath, [npmCli, "ls", "--all", "--json"], install));
+  assertDependencyAbsent(dependencyTree, "pi-context-vault");
   const packedRoot = join(install, "node_modules", "pi-repo-context");
   const manifest = JSON.parse(readFileSync(join(packedRoot, "package.json"), "utf8"));
   if (manifest.name !== "pi-repo-context" || manifest.version !== "0.1.0")
