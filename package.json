@@ -1,0 +1,63 @@
+{
+  "name": "pi-repo-context",
+  "version": "0.1.0",
+  "description": "Revision-aware repository indexing and code navigation extension for Pi",
+  "type": "module",
+  "license": "MIT",
+  "author": "Fubuyunhua",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Fubuyunhua/pi-repo-context.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "repository-index",
+    "code-navigation"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "files": [
+    "extensions",
+    "src",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "npm run typecheck && npm run lint",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watcher": "vitest run tests/watcher-smoke.test.ts",
+    "test:package": "node scripts/package-smoke.mjs",
+    "test:pi": "node scripts/pi-rpc-smoke.mjs",
+    "ci": "npm run check && npm run test:coverage && npm run test:package"
+  },
+  "dependencies": {
+    "chokidar": "5.0.0",
+    "java-parser": "3.0.1",
+    "minisearch": "7.2.0",
+    "typescript": "5.9.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.8",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@types/node": "24.10.1",
+    "@vitest/coverage-v8": "4.1.10",
+    "typebox": "1.3.7",
+    "vitest": "4.1.10"
+  }
+}
