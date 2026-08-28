@@ -1,8 +1,8 @@
 # Migration from the pre-split Context Vault repository map
 
-This document describes the current **release-candidate boundary**. Repo Context `0.1.0` and the observation-only
-Context Vault `0.3.0` candidate are unpublished; neither split release is claimed to exist until its reviewed immutable
-tag exists.
+This document describes the Repo Context `0.1.0` migration boundary. The observation-only Context Vault `0.3.0`
+follows an independent release lifecycle; this document makes no claim about the presence of its tag or publication.
+Consult the Vault repository and its immutable tags for availability.
 
 ## Safe transition
 
@@ -29,18 +29,17 @@ Repo Context is Tool-first and provides no automatic context injection.
 
 `mapInjectionMode` has no Repo Context equivalent.
 
-## Candidate ownership boundary
+## Ownership boundary
 
 Repo Context owns `repo_context_search`, `repo_context_status`, `/repo-context status|rebuild|doctor`, and the
 deprecated `context_vault_repo_map` `0.1.x` alias. The alias is planned for removal in Repo Context `0.2.0`.
 
-The observation-only Context Vault `0.3.0` candidate owns `/context-vault rebuild` as a non-executing migration stub
+The observation-only Context Vault `0.3.0` code line owns `/context-vault rebuild` as a non-executing migration stub
 that directs users to `/repo-context rebuild`. Its `/context-vault gc` collects only Vault artifacts, metadata, and
-leases; it does not collect Repo Context or legacy Repo Map state. These statements describe local candidates, not
-published split releases. Check an installed pre-split Vault's own documentation rather than assuming the candidate
-boundary applies to it.
+leases; it does not collect Repo Context or legacy Repo Map state. Check the installed Vault version's own documentation
+rather than assuming this boundary applies to a pre-split installation.
 
-Neither candidate defines a cross-plugin API or runtime dependency.
+Neither plugin defines a cross-plugin API or runtime dependency.
 
 ## State and cold rebuild
 

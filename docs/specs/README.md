@@ -9,5 +9,6 @@ checkpoint. Package identity and persisted generator provenance are `pi-repo-con
 - 0016 is the active Snapshot Foundation, Repository Graph v1, and Resolver v1 contract.
 
 Specification 0018 is retained in the source repository as split-internal decision history and is deliberately excluded
-from the packed candidate. Current user-facing ownership and transition guidance is in [`../MIGRATION.md`](../MIGRATION.md).
-No S03 Planner/Renderer/Projection Cache contract or gold-task system is included or implemented.
+from the `v0.1.0` packed artifact. Current user-facing ownership and transition guidance is in
+[`../MIGRATION.md`](../MIGRATION.md). S03 Planner/Renderer/Projection Cache contracts and the gold-task system are
+outside the `v0.1.0` payload and are not implemented.
