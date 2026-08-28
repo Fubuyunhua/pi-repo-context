@@ -1,6 +1,18 @@
 import { execFile } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -90,8 +102,8 @@ describe("isWatcherIgnoredPath", () => {
 });
 
 async function fixture(files: Record<string, string>, git = true): Promise<{ root: string; stateRoot: string }> {
-  const root = await mkdtemp(join(tmpdir(), "repo-context-runtime-"));
-  const stateRoot = await mkdtemp(join(tmpdir(), "repo-context-runtime-state-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "repo-context-runtime-")));
+  const stateRoot = await realpath(await mkdtemp(join(tmpdir(), "repo-context-runtime-state-")));
   roots.push(root, stateRoot);
   for (const [path, content] of Object.entries(files)) {
     const target = join(root, path);
@@ -326,7 +338,7 @@ describe("incremental repository map runtime", () => {
       stateRoot,
       watch: false,
       beforeStateWrite: async (path) => {
-        if (gateActivation && path === join(stateRoot, "active.json")) {
+        if (gateActivation && path.endsWith("active.json")) {
           gateActivation = false;
           activationWrite.resolve();
           await releaseActivation.promise;

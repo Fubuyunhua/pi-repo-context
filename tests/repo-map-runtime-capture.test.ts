@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -17,8 +17,8 @@ afterEach(async () => {
 });
 
 async function fixture(files: Record<string, string>): Promise<{ root: string; stateRoot: string }> {
-  const root = await mkdtemp(join(tmpdir(), "repo-context-capture-"));
-  const stateRoot = await mkdtemp(join(tmpdir(), "repo-context-capture-state-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "repo-context-capture-")));
+  const stateRoot = await realpath(await mkdtemp(join(tmpdir(), "repo-context-capture-state-")));
   roots.push(root, stateRoot);
   for (const [path, content] of Object.entries(files)) {
     const target = join(root, path);
@@ -387,7 +387,7 @@ describe("repository map runtime snapshot capture", () => {
       stateRoot,
       watch: false,
       beforeStateWrite: async (path) => {
-        if (failActivation && path === join(stateRoot, "active.json")) throw new Error("SECRET activation failure");
+        if (failActivation && path.endsWith("active.json")) throw new Error("SECRET activation failure");
       },
     });
     await runtime.start();

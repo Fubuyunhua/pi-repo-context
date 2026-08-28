@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
@@ -48,7 +48,7 @@ it("computes the isolated state root without creating it", async () => {
   const root = await mkdtemp(join(tmpdir(), "repo-context-project-"));
   const piRoot = join(root, "pi-state");
   const state = await resolveProjectState(root, { PI_CODING_AGENT_DIR: piRoot });
-  expect(state.projectRoot).toBe(root);
+  expect(state.projectRoot).toBe(await realpath(root));
   expect(state.stateRoot).toBe(join(piRoot, "pi-repo-context", "projects", state.projectId));
   expect(state.mapRoot).toBe(join(state.stateRoot, "repo-map"));
   await expect(readFile(join(piRoot, "context-vault", "projects", state.projectId, "repo-map"))).rejects.toMatchObject({
