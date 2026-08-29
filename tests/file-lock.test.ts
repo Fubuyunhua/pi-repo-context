@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { constants } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -30,6 +31,7 @@ const fsControls = vi.hoisted(() => ({
   replaceLegacyFileOnRename: false,
   publicationRenameAttempts: 0,
   directorySyncAttempts: [] as string[],
+  numericOpenFlags: [] as Array<{ path: string; flags: number }>,
 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -38,6 +40,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     ...actual,
     open: async (path: string, flags: string | number, mode?: number) => {
       if (flags === "r") fsControls.directorySyncAttempts.push(path);
+      if (typeof flags === "number") fsControls.numericOpenFlags.push({ path, flags });
       const injected = fsControls.openErrors;
       if (injected?.path === path) {
         const code = injected.codes.shift();
@@ -234,6 +237,7 @@ afterEach(async () => {
   fsControls.replaceLegacyFileOnRename = false;
   fsControls.publicationRenameAttempts = 0;
   fsControls.directorySyncAttempts.splice(0);
+  fsControls.numericOpenFlags.splice(0);
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -604,6 +608,8 @@ describe("race-safe file locks", () => {
           await utimes(originalOwnerPath, beforeHeartbeat, beforeHeartbeat);
           await heartbeatScheduler.run();
           expect((await stat(originalOwnerPath)).mtimeMs).toBeGreaterThan(beforeHeartbeat.getTime());
+          const heartbeatOpen = fsControls.numericOpenFlags.find(({ path }) => path === originalOwnerPath);
+          expect((heartbeatOpen?.flags ?? 0) & constants.O_RDWR).toBe(constants.O_RDWR);
 
           await unlink(originalOwnerPath);
           await realRmdir(lockPath);
@@ -619,6 +625,56 @@ describe("race-safe file locks", () => {
 
     expect(Math.abs((await stat(replacementPath)).mtimeMs - beforeReplacement.getTime())).toBeLessThan(2);
     await expect(readFile(replacementPath, "utf8")).resolves.toBe("replacement");
+  });
+
+  it("propagates a heartbeat failure to the owning operation", async () => {
+    const root = await tempRoot();
+    const lockPath = join(root, "writer.lock");
+    const heartbeatScheduler = new ManualHeartbeatScheduler();
+
+    await expect(
+      withFileLock(
+        lockPath,
+        async () => {
+          const [owner] = await readdir(lockPath);
+          fsControls.openErrors = { path: join(lockPath, owner), codes: ["EIO"] };
+          await expect(heartbeatScheduler.run()).rejects.toThrow("State lock heartbeat failed (EIO)");
+        },
+        { staleMs: 60, heartbeatScheduler },
+      ),
+    ).rejects.toThrow("State lock heartbeat failed (EIO)");
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps a remotely-owned live lock fresh beyond its stale interval", async () => {
+    const root = await tempRoot();
+    const lockPath = join(root, "writer.lock");
+    let contenderEntered = false;
+
+    await withFileLock(
+      lockPath,
+      async () => {
+        const [owner] = await readdir(lockPath);
+        const ownerPath = join(lockPath, owner);
+        const metadata = JSON.parse(await readFile(ownerPath, "utf8")) as { hostname: string };
+        metadata.hostname = "remote-heartbeat-test.invalid";
+        await writeFile(ownerPath, JSON.stringify(metadata));
+
+        await new Promise((resolve) => setTimeout(resolve, 180));
+        await expect(
+          withFileLock(
+            lockPath,
+            async () => {
+              contenderEntered = true;
+            },
+            { retryMs: 5, staleMs: 120, timeoutMs: 70 },
+          ),
+        ).rejects.toThrow("Timed out waiting for state lock");
+      },
+      { staleMs: 120 },
+    );
+
+    expect(contenderEntered).toBe(false);
   });
 
   it.each(["EEXIST", "ENOTEMPTY", "EPERM"])("treats mocked Windows/Linux %s rename collisions safely", async (code) => {
