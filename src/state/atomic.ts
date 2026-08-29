@@ -469,7 +469,7 @@ async function assertOwnedLock(path: string, prepared: PreparedLock): Promise<vo
 async function heartbeatOwnedLock(path: string, prepared: PreparedLock): Promise<void> {
   await assertOwnedLock(path, prepared);
   const ownerPath = join(path, prepared.ownerFilename);
-  let flags = constants.O_RDONLY;
+  let flags = constants.O_RDWR;
   if (process.platform !== "win32" && typeof constants.O_NOFOLLOW === "number") flags |= constants.O_NOFOLLOW;
   const handle = await open(ownerPath, flags);
   try {
@@ -482,6 +482,12 @@ async function heartbeatOwnedLock(path: string, prepared: PreparedLock): Promise
   } finally {
     await handle.close();
   }
+}
+
+function normalizeHeartbeatError(path: string, error: unknown): Error {
+  const code = errorCode(error);
+  const detail = code === "" ? "" : ` (${code.slice(0, 32)})`;
+  return new Error(`State lock heartbeat failed${detail}: ${path}`, { cause: error });
 }
 
 async function releaseOwnedLock(path: string, prepared: PreparedLock): Promise<void> {
@@ -582,23 +588,44 @@ export async function withFileLock<T>(
   }
 
   const heartbeatScheduler = options.heartbeatScheduler ?? DEFAULT_HEARTBEAT_SCHEDULER;
-  const heartbeat = heartbeatScheduler.schedule(Math.max(10, Math.floor(staleMs / 3)), () =>
-    heartbeatOwnedLock(path, prepared),
-  );
+  const activeHeartbeats = new Set<Promise<void>>();
+  let heartbeatFailure: Error | undefined;
+  const runHeartbeat = (): Promise<void> => {
+    let task: Promise<void>;
+    task = heartbeatOwnedLock(path, prepared)
+      .catch((error: unknown) => {
+        const failure = normalizeHeartbeatError(path, error);
+        heartbeatFailure ??= failure;
+        throw failure;
+      })
+      .finally(() => activeHeartbeats.delete(task));
+    activeHeartbeats.add(task);
+    return task;
+  };
+  const heartbeat = heartbeatScheduler.schedule(Math.max(10, Math.floor(staleMs / 3)), runHeartbeat);
 
+  let result: T | undefined;
+  let operationCompleted = false;
+  let operationFailure: unknown;
   try {
     await options.guard?.();
     await assertOwnedLock(path, prepared);
-    const result = await operation();
+    result = await operation();
     await options.guard?.();
     await assertOwnedLock(path, prepared);
-    return result;
-  } finally {
-    heartbeatScheduler.cancel(heartbeat);
-    // A failed boundary guard must prevent cleanup from unlinking through a
-    // replaced parent. The replacement is intentionally left untouched.
-    await options.guard?.();
-    await releaseOwnedLock(path, prepared);
-    await options.guard?.();
+    operationCompleted = true;
+  } catch (error) {
+    operationFailure = error;
   }
+
+  heartbeatScheduler.cancel(heartbeat);
+  await Promise.allSettled([...activeHeartbeats]);
+  // A failed boundary guard must prevent cleanup from unlinking through a
+  // replaced parent. The replacement is intentionally left untouched.
+  await options.guard?.();
+  await releaseOwnedLock(path, prepared);
+  await options.guard?.();
+  if (heartbeatFailure !== undefined) throw heartbeatFailure;
+  if (!operationCompleted) throw operationFailure;
+  return result as T;
 }
