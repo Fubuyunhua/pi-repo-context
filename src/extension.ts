@@ -112,7 +112,7 @@ export interface RepoContextStatusPayload {
   failures: readonly BoundedFailure[];
 }
 
-export interface RepoContextDiagnosticStatusPayload extends RepoContextStatusPayload {
+interface RepoContextDiagnosticStatusPayload extends RepoContextStatusPayload {
   project?: { id: string; root: string; stateRoot: string; mapRoot: string };
 }
 
@@ -274,7 +274,7 @@ export function buildStatus(runtime: RuntimeState): RepoContextStatusPayload {
   };
 }
 
-export function buildDiagnosticStatus(runtime: RuntimeState): RepoContextDiagnosticStatusPayload {
+function buildDiagnosticStatus(runtime: RuntimeState): RepoContextDiagnosticStatusPayload {
   const status = buildStatus(runtime);
   if (!runtime.state) return status;
   return {

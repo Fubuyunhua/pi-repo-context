@@ -243,8 +243,9 @@ it("omits private paths from model-visible status and retains them in explicit l
   const command = target.commands.get("repo-context");
   await command?.handler("status", headlessContext);
   await command?.handler("doctor", headlessContext);
-  const localStatus = JSON.parse(output[0] ?? "{}") as { project?: RepoContextProjectState };
-  const doctor = JSON.parse(output[1] ?? "{}") as { repoContext?: { project?: RepoContextProjectState } };
+  type DiagnosticProject = { id: string; root: string; stateRoot: string; mapRoot: string };
+  const localStatus = JSON.parse(output[0] ?? "{}") as { project?: DiagnosticProject };
+  const doctor = JSON.parse(output[1] ?? "{}") as { repoContext?: { project?: DiagnosticProject } };
   expect(localStatus.project).toEqual({
     id: privateState.projectId,
     root: privateState.projectRoot,
