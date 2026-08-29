@@ -91,7 +91,6 @@ export interface RepoContextStatusPayload {
   enabled: boolean | null;
   available: boolean;
   degraded: boolean;
-  project?: { id: string; root: string; stateRoot: string; mapRoot: string };
   components: {
     repoMap: {
       available: boolean;
@@ -111,6 +110,10 @@ export interface RepoContextStatusPayload {
   };
   telemetry: RepoContextTelemetrySnapshot;
   failures: readonly BoundedFailure[];
+}
+
+export interface RepoContextDiagnosticStatusPayload extends RepoContextStatusPayload {
+  project?: { id: string; root: string; stateRoot: string; mapRoot: string };
 }
 
 function utf8Prefix(value: string, maxBytes: number): string {
@@ -243,16 +246,6 @@ export function buildStatus(runtime: RuntimeState): RepoContextStatusPayload {
     enabled: runtime.config?.enabled ?? null,
     available: runtime.available,
     degraded,
-    ...(runtime.state
-      ? {
-          project: {
-            id: runtime.state.projectId,
-            root: runtime.state.projectRoot,
-            stateRoot: runtime.state.stateRoot,
-            mapRoot: runtime.state.mapRoot,
-          },
-        }
-      : {}),
     components: {
       repoMap: map
         ? {
@@ -278,6 +271,20 @@ export function buildStatus(runtime: RuntimeState): RepoContextStatusPayload {
     },
     telemetry: runtime.telemetry.snapshot(),
     failures: runtime.failures.map((failure) => ({ ...failure })),
+  };
+}
+
+export function buildDiagnosticStatus(runtime: RuntimeState): RepoContextDiagnosticStatusPayload {
+  const status = buildStatus(runtime);
+  if (!runtime.state) return status;
+  return {
+    ...status,
+    project: {
+      id: runtime.state.projectId,
+      root: runtime.state.projectRoot,
+      stateRoot: runtime.state.stateRoot,
+      mapRoot: runtime.state.mapRoot,
+    },
   };
 }
 
@@ -462,11 +469,11 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     handler: async (args, ctx) => {
       const command = args.trim() || "status";
       if (command === "status") {
-        notify(ctx, buildStatus(runtime));
+        notify(ctx, buildDiagnosticStatus(runtime));
         return;
       }
       if (command === "doctor") {
-        const status = buildStatus(runtime);
+        const status = buildDiagnosticStatus(runtime);
         notify(ctx, {
           status: status.enabled === false ? "disabled" : status.degraded ? "degraded" : "healthy",
           automaticInjection: false,
@@ -491,15 +498,15 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
           const status = runtime.repoMap.status();
           if (mapStatusDegraded(status)) {
             addFailure(runtime, "rebuild", status.error ?? `rebuild completed with ${status.freshness} freshness`);
-            notify(ctx, buildStatus(runtime), "error");
+            notify(ctx, buildDiagnosticStatus(runtime), "error");
           } else {
             runtime.failures = runtime.failures.filter((failure) => failure.component !== "rebuild");
-            notify(ctx, buildStatus(runtime));
+            notify(ctx, buildDiagnosticStatus(runtime));
           }
           updateUi(ctx, runtime);
         } catch (error) {
           addFailure(runtime, "rebuild", error);
-          notify(ctx, buildStatus(runtime), "error");
+          notify(ctx, buildDiagnosticStatus(runtime), "error");
           updateUi(ctx, runtime);
         }
         return;

@@ -208,6 +208,52 @@ it("bounds status arrays and supports headless status, rebuild, doctor, and usag
   expect(output.at(-1)).toBe("Usage: /repo-context status|rebuild|doctor");
 });
 
+it("omits private paths from model-visible status and retains them in explicit local diagnostics", async () => {
+  const target = harness();
+  const output: string[] = [];
+  const privateMarker = "private-home-marker";
+  const privateState: RepoContextProjectState = {
+    projectId: "private-project-id",
+    projectRoot: `/home/${privateMarker}/project`,
+    stateRoot: `/home/${privateMarker}/.pi/agent/pi-repo-context/projects/private-project-id`,
+    mapRoot: `/home/${privateMarker}/.pi/agent/pi-repo-context/projects/private-project-id/repo-map`,
+  };
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => privateState,
+    loadConfig: async () => config,
+    runtimeFactory: () => fakeController(),
+    stdout: (text) => output.push(text),
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+
+  const result = (await target.tools.get("repo_context_status")?.execute()) as {
+    content: Array<{ text: string }>;
+    details: Record<string, unknown>;
+  };
+  expect(result.details).toMatchObject({
+    initialized: true,
+    available: true,
+    degraded: false,
+    components: { repoMap: { freshness: "fresh", generation: 1 } },
+  });
+  expect(result.details).not.toHaveProperty("project");
+  expect(result.content[0]?.text).not.toContain(privateMarker);
+  expect(JSON.stringify(result.details)).not.toContain(privateMarker);
+
+  const command = target.commands.get("repo-context");
+  await command?.handler("status", headlessContext);
+  await command?.handler("doctor", headlessContext);
+  const localStatus = JSON.parse(output[0] ?? "{}") as { project?: RepoContextProjectState };
+  const doctor = JSON.parse(output[1] ?? "{}") as { repoContext?: { project?: RepoContextProjectState } };
+  expect(localStatus.project).toEqual({
+    id: privateState.projectId,
+    root: privateState.projectRoot,
+    stateRoot: privateState.stateRoot,
+    mapRoot: privateState.mapRoot,
+  });
+  expect(doctor.repoContext?.project).toEqual(localStatus.project);
+});
+
 it("treats fresh rebuild maintenance errors as failures and retains prior rebuild failure", async () => {
   const target = harness();
   let maintenanceError = false;
