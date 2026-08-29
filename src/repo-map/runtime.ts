@@ -1203,7 +1203,11 @@ export class RepoMapRuntime {
     let snapshot: RepoMapSnapshot;
     try {
       head = await gitHead(this.#projectRoot, this.#gitRunner, this.#telemetry, this.#monotonicNow);
-      snapshot = await this.#snapshotBuilder({ projectRoot: this.#projectRoot, exclude: this.#options.exclude });
+      snapshot = await this.#snapshotBuilder({
+        projectRoot: this.#projectRoot,
+        exclude: this.#options.exclude,
+        ...(this.#options.indexFileSystem ? { fileSystem: this.#options.indexFileSystem } : {}),
+      });
     } catch (error) {
       this.#baseBuildFailed = true;
       this.#degrade(error);

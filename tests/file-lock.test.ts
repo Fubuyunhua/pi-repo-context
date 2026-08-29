@@ -117,7 +117,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-import { withFileLock } from "../src/state/atomic.js";
+import { type FileLockHeartbeatScheduler, withFileLock } from "../src/state/atomic.js";
 
 const execFileAsync = promisify(execFile);
 const roots: string[] = [];
@@ -128,6 +128,24 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
     resolve = accept;
   });
   return { promise, resolve };
+}
+
+class ManualHeartbeatScheduler implements FileLockHeartbeatScheduler {
+  task: (() => Promise<void>) | undefined;
+
+  schedule(_delayMs: number, task: () => Promise<void>): unknown {
+    this.task = task;
+    return task;
+  }
+
+  cancel(handle: unknown): void {
+    if (this.task === handle) this.task = undefined;
+  }
+
+  async run(): Promise<void> {
+    if (this.task === undefined) throw new Error("heartbeat is not scheduled");
+    await this.task();
+  }
 }
 
 async function tempRoot(): Promise<string> {
@@ -571,8 +589,10 @@ describe("race-safe file locks", () => {
   it("heartbeats the exact owner, rejects a lock replacement, and leaves it untouched", async () => {
     const root = await tempRoot();
     const lockPath = join(root, "writer.lock");
+    const heartbeatScheduler = new ManualHeartbeatScheduler();
     let originalOwner = "";
     let replacementPath = "";
+    const beforeHeartbeat = new Date(Date.now() - 60_000);
     const beforeReplacement = new Date(Date.now() - 60_000);
 
     await expect(
@@ -580,17 +600,20 @@ describe("race-safe file locks", () => {
         lockPath,
         async () => {
           [originalOwner] = await readdir(lockPath);
-          await new Promise((resolve) => setTimeout(resolve, 45));
-          expect(Date.now() - (await stat(join(lockPath, originalOwner))).mtimeMs).toBeLessThan(40);
-          await unlink(join(lockPath, originalOwner));
+          const originalOwnerPath = join(lockPath, originalOwner);
+          await utimes(originalOwnerPath, beforeHeartbeat, beforeHeartbeat);
+          await heartbeatScheduler.run();
+          expect((await stat(originalOwnerPath)).mtimeMs).toBeGreaterThan(beforeHeartbeat.getTime());
+
+          await unlink(originalOwnerPath);
           await realRmdir(lockPath);
           await mkdir(lockPath);
           replacementPath = join(lockPath, "owner-00000000-0000-4000-8000-000000000007.json");
           await writeFile(replacementPath, "replacement");
           await utimes(replacementPath, beforeReplacement, beforeReplacement);
-          await new Promise((resolve) => setTimeout(resolve, 45));
+          await expect(heartbeatScheduler.run()).rejects.toThrow("State lock");
         },
-        { staleMs: 60 },
+        { staleMs: 60, heartbeatScheduler },
       ),
     ).rejects.toThrow("State lock");
 

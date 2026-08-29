@@ -120,6 +120,8 @@ export interface BuildRepoMapOptions {
   projectRoot: string;
   exclude?: string[];
   outputPath?: string;
+  /** Injectable file operations for deterministic full-build read failures. */
+  fileSystem?: RepoMapFileSystem;
 }
 
 export interface RepoMapQueryOptions {
@@ -701,7 +703,13 @@ export async function buildRepoMap(options: BuildRepoMapOptions): Promise<RepoMa
   const projectRoot = await realpath(resolve(options.projectRoot));
   const paths = await enumerateRepoMapFiles(projectRoot, options.exclude ?? []);
   const indexed = await Promise.all(
-    paths.map((path) => indexRepoMapFile(projectRoot, path, { exclude: options.exclude, checkGitIgnore: false })),
+    paths.map((path) =>
+      indexRepoMapFile(projectRoot, path, {
+        exclude: options.exclude,
+        checkGitIgnore: false,
+        ...(options.fileSystem ? { fileSystem: options.fileSystem } : {}),
+      }),
+    ),
   );
   const snapshot: RepoMapSnapshot = {
     schemaVersion: REPO_MAP_SCHEMA_VERSION,

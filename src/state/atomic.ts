@@ -117,6 +117,11 @@ export async function atomicWriteFile(path: string, content: string | Uint8Array
   }
 }
 
+export interface FileLockHeartbeatScheduler {
+  schedule(delayMs: number, task: () => Promise<void>): unknown;
+  cancel(handle: unknown): void;
+}
+
 export interface FileLockOptions {
   retryMs?: number;
   staleMs?: number;
@@ -125,7 +130,22 @@ export interface FileLockOptions {
   guard?: () => Promise<void>;
   /** Product-owned lock targets reject unexpected fixed entries immediately. */
   rejectUnsafeTarget?: boolean;
+  /** Injectable scheduler used to test heartbeat behavior without wall-clock timing. */
+  heartbeatScheduler?: FileLockHeartbeatScheduler;
 }
+
+const DEFAULT_HEARTBEAT_SCHEDULER: FileLockHeartbeatScheduler = {
+  schedule(delayMs, task) {
+    const handle = setInterval(() => {
+      void task().catch(() => undefined);
+    }, delayMs);
+    handle.unref();
+    return handle;
+  },
+  cancel(handle) {
+    clearInterval(handle as ReturnType<typeof setInterval>);
+  },
+};
 
 function encodeOwner(metadata: LockOwnerMetadata): string {
   return JSON.stringify(metadata);
@@ -561,13 +581,10 @@ export async function withFileLock<T>(
     throw error;
   }
 
-  const heartbeat = setInterval(
-    () => {
-      void heartbeatOwnedLock(path, prepared).catch(() => undefined);
-    },
-    Math.max(10, Math.floor(staleMs / 3)),
+  const heartbeatScheduler = options.heartbeatScheduler ?? DEFAULT_HEARTBEAT_SCHEDULER;
+  const heartbeat = heartbeatScheduler.schedule(Math.max(10, Math.floor(staleMs / 3)), () =>
+    heartbeatOwnedLock(path, prepared),
   );
-  heartbeat.unref();
 
   try {
     await options.guard?.();
@@ -577,7 +594,7 @@ export async function withFileLock<T>(
     await assertOwnedLock(path, prepared);
     return result;
   } finally {
-    clearInterval(heartbeat);
+    heartbeatScheduler.cancel(heartbeat);
     // A failed boundary guard must prevent cleanup from unlinking through a
     // replaced parent. The replacement is intentionally left untouched.
     await options.guard?.();
