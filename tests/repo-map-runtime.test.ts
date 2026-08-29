@@ -1044,13 +1044,40 @@ describe("incremental repository map runtime", () => {
     await runtime.close();
   });
 
+  it("does not hydrate persisted java-parser generations and rebuilds with current analyzer provenance", async () => {
+    const { root, stateRoot } = await fixture({ "src/Value.java": "public class Value {}" });
+    const first = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    await first.start();
+    await first.close();
+
+    const activePath = join(stateRoot, "generations", "1.json");
+    const legacy = JSON.parse(await readFile(activePath, "utf8"));
+    legacy.snapshot.provenance.javaParser = "java-parser@3.0.1";
+    await writeFile(activePath, `${JSON.stringify(legacy)}\n`);
+    await expect(loadActiveRepoMapGeneration(stateRoot)).resolves.toMatchObject({ generation: 1 });
+
+    const second = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    await second.start();
+    await expect(loadActiveRepoMapGeneration(stateRoot)).resolves.toMatchObject({
+      generation: 2,
+      snapshot: {
+        provenance: {
+          javaParser: "web-tree-sitter@0.26.11+tree-sitter-java-orchard@0.5.10",
+        },
+      },
+    });
+    await second.close();
+  });
+
   it("accepts documented optional snapshot metadata", async () => {
     const { root, stateRoot } = await fixture({ "src/value.ts": "export const safeValue = 1;" });
     const runtime = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
     await runtime.start();
     const activePath = join(stateRoot, "generations", "1.json");
     const active = JSON.parse(await readFile(activePath, "utf8"));
-    Object.assign(active.snapshot.provenance, { javaParser: "java-parser@3.0.1" });
+    Object.assign(active.snapshot.provenance, {
+      javaParser: "web-tree-sitter@0.26.11+tree-sitter-java-orchard@0.5.10",
+    });
     Object.assign(active.snapshot.files[0], {
       packageName: "example",
       degradedReason: "documented optional reason",

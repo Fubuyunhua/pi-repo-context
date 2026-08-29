@@ -50,9 +50,9 @@ it("has no Vault, S03, bench, report, or automatic-injection production boundary
   };
   expect(manifest.dependencies).toEqual({
     chokidar: "5.0.0",
-    "java-parser": "3.0.1",
     minisearch: "7.2.0",
     typescript: "5.9.3",
+    "web-tree-sitter": "0.26.11",
   });
   const exactPeers = {
     "@earendil-works/pi-coding-agent": "0.84.1",
@@ -77,6 +77,8 @@ it("has no Vault, S03, bench, report, or automatic-injection production boundary
     "src/state/owned-state.ts",
     "src/state/project-state.ts",
     "src/telemetry.ts",
+    "vendor/tree-sitter-java-orchard/tree-sitter-java_orchard.wasm",
+    "vendor/tree-sitter-java-orchard/LICENSE",
     "docs/MIGRATION.md",
     "docs/releases/v0.1.0.md",
     "docs/specs/0005-bounded-repo-map-generations.md",

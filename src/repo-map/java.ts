@@ -1,8 +1,12 @@
-import { type CstNode, type IToken, parse } from "java-parser";
+import { fileURLToPath } from "node:url";
+import { Language, type Node, Parser } from "web-tree-sitter";
 import type { RepoMapExport, RepoMapImport, RepoMapSymbol } from "./index.js";
 
 const MAX_JAVA_SOURCE_BYTES = 2 * 1024 * 1024;
 const MAX_BRACE_NESTING = 512;
+const JAVA_GRAMMAR_PATH = fileURLToPath(
+  new URL("../../vendor/tree-sitter-java-orchard/tree-sitter-java_orchard.wasm", import.meta.url),
+);
 const MODIFIERS = new Set([
   "public",
   "protected",
@@ -19,6 +23,18 @@ const MODIFIERS = new Set([
   "volatile",
   "default",
 ]);
+const TYPE_DECLARATIONS = new Set([
+  "class_declaration",
+  "interface_declaration",
+  "enum_declaration",
+  "record_declaration",
+  "annotation_type_declaration",
+]);
+const METHOD_DECLARATIONS = new Set(["method_declaration", "annotation_type_element_declaration"]);
+const CONSTRUCTOR_DECLARATIONS = new Set(["constructor_declaration", "compact_constructor_declaration"]);
+const FIELD_DECLARATIONS = new Set(["field_declaration", "constant_declaration"]);
+
+export const JAVA_ANALYZER_VERSION = "web-tree-sitter@0.26.11+tree-sitter-java-orchard@0.5.10" as const;
 
 export interface JavaAnalysis {
   packageName?: string;
@@ -28,44 +44,70 @@ export interface JavaAnalysis {
   dependencies: string[];
 }
 
-function childNodes(node: CstNode): CstNode[] {
-  return Object.values(node.children)
-    .flat()
-    .filter((item) => "name" in item) as CstNode[];
+let parserPromise: Promise<Parser> | undefined;
+let parserTail: Promise<void> = Promise.resolve();
+
+function javaParser(): Promise<Parser> {
+  parserPromise ??= (async () => {
+    await Parser.init();
+    const language = await Language.load(JAVA_GRAMMAR_PATH);
+    return new Parser().setLanguage(language);
+  })();
+  return parserPromise;
 }
 
-function allTokens(node: CstNode): IToken[] {
-  const output: IToken[] = [];
-  const visit = (current: CstNode): void => {
-    for (const items of Object.values(current.children)) {
-      for (const item of items) {
-        if ("image" in item) output.push(item as IToken);
-        else visit(item as CstNode);
-      }
-    }
-  };
-  visit(node);
-  return output.sort((left, right) => left.startOffset - right.startOffset);
+async function withJavaParser<T>(operation: (parser: Parser) => T): Promise<T> {
+  const previous = parserTail;
+  let release = (): void => undefined;
+  parserTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    const parser = await javaParser();
+    parser.reset();
+    return operation(parser);
+  } finally {
+    release();
+  }
 }
 
-function descendants(node: CstNode, name: string): CstNode[] {
-  const found: CstNode[] = [];
-  const visit = (current: CstNode): void => {
-    for (const child of childNodes(current)) {
-      if (child.name === name) found.push(child);
+function descendants(node: Node, types: string | readonly string[]): Node[] {
+  const accepted = new Set(typeof types === "string" ? [types] : types);
+  const output: Node[] = [];
+  const visit = (current: Node): void => {
+    for (const child of current.namedChildren) {
+      if (accepted.has(child.type)) output.push(child);
       visit(child);
     }
   };
   visit(node);
-  return found;
+  return output;
 }
 
-function firstDescendant(node: CstNode, name: string): CstNode | undefined {
-  return descendants(node, name)[0];
+function directChild(node: Node, type: string): Node | undefined {
+  return node.namedChildren.find((child) => child.type === type);
 }
 
-function images(node: CstNode): string[] {
-  return allTokens(node).map((token) => token.image);
+function leafTokens(node: Node, excludeAnnotations = false): Node[] {
+  const output: Node[] = [];
+  const visit = (current: Node): void => {
+    if (
+      current.isExtra ||
+      current.type === "line_comment" ||
+      current.type === "block_comment" ||
+      (excludeAnnotations && (current.type === "annotation" || current.type === "marker_annotation"))
+    ) {
+      return;
+    }
+    if (current.childCount === 0 || current.type.endsWith("_literal")) {
+      output.push(current);
+      return;
+    }
+    for (const child of current.children) visit(child);
+  };
+  visit(node);
+  return output;
 }
 
 function render(tokens: readonly string[]): string {
@@ -86,45 +128,43 @@ function render(tokens: readonly string[]): string {
   return output.replace(/\s+/gu, " ").trim();
 }
 
-function withoutAnnotations(node: CstNode): IToken[] {
-  const excluded = new Set<number>();
-  for (const annotation of descendants(node, "annotation")) {
-    for (const token of allTokens(annotation)) excluded.add(token.startOffset);
-  }
-  return allTokens(node).filter((token) => !excluded.has(token.startOffset));
+function renderedNode(node: Node): string {
+  return render(leafTokens(node, true).map((token) => token.text));
 }
 
-function beforeBody(node: CstNode): IToken[] {
-  const tokens = withoutAnnotations(node);
-  const cutoff = tokens.findIndex((token) => token.image === "{" || token.image === ";");
-  return cutoff < 0 ? tokens : tokens.slice(0, cutoff);
+function beforeBody(node: Node): string {
+  const tokens = leafTokens(node, true).map((token) => token.text);
+  const cutoff = tokens.findIndex((token) => token === "{" || token === ";");
+  return render(cutoff < 0 ? tokens : tokens.slice(0, cutoff));
 }
 
-function annotationNames(node: CstNode): string[] {
-  const modifierNodes = childNodes(node).filter((child) => child.name.endsWith("Modifier"));
-  return modifierNodes
-    .flatMap((modifier) => descendants(modifier, "annotation"))
-    .map((annotation) => {
-      const tokenImages = images(annotation);
-      const end = tokenImages.indexOf("(");
-      return tokenImages
-        .slice(1, end < 0 ? undefined : end)
-        .filter((token) => token !== ".")
-        .join(".");
-    });
+function modifiersNode(node: Node): Node | undefined {
+  return directChild(node, "modifiers");
 }
 
-function modifierNames(node: CstNode): string[] {
-  return childNodes(node)
-    .filter((child) => child.name.endsWith("Modifier"))
-    .flatMap((modifier) => withoutAnnotations(modifier))
-    .map((token) => token.image)
+function annotationNames(node: Node): string[] {
+  const modifiers = modifiersNode(node);
+  if (!modifiers) return [];
+  return descendants(modifiers, ["annotation", "marker_annotation"]).map((annotation) => {
+    const name = annotation.namedChildren.find((child) => ["identifier", "scoped_identifier"].includes(child.type));
+    return name?.text ?? annotation.text.replace(/^@/u, "").replace(/\(.*$/su, "");
+  });
+}
+
+function modifierNames(node: Node): string[] {
+  const modifiers = modifiersNode(node);
+  if (!modifiers) return [];
+  return leafTokens(modifiers, true)
+    .map((token) => token.text)
     .filter((token) => MODIFIERS.has(token));
 }
 
-function tokenLine(node: CstNode, image?: string): number {
-  const tokens = withoutAnnotations(node);
-  return (image ? tokens.find((token) => token.image === image) : tokens[0])?.startLine ?? node.location.startLine;
+function tokenLine(node: Node, image?: string): number {
+  const tokens = leafTokens(node, true);
+  return (image ? tokens.find((token) => token.text === image) : tokens[0])?.startPosition.row !== undefined
+    ? ((image ? tokens.find((token) => token.text === image) : tokens[0])?.startPosition.row ??
+        node.startPosition.row) + 1
+    : node.startPosition.row + 1;
 }
 
 function splitTopLevel(tokens: readonly string[], delimiter = ","): string[][] {
@@ -139,97 +179,55 @@ function splitTopLevel(tokens: readonly string[], delimiter = ","): string[][] {
   return parts.filter((part) => part.length > 0);
 }
 
-function nodeList(node: CstNode, name: string): string[] {
-  const relationship = childNodes(node).find((child) => child.name === name);
-  if (!relationship) return [];
-  const tokens = images(relationship).slice(1);
-  return splitTopLevel(tokens).map(render);
+function relationshipList(node: Node | null, keyword: string): string[] {
+  if (!node) return [];
+  const tokens = leafTokens(node, true).map((token) => token.text);
+  const start = tokens.indexOf(keyword);
+  return splitTopLevel(tokens.slice(start < 0 ? 0 : start + 1)).map(render);
 }
 
-function typeParameters(node: CstNode): string[] {
-  const parameters = childNodes(node).find((child) => child.name === "typeParameters");
+function typeParameters(node: Node): string[] {
+  const parameters = node.childForFieldName("type_parameters") ?? directChild(node, "type_parameters");
   if (!parameters) return [];
-  const tokens = images(parameters);
-  return splitTopLevel(tokens.slice(1, -1)).map(render);
+  return parameters.namedChildren
+    .filter((child) => child.type === "type_parameter")
+    .map((parameter) => renderedNode(parameter));
 }
 
-function identifier(node: CstNode, name = "typeIdentifier"): string | undefined {
-  const target = firstDescendant(node, name);
-  return target ? allTokens(target)[0]?.image : undefined;
+function declarationName(node: Node): string | undefined {
+  return node.childForFieldName("name")?.text ?? directChild(node, "identifier")?.text;
 }
 
-function typeKind(node: CstNode): RepoMapSymbol["kind"] {
-  if (firstDescendant(node, "enumDeclaration")) return "enum";
-  if (firstDescendant(node, "recordDeclaration")) return "record";
-  if (firstDescendant(node, "annotationInterfaceDeclaration")) return "annotation";
-  if (node.name === "interfaceDeclaration") return "interface";
+function typeKind(node: Node): RepoMapSymbol["kind"] {
+  if (node.type === "interface_declaration") return "interface";
+  if (node.type === "enum_declaration") return "enum";
+  if (node.type === "record_declaration") return "record";
+  if (node.type === "annotation_type_declaration") return "annotation";
   return "class";
 }
 
-function declarationNode(node: CstNode): CstNode | undefined {
-  return childNodes(node).find((child) =>
-    [
-      "normalClassDeclaration",
-      "enumDeclaration",
-      "recordDeclaration",
-      "normalInterfaceDeclaration",
-      "annotationInterfaceDeclaration",
-    ].includes(child.name),
-  );
-}
-
-function declarationName(node: CstNode): string | undefined {
-  const declaration = declarationNode(node);
-  if (!declaration) return undefined;
-  return (
-    identifier(declaration) ?? allTokens(declaration).find((token) => token.tokenType.name === "Identifier")?.image
-  );
-}
-
-function memberName(node: CstNode): string | undefined {
-  if (node.name === "constructorDeclaration" || node.name === "compactConstructorDeclaration") {
-    return (
-      identifier(node, "simpleTypeName") ??
-      allTokens(node).find((token) => token.tokenType.name === "Identifier")?.image
-    );
-  }
-  if (
-    node.name === "methodDeclaration" ||
-    node.name === "interfaceMethodDeclaration" ||
-    node.name === "annotationInterfaceElementDeclaration"
-  ) {
-    const declarator = firstDescendant(node, "methodDeclarator") ?? node;
-    const tokens = allTokens(declarator);
-    const open = tokens.findIndex((token) => token.image === "(");
-    return [...tokens.slice(0, open < 0 ? undefined : open)]
-      .reverse()
-      .find((token) => token.tokenType.name === "Identifier")?.image;
-  }
-  return undefined;
-}
-
-function fieldNames(node: CstNode): string[] {
-  return descendants(node, "variableDeclarator")
-    .map((declarator) => firstDescendant(declarator, "variableDeclaratorId"))
-    .flatMap((declarator) => (declarator ? [allTokens(declarator)[0]?.image] : []))
+function fieldNames(node: Node): string[] {
+  return descendants(node, "variable_declarator")
+    .map((declarator) => declarator.childForFieldName("name")?.text ?? directChild(declarator, "identifier")?.text)
     .filter((name): name is string => Boolean(name));
 }
 
-function fieldSignature(node: CstNode, name: string): string {
-  const tokens = withoutAnnotations(node).map((token) => token.image);
+function fieldSignature(node: Node, name: string): string {
+  const tokens = leafTokens(node, true).map((token) => token.text);
   const nameIndex = tokens.indexOf(name);
   return render(tokens.slice(0, nameIndex + 1));
 }
 
-function recordComponents(node: CstNode, container: string, output: RepoMapSymbol[]): void {
-  for (const component of descendants(node, "recordComponent")) {
-    const tokens = images(component);
-    const name = [...allTokens(component)].reverse().find((token) => token.tokenType.name === "Identifier")?.image;
+function recordComponents(node: Node, container: string, output: RepoMapSymbol[]): void {
+  const parameters = node.childForFieldName("parameters") ?? directChild(node, "formal_parameters");
+  if (!parameters) return;
+  for (const component of parameters.namedChildren.filter((child) => child.type === "formal_parameter")) {
+    const name = component.childForFieldName("name")?.text ?? directChild(component, "identifier")?.text;
     if (!name) continue;
     output.push({
       name,
       kind: "field",
-      signature: render(tokens),
+      signature: renderedNode(component),
       exported: true,
       line: tokenLine(component, name),
       container,
@@ -251,60 +249,67 @@ function validateBounds(text: string): void {
   }
 }
 
-export function analyzeJava(text: string): JavaAnalysis {
-  validateBounds(text);
-  const root = parse(text) as CstNode;
+function firstParseError(root: Node): Node | undefined {
+  if (root.isError || root.isMissing) return root;
+  for (const child of root.children) {
+    const error = firstParseError(child);
+    if (error) return error;
+  }
+  return undefined;
+}
+
+function analyzeTree(root: Node): JavaAnalysis {
   const imports: RepoMapImport[] = [];
   const exports: RepoMapExport[] = [];
   const symbols: RepoMapSymbol[] = [];
   const dependencies = new Set<string>();
-  const packageDeclaration = firstDescendant(root, "packageDeclaration");
-  const packageName = ((packageDeclaration?.children.Identifier ?? []) as IToken[])
-    .map((token) => token.image)
-    .join(".");
+  const packageDeclaration = root.namedChildren.find((child) => child.type === "package_declaration");
+  const packageName = packageDeclaration?.namedChildren.find((child) =>
+    ["identifier", "scoped_identifier"].includes(child.type),
+  )?.text;
 
-  for (const declaration of descendants(root, "importDeclaration")) {
-    const tokens = images(declaration);
+  for (const declaration of root.namedChildren.filter((child) => child.type === "import_declaration")) {
+    const tokens = leafTokens(declaration).map((token) => token.text);
     const isStatic = tokens.includes("static");
     const wildcard = tokens.includes("*");
     const qualified = tokens.filter((token) => !["import", "static", ";", "*", "."].includes(token)).join(".");
     const pieces = qualified.split(".");
-    const source = wildcard ? qualified : isStatic ? qualified : qualified;
     imports.push({
-      source,
+      source: qualified,
       names: wildcard ? [] : [pieces.at(-1) as string],
       typeOnly: false,
       static: isStatic,
       wildcard,
     });
-    dependencies.add(source);
+    dependencies.add(qualified);
   }
 
-  const walk = (node: CstNode, container?: string, implicitlyPublic = false): void => {
+  const walk = (node: Node, container?: string, implicitlyPublic = false): void => {
     let nextContainer = container;
     let nextImplicitlyPublic = implicitlyPublic;
-    if (node.name === "classDeclaration" || node.name === "interfaceDeclaration") {
+    if (TYPE_DECLARATIONS.has(node.type)) {
       const name = declarationName(node);
-      const declaration = declarationNode(node);
-      if (name && declaration) {
+      if (name) {
         const kind = typeKind(node);
         const relationships = {
-          extends: nodeList(declaration, kind === "interface" ? "interfaceExtends" : "classExtends"),
-          implements: nodeList(declaration, "classImplements"),
-          permits: nodeList(declaration, kind === "interface" ? "interfacePermits" : "classPermits"),
+          extends:
+            kind === "interface"
+              ? relationshipList(directChild(node, "extends_interfaces") ?? null, "extends")
+              : relationshipList(node.childForFieldName("superclass"), "extends"),
+          implements: relationshipList(node.childForFieldName("interfaces"), "implements"),
+          permits: relationshipList(node.childForFieldName("permits"), "permits"),
         };
         const modifiers = modifierNames(node);
-        const headerTokens = beforeBody(node).map((token) => token.image);
         const symbol: RepoMapSymbol = {
           name,
           kind,
-          signature: render(headerTokens),
+          signature: beforeBody(node),
           exported: modifiers.includes("public") || Boolean(container && implicitlyPublic),
-          line: tokenLine(declaration, kind === "annotation" ? "interface" : kind === "record" ? "record" : kind),
+          line: tokenLine(node, kind === "annotation" ? "interface" : kind),
           ...(container ? { container } : {}),
           annotations: annotationNames(node),
           modifiers,
-          typeParameters: typeParameters(declaration),
+          typeParameters: typeParameters(node),
           relationships,
         };
         symbols.push(symbol);
@@ -317,34 +322,27 @@ export function analyzeJava(text: string): JavaAnalysis {
           const bound = parameter.match(/\bextends\s+(.+)$/u)?.[1];
           if (bound) dependencies.add(bound.replace(/<.*$/u, ""));
         }
-        if (kind === "record") recordComponents(declaration, name, symbols);
+        if (kind === "record") recordComponents(node, name, symbols);
         nextContainer = name;
         nextImplicitlyPublic = kind === "interface" || kind === "annotation";
       }
-    } else if (
-      node.name === "methodDeclaration" ||
-      node.name === "interfaceMethodDeclaration" ||
-      node.name === "annotationInterfaceElementDeclaration"
-    ) {
-      const name = memberName(node);
+    } else if (METHOD_DECLARATIONS.has(node.type)) {
+      const name = declarationName(node);
       if (name) {
         const modifiers = modifierNames(node);
-        const header = firstDescendant(node, "methodHeader");
         const symbol: RepoMapSymbol = {
           name,
           kind: "method",
-          signature: render(beforeBody(node).map((token) => token.image)),
+          signature: beforeBody(node),
           exported:
             modifiers.includes("public") ||
             implicitlyPublic ||
-            Boolean(
-              container && ["interfaceMethodDeclaration", "annotationInterfaceElementDeclaration"].includes(node.name),
-            ),
+            Boolean(container && node.type === "annotation_type_element_declaration"),
           line: tokenLine(node, name),
           ...(container ? { container } : {}),
           annotations: annotationNames(node),
           modifiers,
-          typeParameters: typeParameters(header ?? node),
+          typeParameters: typeParameters(node),
         };
         symbols.push(symbol);
         for (const parameter of symbol.typeParameters ?? []) {
@@ -353,14 +351,14 @@ export function analyzeJava(text: string): JavaAnalysis {
         }
       }
       nextImplicitlyPublic = false;
-    } else if (node.name === "constructorDeclaration" || node.name === "compactConstructorDeclaration") {
-      const name = memberName(node) ?? container;
+    } else if (CONSTRUCTOR_DECLARATIONS.has(node.type)) {
+      const name = declarationName(node) ?? container;
       if (name) {
         const modifiers = modifierNames(node);
         symbols.push({
           name,
           kind: "constructor",
-          signature: render(beforeBody(node).map((token) => token.image)),
+          signature: beforeBody(node),
           exported: modifiers.includes("public"),
           line: tokenLine(node, name),
           ...(container ? { container } : {}),
@@ -370,14 +368,14 @@ export function analyzeJava(text: string): JavaAnalysis {
         });
         nextImplicitlyPublic = false;
       }
-    } else if (node.name === "fieldDeclaration" || node.name === "constantDeclaration") {
+    } else if (FIELD_DECLARATIONS.has(node.type)) {
       const modifiers = modifierNames(node);
       for (const name of fieldNames(node)) {
         symbols.push({
           name,
           kind: "field",
           signature: fieldSignature(node, name),
-          exported: modifiers.includes("public") || implicitlyPublic || node.name === "constantDeclaration",
+          exported: modifiers.includes("public") || implicitlyPublic || node.type === "constant_declaration",
           line: tokenLine(node, name),
           ...(container ? { container } : {}),
           annotations: annotationNames(node),
@@ -385,8 +383,8 @@ export function analyzeJava(text: string): JavaAnalysis {
         });
       }
       nextImplicitlyPublic = false;
-    } else if (node.name === "enumConstant") {
-      const name = allTokens(node).find((token) => token.tokenType.name === "Identifier")?.image;
+    } else if (node.type === "enum_constant") {
+      const name = declarationName(node);
       if (name) {
         symbols.push({
           name,
@@ -400,7 +398,7 @@ export function analyzeJava(text: string): JavaAnalysis {
         });
       }
     }
-    for (const child of childNodes(node)) walk(child, nextContainer, nextImplicitlyPublic);
+    for (const child of node.namedChildren) walk(child, nextContainer, nextImplicitlyPublic);
   };
   walk(root);
 
@@ -411,4 +409,23 @@ export function analyzeJava(text: string): JavaAnalysis {
     symbols,
     dependencies: [...dependencies],
   };
+}
+
+export async function analyzeJava(text: string): Promise<JavaAnalysis> {
+  validateBounds(text);
+  return withJavaParser((parser) => {
+    const tree = parser.parse(text);
+    if (!tree) throw new Error("parse error: Java parser returned no syntax tree");
+    try {
+      if (tree.rootNode.hasError) {
+        const error = firstParseError(tree.rootNode) ?? tree.rootNode;
+        throw new Error(
+          `parse error: Java syntax is malformed at line ${error.startPosition.row + 1}, column ${error.startPosition.column + 1}`,
+        );
+      }
+      return analyzeTree(tree.rootNode);
+    } finally {
+      tree.delete();
+    }
+  });
 }

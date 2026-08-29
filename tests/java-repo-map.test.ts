@@ -46,6 +46,7 @@ describe("Java semantic repository map", () => {
     const snapshot = await buildRepoMap({ projectRoot: root });
     const file = snapshot.files[0];
 
+    expect(snapshot.provenance.javaParser).toBe("web-tree-sitter@0.26.11+tree-sitter-java-orchard@0.5.10");
     expect(file).toMatchObject({
       kind: "semantic",
       language: "java",
@@ -232,6 +233,26 @@ describe("Java semantic repository map", () => {
     if (indexed.kind !== "indexed") throw new Error("expected indexed Java outcome");
     expect(indexed.warning?.message.length).toBeLessThanOrEqual(512);
     await expect(indexRepoMapFile(root, "../Outside.java")).rejects.toThrow("project-relative");
+  });
+
+  it("serializes concurrent Java parses without cross-contaminating syntax trees", async () => {
+    const root = await fixture({
+      "src/Alpha.java": "public class Alpha { public void alphaOnly() {} }",
+      "src/Beta.java": "public class Beta { public void betaOnly() {} }",
+      "src/Gamma.java": "public class Gamma { public void gammaOnly() {} }",
+    });
+    const paths = ["src/Alpha.java", "src/Beta.java", "src/Gamma.java"];
+    const outcomes = await Promise.all(
+      Array.from({ length: 4 }, () => paths.map((path) => indexRepoMapFile(root, path))).flat(),
+    );
+
+    for (const [index, outcome] of outcomes.entries()) {
+      expect(outcome.kind).toBe("indexed");
+      if (outcome.kind !== "indexed") throw new Error("expected indexed Java outcome");
+      const expected = paths[index % paths.length]?.match(/([^/]+)\.java$/u)?.[1];
+      expect(outcome.file.symbols.find((symbol) => symbol.kind === "class")?.name).toBe(expected);
+      expect(outcome.warning).toBeUndefined();
+    }
   });
 
   it("ranks Java declarations above comments and preserves deterministic bounded results", async () => {

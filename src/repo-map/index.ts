@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import MiniSearch from "minisearch";
 import ts from "typescript";
 import { atomicWriteFile } from "../state/atomic.js";
-import { analyzeJava } from "./java.js";
+import { analyzeJava, JAVA_ANALYZER_VERSION } from "./java.js";
 
 const execFileAsync = promisify(execFile);
 export const REPO_MAP_SCHEMA_VERSION = 1;
@@ -108,7 +108,7 @@ export interface RepoMapSnapshot {
     generatorVersion: "0.1.0";
     parser: "typescript-compiler-api";
     typescriptVersion: string;
-    javaParser?: "java-parser@3.0.1";
+    javaParser?: "java-parser@3.0.1" | typeof JAVA_ANALYZER_VERSION;
     generatedAt: string;
     projectRoot: string;
   };
@@ -674,7 +674,7 @@ export async function indexRepoMapFile(
         file: {
           ...base,
           ...(language === "java"
-            ? analyzeJava(content.toString("utf8"))
+            ? await analyzeJava(content.toString("utf8"))
             : analyzeSemantic(normalizedPath, content.toString("utf8"))),
           kind: "semantic",
           language,
@@ -719,7 +719,7 @@ export async function buildRepoMap(options: BuildRepoMapOptions): Promise<RepoMa
       generatorVersion: "0.1.0",
       parser: "typescript-compiler-api",
       typescriptVersion: ts.version,
-      javaParser: "java-parser@3.0.1",
+      javaParser: JAVA_ANALYZER_VERSION,
       generatedAt: new Date().toISOString(),
       projectRoot,
     },

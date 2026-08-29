@@ -387,7 +387,11 @@ function normalizeSnapshot(value: unknown, limits: { symbolLimit: number; eviden
     throw new CheckpointValidationError();
   }
   assertString(provenanceInput.typescriptVersion);
-  if (provenanceInput.javaParser !== undefined && provenanceInput.javaParser !== "java-parser@3.0.1") {
+  if (
+    provenanceInput.javaParser !== undefined &&
+    provenanceInput.javaParser !== "java-parser@3.0.1" &&
+    provenanceInput.javaParser !== "web-tree-sitter@0.26.11+tree-sitter-java-orchard@0.5.10"
+  ) {
     throw new CheckpointValidationError();
   }
   assertString(provenanceInput.generatedAt);

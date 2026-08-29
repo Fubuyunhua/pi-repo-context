@@ -882,7 +882,11 @@ function validateHandle(handle: unknown, limits: GraphBuildLimits, counts: Build
     throw new BuildFailure("invalid-snapshot", "validate");
   }
   const typescriptVersion = string(provenance.typescriptVersion, limits);
-  if (Object.hasOwn(provenance, "javaParser") && provenance.javaParser !== "java-parser@3.0.1") {
+  if (
+    Object.hasOwn(provenance, "javaParser") &&
+    provenance.javaParser !== "java-parser@3.0.1" &&
+    provenance.javaParser !== "web-tree-sitter@0.26.11+tree-sitter-java-orchard@0.5.10"
+  ) {
     throw new BuildFailure("invalid-enum", "validate");
   }
   const generatedAt = string(provenance.generatedAt, limits);
@@ -974,7 +978,13 @@ function validateHandle(handle: unknown, limits: GraphBuildLimits, counts: Build
       generatorVersion: "0.1.0" as const,
       parser: "typescript-compiler-api" as const,
       typescriptVersion,
-      ...(Object.hasOwn(provenance, "javaParser") ? { javaParser: "java-parser@3.0.1" as const } : {}),
+      ...(Object.hasOwn(provenance, "javaParser")
+        ? {
+            javaParser: provenance.javaParser as
+              | "java-parser@3.0.1"
+              | "web-tree-sitter@0.26.11+tree-sitter-java-orchard@0.5.10",
+          }
+        : {}),
       generatedAt,
       projectRoot,
     },
