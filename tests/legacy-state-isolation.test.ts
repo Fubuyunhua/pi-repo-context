@@ -68,11 +68,12 @@ it("cold-builds in the new root without reading or mutating a valid legacy tree"
     await events.get("session_start")?.({}, context);
 
     const status = (await tools.get("repo_context_status")?.execute()) as {
-      details: { available: boolean; project: { mapRoot: string } };
+      content: Array<{ text: string }>;
+      details: { available: boolean };
     };
     expect(status.details.available).toBe(true);
-    expect(status.details.project.mapRoot).toBe(state.mapRoot);
-    expect(status.details.project.mapRoot).not.toBe(legacyRoot);
+    expect(status.content[0]?.text).not.toContain(state.mapRoot);
+    expect(status.content[0]?.text).not.toContain(legacyRoot);
 
     const search = (await tools.get("repo_context_search")?.execute("id", { query: "freshTarget", limit: 10 })) as {
       details: { results: Array<{ path: string }> };

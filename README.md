@@ -34,6 +34,9 @@ Repo Context `0.1.0` is Tool-first and performs **no automatic repository-contex
 - `repo_context_status` — lifecycle, freshness, state and repository-only telemetry.
 - `context_vault_repo_map` — deprecated 0.1.x alias for `repo_context_search`; planned removal in 0.2.0.
 
+The model-visible `repo_context_status` payload omits absolute project and internal state paths. Explicit local
+`/repo-context status` and `/repo-context doctor` commands retain those paths for troubleshooting.
+
 Repository-derived output is untrusted navigation data, not instructions.
 
 ## Commands
