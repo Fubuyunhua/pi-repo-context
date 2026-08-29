@@ -30,6 +30,7 @@ import {
   RepoMapSearch,
   type RepoMapSnapshot,
   type RepoMapWarning,
+  repoMapBuildCompatibilityKey,
 } from "./index.js";
 import {
   RepositoryCheckpointStore,
@@ -64,6 +65,8 @@ export interface RepoMapScheduler {
 export interface RepoMapGeneration {
   schemaVersion: 1;
   generation: number;
+  /** Optional for schema-1 legacy readability; required for unchanged warm reuse. */
+  buildCompatibilityKey?: string;
   gitHead: string;
   dirtyFiles: Array<{ path: string; contentHash: string }>;
   workspaceRevision: string;
@@ -74,7 +77,7 @@ export interface RepoMapGeneration {
 }
 
 export interface RepoMapFallbackEvidence {
-  kind: "source" | "git-diff";
+  kind: "source" | "git-diff" | "warming";
   path?: string;
   excerpt: string;
 }
@@ -473,6 +476,8 @@ function isRepoMapGeneration(value: unknown, expectedGeneration: number): value 
   return (
     isRecord(value) &&
     value.schemaVersion === 1 &&
+    (value.buildCompatibilityKey === undefined ||
+      (typeof value.buildCompatibilityKey === "string" && SHA256_PATTERN.test(value.buildCompatibilityKey))) &&
     Number.isSafeInteger(value.generation) &&
     (value.generation as number) > 0 &&
     value.generation === expectedGeneration &&
@@ -597,13 +602,18 @@ export class RepoMapRuntime {
     this.#stateBoundary = await RepoStateBoundary.create(this.#options.stateRoot);
     await this.#assertStateBoundary();
     await this.#reconcileGenerationBytes();
-    await this.#hydratePriorGeneration();
+    const hydrated = await this.#hydratePriorGeneration();
     if (this.#options.watch) {
       this.#watcher = (this.#options.watcherFactory ?? watcher)(this.#projectRoot);
       for (const event of ["add", "change", "unlink"] as const) {
         this.#watcher.on(event, (path) => this.notify(event, path));
       }
       await this.#watcher.ready?.();
+    }
+    if (hydrated && (await this.#startFromHydratedBase(hydrated))) {
+      recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordHydratedFastReuse());
+      this.#started = true;
+      return;
     }
     await this.#rebuildBase();
     this.#started = true;
@@ -1112,27 +1122,84 @@ export class RepoMapRuntime {
     this.#nonGitIgnorePatterns = await loadRootGitignorePatterns(this.#projectRoot);
   }
 
-  async #hydratePriorGeneration(): Promise<void> {
-    await this.#assertStateBoundary();
-    let active: RepoMapGeneration;
+  async #hydratePriorGeneration(): Promise<RepoMapGeneration | undefined> {
+    const startedAt = monotonicReading(this.#monotonicNow);
     try {
-      active = await this.#loadActiveGeneration();
-    } catch {
-      // Rebuild remains authoritative when there is no valid persisted prior.
-      return;
+      await this.#assertStateBoundary();
+      let active: RepoMapGeneration;
+      try {
+        active = await this.#loadActiveGeneration();
+      } catch {
+        // Rebuild remains authoritative when there is no valid persisted prior.
+        return undefined;
+      }
+      if (resolve(active.snapshot.provenance.projectRoot) !== this.#projectRoot) return undefined;
+      // Legacy Java analyzer generations remain portable/readable, but reusing
+      // their files would mix incompatible analyzer output into this runtime.
+      if (active.snapshot.provenance.javaParser === "java-parser@3.0.1") return undefined;
+      this.#generation = active.generation;
+      this.#head = active.gitHead;
+      this.#dirty = new Map(active.dirtyFiles.map(({ path, contentHash }) => [path, contentHash]));
+      this.#pending = new Set(active.pendingFiles);
+      // The parsed generation is private to this runtime. Keep its clean snapshot
+      // as the immutable base and clone only the effective overlay.
+      this.#base = active.snapshot;
+      this.#effective = cloneSnapshot(active.snapshot);
+      this.#freshness = active.freshness;
+      this.#publishCheckpoint();
+      return active;
+    } finally {
+      recordTelemetry(this.#telemetry, (telemetry) =>
+        telemetry.recordHydration(monotonicDuration(this.#monotonicNow, startedAt)),
+      );
     }
-    if (resolve(active.snapshot.provenance.projectRoot) !== this.#projectRoot) return;
-    // Legacy Java analyzer generations remain portable/readable, but reusing
-    // their files would mix incompatible analyzer output into this runtime.
-    if (active.snapshot.provenance.javaParser === "java-parser@3.0.1") return;
-    this.#generation = active.generation;
-    this.#head = active.gitHead;
-    this.#dirty = new Map(active.dirtyFiles.map(({ path, contentHash }) => [path, contentHash]));
-    this.#pending = new Set(active.pendingFiles);
-    this.#base = cloneSnapshot(active.snapshot);
-    this.#effective = cloneSnapshot(active.snapshot);
-    this.#freshness = active.freshness;
+  }
+
+  async #startFromHydratedBase(active: RepoMapGeneration): Promise<boolean> {
+    if (
+      // Injectable file systems may impose visibility/read semantics that Git
+      // cannot verify, so they conservatively retain the authoritative rebuild.
+      this.#options.indexFileSystem !== undefined ||
+      active.buildCompatibilityKey !== repoMapBuildCompatibilityKey(this.#options.exclude) ||
+      active.dirtyFiles.length > 0 ||
+      active.pendingFiles.length > 0 ||
+      (active.freshness !== "fresh" && active.freshness !== "unsupported")
+    ) {
+      return false;
+    }
+
+    // HEAD and a successful clean Git status are both required. A non-Git
+    // workspace or any status failure takes the authoritative full-build path.
+    const currentHead = await gitHead(this.#projectRoot, this.#gitRunner, this.#telemetry, this.#monotonicNow);
+    if (currentHead === "no-head" || currentHead !== active.gitHead) return false;
+    const initialDirty = await gitDirtyPaths(this.#projectRoot, this.#gitRunner, this.#telemetry, this.#monotonicNow);
+    if (!initialDirty || initialDirty.length > 0) return false;
+    this.#gitWorkspace = true;
+    this.#nonGitIgnorePatterns = [];
+
+    // Events observed while the watcher attached must be reconciled before the
+    // hydrated generation can be advertised as live.
+    await this.#drainWatcherUpdates();
+    if (this.#dirty.size > 0 || this.#pending.size > 0 || this.#readFailures.size > 0) return false;
+    const epoch = this.#mutationEpoch;
+    const verifiedHead = await gitHead(this.#projectRoot, this.#gitRunner, this.#telemetry, this.#monotonicNow);
+    const verifiedDirty = await gitDirtyPaths(this.#projectRoot, this.#gitRunner, this.#telemetry, this.#monotonicNow);
+    if (
+      verifiedHead !== active.gitHead ||
+      !verifiedDirty ||
+      verifiedDirty.length > 0 ||
+      epoch !== this.#mutationEpoch ||
+      this.#watcherUpdates.length > 0
+    ) {
+      return false;
+    }
+
+    this.#head = verifiedHead;
+    this.#baseBuildFailed = false;
+    this.#error = undefined;
+    this.#freshness = this.#computedFreshness();
     this.#publishCheckpoint();
+    return true;
   }
 
   async #reconcileDirtyOverlay(): Promise<boolean> {
@@ -1193,6 +1260,17 @@ export class RepoMapRuntime {
   }
 
   async #rebuildBase(): Promise<boolean> {
+    const startedAt = monotonicReading(this.#monotonicNow);
+    try {
+      return await this.#rebuildBaseUninstrumented();
+    } finally {
+      recordTelemetry(this.#telemetry, (telemetry) =>
+        telemetry.recordFullBuild(monotonicDuration(this.#monotonicNow, startedAt)),
+      );
+    }
+  }
+
+  async #rebuildBaseUninstrumented(): Promise<boolean> {
     await this.#assertStateBoundary();
     // Build into detached local state first. A builder failure must not replace
     // hydrated or previously published content with an incomplete rebuild.
@@ -1291,6 +1369,7 @@ export class RepoMapRuntime {
         const candidate: RepoMapGeneration = {
           schemaVersion: 1,
           generation: candidateGeneration,
+          buildCompatibilityKey: repoMapBuildCompatibilityKey(this.#options.exclude),
           gitHead: this.#head,
           dirtyFiles: [...this.#dirty]
             .sort(([left], [right]) => left.localeCompare(right))

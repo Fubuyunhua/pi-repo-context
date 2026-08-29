@@ -10,6 +10,30 @@ import { analyzeJava, JAVA_ANALYZER_VERSION } from "./java.js";
 
 const execFileAsync = promisify(execFile);
 export const REPO_MAP_SCHEMA_VERSION = 1;
+/** Bump when repository admission or analyzer output changes incompatibly. */
+export const REPO_MAP_BUILD_COMPATIBILITY_VERSION = "repo-map-build/v1" as const;
+
+/** Stable key proving a persisted clean generation can be reused by this build. */
+export function repoMapBuildCompatibilityKey(exclude: readonly string[] = []): string {
+  // Hash the exact configured patterns. Normalizing separators here would be
+  // unsafe unless the admission matcher performed the identical transform:
+  // distinct matching behavior must never share a fast-reuse key.
+  const normalizedExclusions = [...new Set(exclude)].sort();
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        compatibility: REPO_MAP_BUILD_COMPATIBILITY_VERSION,
+        schema: REPO_MAP_SCHEMA_VERSION,
+        generator: "pi-repo-context@0.1.0",
+        parser: "typescript-compiler-api",
+        typescript: ts.version,
+        java: JAVA_ANALYZER_VERSION,
+        exclude: normalizedExclusions,
+      }),
+    )
+    .digest("hex");
+}
+
 const SEMANTIC_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".java"]);
 const BUILT_IN_EXCLUDED_SEGMENTS = new Set([
   ".git",

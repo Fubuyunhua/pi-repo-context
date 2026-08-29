@@ -4,6 +4,13 @@ function finiteNonnegative(value: number): number {
 }
 
 export interface RepoContextTelemetrySnapshot {
+  initializationAttemptCount: number;
+  warmupTimeoutCount: number;
+  hydrationCount: number;
+  hydrationDurationMsTotal: number;
+  hydratedFastReuseCount: number;
+  fullBuildCount: number;
+  fullBuildDurationMsTotal: number;
   repoMapQueryCount: number;
   repoMapQueryDurationMsTotal: number;
   ensureFreshCount: number;
@@ -31,6 +38,13 @@ export interface RepoContextTelemetrySnapshot {
 
 export class RepoContextTelemetry {
   #values: RepoContextTelemetrySnapshot = {
+    initializationAttemptCount: 0,
+    warmupTimeoutCount: 0,
+    hydrationCount: 0,
+    hydrationDurationMsTotal: 0,
+    hydratedFastReuseCount: 0,
+    fullBuildCount: 0,
+    fullBuildDurationMsTotal: 0,
     repoMapQueryCount: 0,
     repoMapQueryDurationMsTotal: 0,
     ensureFreshCount: 0,
@@ -58,6 +72,23 @@ export class RepoContextTelemetry {
 
   snapshot(): RepoContextTelemetrySnapshot {
     return { ...this.#values };
+  }
+  recordInitializationAttempt(): void {
+    this.#values.initializationAttemptCount += 1;
+  }
+  recordWarmupTimeout(): void {
+    this.#values.warmupTimeoutCount += 1;
+  }
+  recordHydration(durationMs: number): void {
+    this.#values.hydrationCount += 1;
+    this.#values.hydrationDurationMsTotal += finiteNonnegative(durationMs);
+  }
+  recordHydratedFastReuse(): void {
+    this.#values.hydratedFastReuseCount += 1;
+  }
+  recordFullBuild(durationMs: number): void {
+    this.#values.fullBuildCount += 1;
+    this.#values.fullBuildDurationMsTotal += finiteNonnegative(durationMs);
   }
   recordRepoMapQuery(durationMs: number): void {
     this.#values.repoMapQueryCount += 1;

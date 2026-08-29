@@ -18,6 +18,7 @@ export const EXTENSION_VERSION = "0.1.0" as const;
 const MAX_FAILURES = 20;
 const MAX_FAILURE_BYTES = 512;
 const MAX_STATUS_PATHS = 64;
+const INITIAL_SEARCH_WAIT_MS = 250;
 const SEARCH_RESULT_TYPE = "repo_context_search_result" as const;
 const SEARCH_TRUST = "untrusted-derived-navigation-data" as const;
 const LEGACY_SEARCH_TOOL = "context_vault_repo_map" as const;
@@ -35,6 +36,12 @@ const PUBLIC_ERRORS = Object.freeze({
 });
 
 type FailureComponent = "initialization" | "repo-map" | "query" | "rebuild";
+export type RepoContextLifecycle = "pre-session" | "disabled" | "dormant" | "warming" | "ready" | "failed" | "stopping";
+export type RepoContextInitializationWaiter = (
+  initialization: Promise<void>,
+  budgetMs: number,
+) => Promise<"ready" | "timeout">;
+
 export interface BoundedFailure {
   component: FailureComponent;
   error: string;
@@ -52,10 +59,17 @@ export interface RepoMapController {
 }
 
 interface RuntimeState {
+  epoch: number;
   initialized: boolean;
+  lifecycle: RepoContextLifecycle;
+  disposed: boolean;
   config?: RepoContextConfig;
   state?: RepoContextProjectState;
   repoMap?: RepoMapController;
+  initializationPromise?: Promise<void>;
+  rebuildPromise?: Promise<void>;
+  closePromise?: Promise<void>;
+  activeOperations: Set<Promise<void>>;
   available: boolean;
   failures: BoundedFailure[];
   telemetry: RepoContextTelemetry;
@@ -70,6 +84,8 @@ export interface RegisterRepoContextOptions {
     config: RepoContextConfig;
     telemetry: RepoContextTelemetry;
   }) => RepoMapController;
+  /** Deterministic wait primitive; production uses the fixed 250 ms budget. */
+  initializationWaiter?: RepoContextInitializationWaiter;
   stdout?: (text: string) => void;
 }
 
@@ -77,6 +93,7 @@ export interface BoundedSearchPayload {
   type: typeof SEARCH_RESULT_TYPE;
   trust: typeof SEARCH_TRUST;
   query: string;
+  lifecycle: RepoContextLifecycle;
   freshness: RepoMapFreshness;
   generation: number;
   gitHead: string;
@@ -91,12 +108,14 @@ export interface BoundedSearchPayload {
 export interface RepoContextStatusPayload {
   extension: { id: typeof EXTENSION_ID; version: typeof EXTENSION_VERSION };
   initialized: boolean;
+  lifecycle: RepoContextLifecycle;
   enabled: boolean | null;
   available: boolean;
   degraded: boolean;
   components: {
     repoMap: {
       available: boolean;
+      lifecycle: RepoContextLifecycle;
       freshness?: RepoMapFreshness;
       generation?: number;
       gitHead?: string;
@@ -147,12 +166,14 @@ export function boundSearchPayload(
   result: RepoMapRuntimeQuery,
   maxBytes: number,
   publicError?: string,
+  lifecycle: RepoContextLifecycle = "ready",
 ): { payload: BoundedSearchPayload; text: string } {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 512) throw new Error("searchMaxBytes must be at least 512 bytes");
   const payload: BoundedSearchPayload = {
     type: SEARCH_RESULT_TYPE,
     trust: SEARCH_TRUST,
     query,
+    lifecycle,
     freshness: result.freshness,
     generation: result.generation,
     gitHead: result.gitHead,
@@ -164,7 +185,7 @@ export function boundSearchPayload(
     ...(result.error ? { error: publicError ?? PUBLIC_ERRORS.searchResult } : {}),
   };
   const bytes = () => Buffer.byteLength(renderSearch(payload), "utf8");
-  while (bytes() > maxBytes && payload.fallbackEvidence.length > 0) {
+  while (bytes() > maxBytes && payload.fallbackEvidence.length > 0 && lifecycle !== "warming") {
     payload.fallbackEvidence.pop();
     markTruncated(payload, "fallbackEvidence");
   }
@@ -219,11 +240,17 @@ function mapStatusDegraded(map: ReturnType<RepoMapController["status"]> | undefi
 }
 
 export function buildStatus(runtime: RuntimeState): RepoContextStatusPayload {
-  const map = runtime.repoMap?.status();
+  // status() assumes start() completed and must never be called for a dormant
+  // or partially-started controller.
+  const map = runtime.lifecycle === "ready" ? runtime.repoMap?.status() : undefined;
   const pending = boundedPaths(map?.pendingFiles ?? []);
   const dirty = boundedPaths(map?.dirtyFiles ?? []);
   const mapFailure = [...runtime.failures].reverse().find((failure) => failure.component === "repo-map");
-  const degraded = runtime.failures.length > 0 || mapStatusDegraded(map);
+  const degraded =
+    runtime.failures.length > 0 ||
+    mapStatusDegraded(map) ||
+    runtime.lifecycle === "warming" ||
+    runtime.lifecycle === "failed";
   const maintenance =
     map?.maintenance === undefined
       ? undefined
@@ -233,6 +260,7 @@ export function buildStatus(runtime: RuntimeState): RepoContextStatusPayload {
   return {
     extension: { id: EXTENSION_ID, version: EXTENSION_VERSION },
     initialized: runtime.initialized,
+    lifecycle: runtime.lifecycle,
     enabled: runtime.config?.enabled ?? null,
     available: runtime.available,
     degraded,
@@ -240,6 +268,7 @@ export function buildStatus(runtime: RuntimeState): RepoContextStatusPayload {
       repoMap: map
         ? {
             available: runtime.available,
+            lifecycle: runtime.lifecycle,
             freshness: map.freshness,
             generation: map.generation,
             gitHead: map.gitHead,
@@ -257,7 +286,11 @@ export function buildStatus(runtime: RuntimeState): RepoContextStatusPayload {
                 ? { error: mapFailure.error }
                 : {}),
           }
-        : { available: false, ...(mapFailure ? { error: mapFailure.error } : {}) },
+        : {
+            available: false,
+            lifecycle: runtime.lifecycle,
+            ...(mapFailure ? { error: mapFailure.error } : {}),
+          },
     },
     telemetry: runtime.telemetry.snapshot(),
     failures: runtime.failures.map((failure) => ({ ...failure })),
@@ -302,16 +335,56 @@ function updateUi(ctx: ExtensionContext, runtime: RuntimeState): void {
   ctx.ui.setStatus(EXTENSION_ID, `repo-context v${EXTENSION_VERSION}${suffix}`);
 }
 
+const defaultInitializationWaiter: RepoContextInitializationWaiter = (initialization, budgetMs) =>
+  new Promise((resolveWait) => {
+    let settled = false;
+    const finish = (result: "ready" | "timeout") => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolveWait(result);
+    };
+    const timeout = setTimeout(() => finish("timeout"), budgetMs);
+    timeout.unref();
+    // Initialization failures are reflected by lifecycle; waking the caller is
+    // sufficient and avoids leaking internal rejection details.
+    void initialization.then(
+      () => finish("ready"),
+      () => finish("ready"),
+    );
+  });
+
 export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoContextOptions = {}): void {
   const configLoader = options.loadConfig ?? loadConfig;
   const stateResolver = options.resolveProjectState ?? resolveProjectState;
   const runtimeFactory = options.runtimeFactory ?? createRuntime;
+  const initializationWaiter = options.initializationWaiter ?? defaultInitializationWaiter;
   const stdout = options.stdout ?? ((text: string) => console.log(text));
-  let runtime: RuntimeState = {
+  let epoch = 0;
+  const freshRuntime = (runtimeEpoch: number): RuntimeState => ({
+    epoch: runtimeEpoch,
     initialized: false,
+    lifecycle: "pre-session",
+    disposed: false,
+    activeOperations: new Set(),
     available: false,
     failures: [],
     telemetry: new RepoContextTelemetry(),
+  });
+  let runtime: RuntimeState = freshRuntime(epoch);
+  const isCurrent = (target: RuntimeState): boolean => target === runtime && target.epoch === epoch && !target.disposed;
+  const withActiveOperation = async <T>(target: RuntimeState, operation: () => Promise<T>): Promise<T> => {
+    let complete: () => void = () => {};
+    const completion = new Promise<void>((resolveCompletion) => {
+      complete = resolveCompletion;
+    });
+    target.activeOperations.add(completion);
+    try {
+      return await operation();
+    } finally {
+      complete();
+      target.activeOperations.delete(completion);
+    }
   };
 
   const setLegacySearchActive = (enabled: boolean): void => {
@@ -320,106 +393,177 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     pi.setActiveTools(active);
   };
 
-  const dispose = async (): Promise<void> => {
-    const map = runtime.repoMap;
-    runtime.repoMap = undefined;
-    runtime.available = false;
-    if (map) {
+  const closeMapOnce = (target: RuntimeState): Promise<void> => {
+    if (target.closePromise) return target.closePromise;
+    const map = target.repoMap;
+    target.repoMap = undefined;
+    target.available = false;
+    target.closePromise = (async () => {
+      if (!map) return;
       try {
         await map.close();
       } catch (error) {
-        addFailure(runtime, "repo-map", error);
+        addFailure(target, "repo-map", error);
       }
+    })();
+    return target.closePromise;
+  };
+
+  const dispose = async (target: RuntimeState): Promise<void> => {
+    target.disposed = true;
+    target.available = false;
+    target.lifecycle = "stopping";
+    await target.rebuildPromise?.catch(() => undefined);
+    await target.initializationPromise?.catch(() => undefined);
+    await Promise.allSettled([...target.activeOperations]);
+    await closeMapOnce(target);
+  };
+
+  const beginInitialization = (target: RuntimeState): Promise<void> => {
+    if (target.initializationPromise) return target.initializationPromise;
+    if (target.lifecycle !== "dormant" || !target.state || !target.config?.enabled || target.disposed) {
+      return Promise.resolve();
     }
+    target.lifecycle = "warming";
+    target.telemetry.recordInitializationAttempt();
+    let map: RepoMapController;
+    try {
+      map = runtimeFactory({
+        projectRoot: target.state.projectRoot,
+        mapRoot: target.state.mapRoot,
+        config: target.config,
+        telemetry: target.telemetry,
+      });
+      target.repoMap = map;
+    } catch (error) {
+      addFailure(target, "repo-map", error);
+      target.lifecycle = "failed";
+      return Promise.resolve();
+    }
+    target.initializationPromise = map.start().then(
+      () => {
+        if (!isCurrent(target)) return;
+        target.lifecycle = "ready";
+        target.available = true;
+      },
+      async (error) => {
+        addFailure(target, "repo-map", error);
+        target.lifecycle = target.disposed ? "stopping" : "failed";
+        target.available = false;
+        await closeMapOnce(target);
+      },
+    );
+    return target.initializationPromise;
   };
 
   pi.on("session_start", async (_event, ctx) => {
     // Pi activates newly registered tools by default. Remove only our deprecated
     // alias before loading configuration so initialization failures stay closed.
     setLegacySearchActive(false);
-    await dispose();
-    const next: RuntimeState = {
-      initialized: false,
-      available: false,
-      failures: [],
-      telemetry: new RepoContextTelemetry(),
-    };
+    const previous = runtime;
+    const next = freshRuntime(++epoch);
+    runtime = next;
+    await dispose(previous);
+    if (!isCurrent(next)) return;
     try {
       next.state = await stateResolver(ctx.cwd);
+      if (!isCurrent(next)) return;
       next.config = await configLoader(next.state.projectRoot);
-      if (next.config.enabled) {
-        const map = runtimeFactory({
-          projectRoot: next.state.projectRoot,
-          mapRoot: next.state.mapRoot,
-          config: next.config,
-          telemetry: next.telemetry,
-        });
-        next.repoMap = map;
-        try {
-          await map.start();
-          next.available = true;
-        } catch (error) {
-          addFailure(next, "repo-map", error);
-          try {
-            await map.close();
-          } catch (closeError) {
-            addFailure(next, "repo-map", closeError);
-          }
-          next.repoMap = undefined;
-        }
-      }
+      if (!isCurrent(next)) return;
+      next.lifecycle = next.config.enabled ? "dormant" : "disabled";
     } catch (error) {
       addFailure(next, "initialization", error);
+      next.lifecycle = "failed";
     }
     next.initialized = true;
-    runtime = next;
     setLegacySearchActive(next.config?.legacyContextVaultRepoMap === true);
-    updateUi(ctx, runtime);
+    updateUi(ctx, next);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     setLegacySearchActive(false);
-    await dispose();
-    runtime = {
-      initialized: false,
-      available: false,
-      failures: [],
-      telemetry: new RepoContextTelemetry(),
-    };
-    if (ctx.hasUI) ctx.ui.setStatus(EXTENSION_ID, undefined);
+    const previous = runtime;
+    const next = freshRuntime(++epoch);
+    runtime = next;
+    await dispose(previous);
+    if (runtime === next && ctx.hasUI) ctx.ui.setStatus(EXTENSION_ID, undefined);
   });
 
-  const executeSearch = async (params: { query: string; limit?: number }, deprecated: boolean) => {
-    if (!runtime.initialized || !runtime.available || !runtime.repoMap) {
-      if (runtime.initialized && runtime.config?.enabled === false) throw new Error(PUBLIC_ERRORS.disabled);
-      throw new Error(PUBLIC_ERRORS.unavailable);
-    }
+  const warmingResult = (): RepoMapRuntimeQuery => ({
+    results: [],
+    freshness: "stale",
+    generation: 0,
+    gitHead: "unavailable",
+    workspaceRevision: "unavailable",
+    pendingFiles: [],
+    fallbackEvidence: [
+      {
+        kind: "warming",
+        excerpt: "Repository index is warming; retry repository search or use direct filesystem search.",
+      },
+    ],
+  });
 
-    let result: RepoMapRuntimeQuery;
-    try {
-      result = await runtime.repoMap.query(params.query, { limit: params.limit });
-    } catch (error) {
-      addFailure(runtime, "query", error);
-      throw new Error(PUBLIC_ERRORS.query);
-    }
+  const executeSearch = (params: { query: string; limit?: number }, deprecated: boolean) => {
+    const target = runtime;
+    return withActiveOperation(target, async () => {
+      if (!target.initialized) throw new Error(PUBLIC_ERRORS.unavailable);
+      if (target.config?.enabled === false) throw new Error(PUBLIC_ERRORS.disabled);
+      if (target.lifecycle === "dormant") beginInitialization(target);
+      if (target.lifecycle === "warming") {
+        const readiness = target.rebuildPromise ?? target.initializationPromise;
+        const outcome = readiness ? await initializationWaiter(readiness, INITIAL_SEARCH_WAIT_MS) : "ready";
+        if (!isCurrent(target)) throw new Error(PUBLIC_ERRORS.unavailable);
+        if (outcome === "timeout" && target.lifecycle === "warming") {
+          target.telemetry.recordWarmupTimeout();
+          const bounded = boundSearchPayload(
+            params.query,
+            warmingResult(),
+            target.config?.searchMaxBytes ?? 6 * 1024,
+            undefined,
+            "warming",
+          );
+          return {
+            content: [{ type: "text" as const, text: bounded.text }],
+            details: deprecated
+              ? { ...bounded.payload, deprecated: true as const, replacement: "repo_context_search" as const }
+              : bounded.payload,
+          };
+        }
+      }
+      if (target.lifecycle === "failed" || !target.available || !target.repoMap) {
+        throw new Error(PUBLIC_ERRORS.unavailable);
+      }
 
-    try {
-      const bounded = boundSearchPayload(
-        params.query,
-        result,
-        runtime.config?.searchMaxBytes ?? 6 * 1024,
-        result.error === undefined ? undefined : PUBLIC_ERRORS.searchResult,
-      );
-      return {
-        content: [{ type: "text" as const, text: bounded.text }],
-        details: deprecated
-          ? { ...bounded.payload, deprecated: true as const, replacement: "repo_context_search" as const }
-          : bounded.payload,
-      };
-    } catch (error) {
-      addFailure(runtime, "query", error);
-      throw new Error(PUBLIC_ERRORS.query);
-    }
+      let result: RepoMapRuntimeQuery;
+      try {
+        result = await target.repoMap.query(params.query, { limit: params.limit });
+      } catch (error) {
+        if (!isCurrent(target)) throw new Error(PUBLIC_ERRORS.unavailable);
+        addFailure(target, "query", error);
+        throw new Error(PUBLIC_ERRORS.query);
+      }
+      if (!isCurrent(target)) throw new Error(PUBLIC_ERRORS.unavailable);
+
+      try {
+        const bounded = boundSearchPayload(
+          params.query,
+          result,
+          target.config?.searchMaxBytes ?? 6 * 1024,
+          result.error === undefined ? undefined : PUBLIC_ERRORS.searchResult,
+          target.lifecycle,
+        );
+        return {
+          content: [{ type: "text" as const, text: bounded.text }],
+          details: deprecated
+            ? { ...bounded.payload, deprecated: true as const, replacement: "repo_context_search" as const }
+            : bounded.payload,
+        };
+      } catch (error) {
+        addFailure(target, "query", error);
+        throw new Error(PUBLIC_ERRORS.query);
+      }
+    });
   };
 
   const searchParameters = Type.Object(
@@ -489,29 +633,54 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
         return;
       }
       if (command === "rebuild") {
-        if (runtime.config?.enabled === false) {
+        const target = runtime;
+        if (target.config?.enabled === false) {
           notify(ctx, "Repository context is disabled.", "warning");
           return;
         }
-        if (!runtime.available || !runtime.repoMap) {
+        if (!target.initialized || target.lifecycle === "failed" || target.lifecycle === "stopping") {
           notify(ctx, "Repository context is unavailable.", "error");
           return;
         }
         try {
-          await runtime.repoMap.rebuild();
-          const status = runtime.repoMap.status();
-          if (mapStatusDegraded(status)) {
-            addFailure(runtime, "rebuild", status.error ?? `rebuild completed with ${status.freshness} freshness`);
-            notify(ctx, buildDiagnosticStatus(runtime), "error");
-          } else {
-            runtime.failures = runtime.failures.filter((failure) => failure.component !== "rebuild");
-            notify(ctx, buildDiagnosticStatus(runtime));
+          if (!target.rebuildPromise) {
+            const initialization = beginInitialization(target);
+            const operation = (async () => {
+              await initialization;
+              if (target.disposed || target.lifecycle === "failed" || !target.repoMap) {
+                throw new Error(PUBLIC_ERRORS.unavailable);
+              }
+              target.lifecycle = "warming";
+              target.available = false;
+              try {
+                await target.repoMap.rebuild();
+              } finally {
+                if (!target.disposed) {
+                  target.lifecycle = "ready";
+                  target.available = true;
+                }
+              }
+            })();
+            const tracked = operation.finally(() => {
+              if (target.rebuildPromise === tracked) target.rebuildPromise = undefined;
+            });
+            target.rebuildPromise = tracked;
           }
-          updateUi(ctx, runtime);
+          await target.rebuildPromise;
+          if (!isCurrent(target) || !target.repoMap) return;
+          const status = target.repoMap.status();
+          if (mapStatusDegraded(status)) {
+            addFailure(target, "rebuild", status.error ?? `rebuild completed with ${status.freshness} freshness`);
+            notify(ctx, buildDiagnosticStatus(target), "error");
+          } else {
+            target.failures = target.failures.filter((failure) => failure.component !== "rebuild");
+            notify(ctx, buildDiagnosticStatus(target));
+          }
+          updateUi(ctx, target);
         } catch (error) {
-          addFailure(runtime, "rebuild", error);
-          notify(ctx, buildDiagnosticStatus(runtime), "error");
-          updateUi(ctx, runtime);
+          addFailure(target, "rebuild", error);
+          notify(ctx, buildDiagnosticStatus(target), "error");
+          updateUi(ctx, target);
         }
         return;
       }

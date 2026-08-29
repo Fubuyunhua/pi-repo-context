@@ -35,9 +35,16 @@ Repo Context `0.1.0` is Tool-first and performs **no automatic repository-contex
 - `context_vault_repo_map` — deprecated 0.1.x alias for `repo_context_search`; registered for compatibility,
   inactive by default, and planned for removal in 0.2.0.
 
-Hard search failures (before initialization, disabled/unavailable runtime, startup failure, or rejected query) are Pi Tool
-errors. Fulfilled stale/degraded searches that still provide bounded navigation evidence remain successful Tool results and
-carry sanitized degradation metadata.
+Enabled sessions resolve state/configuration and remain `dormant` until the first search or explicit rebuild. The first
+search lazily starts one shared initialization and waits through a fixed 250 ms logical budget. If the budget expires,
+search returns successful bounded `warming` fallback evidence while initialization continues; a real startup failure
+remains a sanitized hard unavailable Tool error. Status reports lifecycle separately from repository freshness and never
+inspects a controller before startup completes.
+
+Hard search failures (before initialization, disabled/unavailable runtime, settled startup failure, or rejected query) are
+Pi Tool errors. Fulfilled warming/stale/degraded searches that still provide bounded navigation evidence remain successful
+Tool results and carry sanitized degradation metadata. A compatible hydrated clean generation can take an unchanged warm
+path after Git HEAD/status and watcher safety checks; legacy generations without the compatibility key rebuild once.
 
 Search preserves dotted and underscored identifiers, boosts exact symbols, exports, and qualified paths, and applies
 query-aware de-boosts to vendor, minified, and locale-catalog paths. Those paths remain searchable when requested

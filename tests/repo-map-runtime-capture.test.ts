@@ -237,6 +237,9 @@ describe("repository map runtime snapshot capture", () => {
       projectRoot: root,
       stateRoot,
       watch: false,
+      // A changed admission key deliberately forces the authoritative startup
+      // rebuild instead of compatible clean-generation reuse.
+      exclude: ["not-present"],
       snapshotBuilder: async () => {
         throw new Error("SECRET hydrated build failure");
       },

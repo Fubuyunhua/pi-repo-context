@@ -267,6 +267,24 @@ function parseSingleSuccessfulNotification(records, offset, label) {
   }
 }
 
+function assertDormantStatus(status, label) {
+  if (
+    status?.extension?.id !== "repo-context" ||
+    status.initialized !== true ||
+    status.enabled !== true ||
+    status.available !== false ||
+    status.degraded !== false ||
+    status.lifecycle !== "dormant" ||
+    status.components?.repoMap?.available !== false ||
+    status.components?.repoMap?.lifecycle !== "dormant" ||
+    !Array.isArray(status.failures) ||
+    status.failures.length !== 0
+  ) {
+    throw new Error(`${label} is not initialized, enabled, dormant, and healthy`);
+  }
+  return status;
+}
+
 function assertHealthyStatus(status, label) {
   if (
     status?.extension?.id !== "repo-context" ||
@@ -423,16 +441,17 @@ try {
     throw new Error("Repo Context did not publish its Pi status during startup");
   }
 
-  const initialStatus = assertHealthyStatus(await runCommand(rpc, "status"), "initial status");
+  assertDormantStatus(await runCommand(rpc, "status"), "initial status");
+  const mapRoot = join(agentRoot, "pi-repo-context", "projects", projectId, "repo-map");
+  const activePath = join(mapRoot, "active.json");
+  if (existsSync(activePath)) throw new Error("Dormant Pi Repo Context unexpectedly created an active generation");
+
   const rebuildStatus = assertHealthyStatus(await runCommand(rpc, "rebuild"), "rebuild success");
   const coherentStatus = assertHealthyStatus(await runCommand(rpc, "status"), "post-rebuild status");
   for (const field of ["generation", "workspaceRevision", "gitHead", "freshness"]) {
     if (coherentStatus.components.repoMap[field] !== rebuildStatus.components.repoMap[field]) {
       throw new Error(`Post-rebuild status changed coherent field ${field}`);
     }
-  }
-  if (rebuildStatus.components.repoMap.generation < initialStatus.components.repoMap.generation) {
-    throw new Error("Rebuild generation regressed");
   }
   const doctor = await runCommand(rpc, "doctor");
   if (
@@ -445,8 +464,6 @@ try {
   }
   assertHealthyStatus(doctor.repoContext, "doctor Repo Context status");
 
-  const mapRoot = join(agentRoot, "pi-repo-context", "projects", projectId, "repo-map");
-  const activePath = join(mapRoot, "active.json");
   if (!existsSync(activePath)) throw new Error("Pi Repo Context did not create its new-root active generation");
   const active = JSON.parse(readFileSync(activePath, "utf8"));
   const generations = readdirSync(join(mapRoot, "generations")).filter((name) => name.endsWith(".json"));

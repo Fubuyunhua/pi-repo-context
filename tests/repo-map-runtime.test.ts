@@ -4,8 +4,8 @@ import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
-import type { RepoMapFileSystem } from "../src/repo-map/index.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildRepoMap, type RepoMapFileSystem } from "../src/repo-map/index.js";
 import {
   isWatcherIgnoredPath,
   loadActiveRepoMapGeneration,
@@ -758,6 +758,148 @@ describe("incremental repository map runtime", () => {
     expect(query.fallbackEvidence.length).toBeGreaterThan(0);
     failures.recover(join(root, "src/value.ts"));
     await runtime.close();
+  });
+
+  it("reuses a compatible clean generation without a full build or generation write", async () => {
+    const { root, stateRoot } = await fixture({
+      "src/value.ts": "export const warmReuseValue = true;",
+      "src/other.ts": "export const otherValue = true;",
+    });
+    const first = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    await first.start();
+    const original = first.status();
+    await first.close();
+
+    const telemetry = new Telemetry();
+    const snapshotBuilder = vi.fn(async () => {
+      throw new Error("unchanged warm start must not build");
+    });
+    const restarted = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      telemetry,
+      snapshotBuilder,
+    });
+    await restarted.start();
+    const result = await restarted.query("warmReuseValue");
+    expect(snapshotBuilder).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      freshness: "fresh",
+      generation: original.generation,
+      gitHead: original.gitHead,
+      workspaceRevision: original.workspaceRevision,
+    });
+    expect(result.results[0]?.path).toBe("src/value.ts");
+    expect(telemetry.snapshot()).toMatchObject({
+      hydratedFastReuseCount: 1,
+      fullBuildCount: 0,
+      filesReindexed: 0,
+      generationWriteCount: 0,
+      generationCreatedCount: 0,
+    });
+    await restarted.close();
+  });
+
+  it("does not claim unchanged fast reuse for a dirty worktree", async () => {
+    const { root, stateRoot } = await fixture({ "src/value.ts": "export const revisionValue = 'clean';" });
+    const first = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    await first.start();
+    const cleanRevision = first.status().workspaceRevision;
+    await first.close();
+
+    await writeFile(join(root, "src/value.ts"), "export const revisionValue = 'dirty';");
+    const snapshotBuilder = vi.fn(buildRepoMap);
+    const restarted = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false, snapshotBuilder });
+    await restarted.start();
+    const result = await restarted.query("revisionValue");
+    expect(snapshotBuilder).toHaveBeenCalledOnce();
+    expect(result.freshness).toBe("dirty");
+    expect(result.workspaceRevision).not.toBe(cleanRevision);
+    expect(result.results[0]?.path).toBe("src/value.ts");
+    await restarted.close();
+  });
+
+  it("rebuilds once for legacy compatibility metadata, changed exclusions, and changed HEAD", async () => {
+    const { root, stateRoot } = await fixture({ "src/value.ts": "export const compatibilityValue = true;" });
+    const first = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    await first.start();
+    const firstGeneration = first.status().generation;
+    await first.close();
+
+    const pointer = JSON.parse(await readFile(join(stateRoot, "active.json"), "utf8")) as {
+      generation: number;
+      path: string;
+    };
+    const generationPath = join(stateRoot, pointer.path);
+    const legacy = JSON.parse(await readFile(generationPath, "utf8")) as Record<string, unknown>;
+    delete legacy.buildCompatibilityKey;
+    await writeFile(generationPath, `${JSON.stringify(legacy)}\n`);
+
+    const legacyBuilder = vi.fn(buildRepoMap);
+    const migrated = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false, snapshotBuilder: legacyBuilder });
+    await migrated.start();
+    expect(legacyBuilder).toHaveBeenCalledOnce();
+    expect(migrated.status().generation).toBeGreaterThan(firstGeneration);
+    await migrated.close();
+    expect((await loadActiveRepoMapGeneration(stateRoot)).buildCompatibilityKey).toMatch(/^[a-f0-9]{64}$/u);
+
+    const exclusionBuilder = vi.fn(buildRepoMap);
+    const changedExclusions = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      exclude: ["src/never"],
+      snapshotBuilder: exclusionBuilder,
+    });
+    await changedExclusions.start();
+    expect(exclusionBuilder).toHaveBeenCalledOnce();
+    await changedExclusions.close();
+
+    await writeFile(join(root, "README.md"), "changed head\n");
+    await execFileAsync("git", ["add", "README.md"], { cwd: root });
+    await execFileAsync("git", ["commit", "-qm", "changed head"], { cwd: root });
+    const headBuilder = vi.fn(buildRepoMap);
+    const changedHead = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      exclude: ["src/never"],
+      snapshotBuilder: headBuilder,
+    });
+    await changedHead.start();
+    expect(headBuilder).toHaveBeenCalledOnce();
+    expect(changedHead.status().gitHead).not.toBe(first.status().gitHead);
+    await changedHead.close();
+  });
+
+  it("does not fast-reuse across exclusion patterns with distinct matching semantics", async () => {
+    const { root, stateRoot } = await fixture({
+      "src/public.ts": "export const publicValue = true;",
+      "src/private/secret.ts": "export const excludedSecret = true;",
+    });
+    const first = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      exclude: ["src\\private/**"],
+    });
+    await first.start();
+    expect((await first.query("excludedSecret")).results[0]?.path).toBe("src/private/secret.ts");
+    await first.close();
+
+    const snapshotBuilder = vi.fn(buildRepoMap);
+    const changed = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      exclude: ["src/private/**"],
+      snapshotBuilder,
+    });
+    await changed.start();
+    expect(snapshotBuilder).toHaveBeenCalledOnce();
+    expect((await changed.query("excludedSecret")).results).toEqual([]);
+    await changed.close();
   });
 
   it("hydrates coherent persisted evidence on restart, but reports no evidence without a prior generation", async () => {

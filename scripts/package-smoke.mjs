@@ -31,6 +31,7 @@ const MANIFEST_FILE_ALLOWLIST = [
   "docs/specs/0007-cached-repo-map-search.md",
   "docs/specs/0009-turn-start-snapshot-semantics.md",
   "docs/specs/0016-repository-graph-contract.md",
+  "docs/specs/0019-lazy-repo-map-startup.md",
   "docs/specs/README.md",
   "README.md",
   "LICENSE",

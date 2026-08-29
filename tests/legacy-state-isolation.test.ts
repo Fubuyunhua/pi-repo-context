@@ -71,23 +71,31 @@ it("cold-builds in the new root without reading or mutating a valid legacy tree"
     } as unknown as ExtensionAPI;
     registerRepoContext(pi, {
       resolveProjectState: (cwd) => resolveProjectState(cwd, { PI_CODING_AGENT_DIR: piRoot }),
+      initializationWaiter: async (initialization) => {
+        await initialization;
+        return "ready";
+      },
     });
     const context = { cwd: project, hasUI: false, ui: { setStatus() {}, notify() {} } };
     await events.get("session_start")?.({}, context);
 
-    const status = (await tools.get("repo_context_status")?.execute()) as {
+    const dormant = (await tools.get("repo_context_status")?.execute()) as {
       content: Array<{ text: string }>;
-      details: { available: boolean };
+      details: { available: boolean; lifecycle: string };
     };
-    expect(status.details.available).toBe(true);
-    expect(status.content[0]?.text).not.toContain(state.mapRoot);
-    expect(status.content[0]?.text).not.toContain(legacyRoot);
+    expect(dormant.details).toMatchObject({ available: false, lifecycle: "dormant" });
+    expect(dormant.content[0]?.text).not.toContain(state.mapRoot);
+    expect(dormant.content[0]?.text).not.toContain(legacyRoot);
 
     const search = (await tools.get("repo_context_search")?.execute("id", { query: "freshTarget", limit: 10 })) as {
       details: { results: Array<{ path: string }> };
     };
     expect(search.details.results.map((row) => row.path)).toContain("entry.ts");
     expect(search.details.results.map((row) => row.path)).not.toContain("legacy.ts");
+    const ready = (await tools.get("repo_context_status")?.execute()) as {
+      details: { available: boolean; lifecycle: string };
+    };
+    expect(ready.details).toMatchObject({ available: true, lifecycle: "ready" });
     await expect(readFile(join(state.mapRoot, "active.json"), "utf8")).resolves.toContain('"generation"');
 
     await events.get("session_shutdown")?.({}, context);

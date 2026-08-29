@@ -5,6 +5,7 @@ import repoContextExtension from "../extensions/index.js";
 import {
   boundSearchPayload,
   isOutsideRelativePath,
+  type RepoContextInitializationWaiter,
   type RepoMapController,
   registerRepoContext,
 } from "../src/extension.js";
@@ -76,6 +77,16 @@ const queryResult: RepoMapRuntimeQuery = {
   pendingFiles: [],
   fallbackEvidence: [],
 };
+
+function deferred(): { promise: Promise<void>; resolve: () => void; reject: (error: Error) => void } {
+  let resolve = () => {};
+  let reject = (_error: Error) => {};
+  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 function fakeController(overrides: Partial<RepoMapController> = {}): RepoMapController {
   return {
@@ -184,6 +195,141 @@ it("keeps status usable before initialization and when disabled without construc
   );
 });
 
+it("keeps enabled sessions dormant until first search", async () => {
+  const target = harness();
+  const controller = fakeController();
+  const factory = vi.fn(() => controller);
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: factory,
+  });
+
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+  const status = (await target.tools.get("repo_context_status")?.execute()) as {
+    details: { lifecycle: string; available: boolean; components: { repoMap: { lifecycle: string } } };
+  };
+  expect(status.details).toMatchObject({
+    lifecycle: "dormant",
+    available: false,
+    components: { repoMap: { lifecycle: "dormant" } },
+  });
+  expect(factory).not.toHaveBeenCalled();
+  expect(controller.start).not.toHaveBeenCalled();
+  expect(controller.status).not.toHaveBeenCalled();
+});
+
+it("shares lazy initialization and returns deterministic warming evidence when the budget expires", async () => {
+  const target = harness();
+  const start = deferred();
+  const controller = fakeController({ start: vi.fn(() => start.promise) });
+  const factory = vi.fn(() => controller);
+  const waiter = vi.fn<RepoContextInitializationWaiter>(async () => "timeout" as const);
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: factory,
+    initializationWaiter: waiter,
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+
+  const [first, second] = (await Promise.all([
+    target.tools.get("repo_context_search")?.execute("one", { query: "one" }),
+    target.tools.get("repo_context_search")?.execute("two", { query: "two" }),
+  ])) as Array<{ details: Record<string, unknown> }>;
+  expect(factory).toHaveBeenCalledOnce();
+  expect(controller.start).toHaveBeenCalledOnce();
+  expect(waiter).toHaveBeenCalledTimes(2);
+  expect(waiter.mock.calls[0]?.[0]).toBe(waiter.mock.calls[1]?.[0]);
+  expect(waiter.mock.calls[0]?.[1]).toBe(250);
+  expect(first.details).toMatchObject({
+    lifecycle: "warming",
+    freshness: "stale",
+    generation: 0,
+    gitHead: "unavailable",
+    workspaceRevision: "unavailable",
+    fallbackEvidence: [{ kind: "warming" }],
+  });
+  expect(second.details).toMatchObject({ lifecycle: "warming" });
+  expect(first).not.toHaveProperty("isError");
+  const warmingStatus = (await target.tools.get("repo_context_status")?.execute()) as {
+    details: { lifecycle: string; degraded: boolean; components: { repoMap: { lifecycle: string } } };
+  };
+  expect(warmingStatus.details).toMatchObject({
+    lifecycle: "warming",
+    degraded: true,
+    components: { repoMap: { lifecycle: "warming" } },
+  });
+  expect(controller.status).not.toHaveBeenCalled();
+
+  start.resolve();
+  await start.promise;
+  await Promise.resolve();
+  const ready = (await target.tools.get("repo_context_search")?.execute("three", { query: "ready" })) as {
+    details: { lifecycle: string };
+  };
+  expect(ready.details.lifecycle).toBe("ready");
+  expect(controller.query).toHaveBeenCalledOnce();
+});
+
+it("serializes shutdown and session replacement behind initialization and closes once", async () => {
+  const target = harness();
+  const start = deferred();
+  const close = vi.fn(async () => undefined);
+  const controller = fakeController({ start: vi.fn(() => start.promise), close });
+  const factory = vi.fn(() => controller);
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: factory,
+    initializationWaiter: async () => "timeout",
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+  await target.tools.get("repo_context_search")?.execute("id", { query: "warming" });
+
+  const replacement = target.events.get("session_start")?.[0]({}, headlessContext) as Promise<void>;
+  await Promise.resolve();
+  expect(close).not.toHaveBeenCalled();
+  start.resolve();
+  await replacement;
+  expect(close).toHaveBeenCalledOnce();
+  expect(factory).toHaveBeenCalledOnce();
+  const status = (await target.tools.get("repo_context_status")?.execute()) as {
+    details: { lifecycle: string; available: boolean };
+  };
+  expect(status.details).toMatchObject({ lifecycle: "dormant", available: false });
+
+  await target.events.get("session_shutdown")?.[0]({}, headlessContext);
+  expect(close).toHaveBeenCalledOnce();
+});
+
+it("retires an in-flight ready query before session replacement can return old evidence", async () => {
+  const target = harness();
+  let resolveQuery: (result: RepoMapRuntimeQuery) => void = () => {};
+  const queryPromise = new Promise<RepoMapRuntimeQuery>((resolveResult) => {
+    resolveQuery = resolveResult;
+  });
+  const close = vi.fn(async () => undefined);
+  const controller = fakeController({ query: vi.fn(() => queryPromise), close });
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: () => controller,
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+
+  const search = target.tools.get("repo_context_search")?.execute("id", { query: "old session" }) as Promise<unknown>;
+  await vi.waitFor(() => expect(controller.query).toHaveBeenCalledOnce());
+  const replacement = target.events.get("session_start")?.[0]({}, headlessContext) as Promise<void>;
+  await Promise.resolve();
+  expect(close).not.toHaveBeenCalled();
+
+  resolveQuery(queryResult);
+  await expect(search).rejects.toThrow("Repository context is unavailable.");
+  await replacement;
+  expect(close).toHaveBeenCalledOnce();
+});
+
 it("uses live query for primary and alias with identical content and alias-only details", async () => {
   const target = harness();
   const controller = fakeController();
@@ -280,15 +426,15 @@ it("closes partial starts and keeps bounded degraded status available", async ()
     runtimeFactory: () => fakeController({ start: vi.fn(async () => Promise.reject(new Error("boom"))), close }),
   });
   await target.events.get("session_start")?.[0]({}, headlessContext);
+  await expect(target.tools.get("repo_context_search")?.execute("id", { query: "x" })).rejects.toThrow(
+    "Repository context is unavailable.",
+  );
   expect(close).toHaveBeenCalledOnce();
   const status = (await target.tools.get("repo_context_status")?.execute()) as {
     details: { initialized: boolean; available: boolean; degraded: boolean; failures: Array<{ error: string }> };
   };
   expect(status.details).toMatchObject({ initialized: true, available: false, degraded: true });
   expect(status.details.failures[0].error).toBe("Repository map runtime failed.");
-  await expect(target.tools.get("repo_context_search")?.execute("id", { query: "x" })).rejects.toThrow(
-    "Repository context is unavailable.",
-  );
 });
 
 it("bounds status arrays and supports headless status, rebuild, doctor, and usage", async () => {
@@ -312,6 +458,7 @@ it("bounds status arrays and supports headless status, rebuild, doctor, and usag
     stdout: (text) => output.push(text),
   });
   await target.events.get("session_start")?.[0]({}, headlessContext);
+  await target.tools.get("repo_context_search")?.execute("id", { query: "initialize" });
   const status = (await target.tools.get("repo_context_status")?.execute()) as {
     details: { components: { repoMap: { pendingFiles: string[]; omittedPendingFiles: number } } };
   };
@@ -345,6 +492,7 @@ it("omits private paths from model-visible status and retains them in explicit l
     stdout: (text) => output.push(text),
   });
   await target.events.get("session_start")?.[0]({}, headlessContext);
+  await target.tools.get("repo_context_search")?.execute("id", { query: "initialize" });
 
   const result = (await target.tools.get("repo_context_status")?.execute()) as {
     content: Array<{ text: string }>;
@@ -443,7 +591,7 @@ it("adds alias migration details on unavailable errors and closes only its runti
 
   await target.events.get("session_start")?.[0]({}, context);
   await target.events.get("session_shutdown")?.[0]({}, context);
-  expect(close).toHaveBeenCalledOnce();
+  expect(close).not.toHaveBeenCalled();
   expect(ui.setStatus).toHaveBeenLastCalledWith("repo-context", undefined);
   expect(ui.setStatus.mock.calls.some(([key]) => key !== "repo-context")).toBe(false);
 });
@@ -572,6 +720,27 @@ it("treats native absolute relative-path results as outside for Windows cross-dr
   expect(isOutsideRelativePath("..")).toBe(true);
   expect(isOutsideRelativePath(`..${process.platform === "win32" ? "\\\\" : "/"}state`)).toBe(true);
   expect(isOutsideRelativePath("state/repo-map")).toBe(false);
+});
+
+it("preserves explicit warming fallback evidence at the 512-byte minimum", () => {
+  const warming: RepoMapRuntimeQuery = {
+    results: [],
+    freshness: "stale",
+    generation: 0,
+    gitHead: "unavailable",
+    workspaceRevision: "unavailable",
+    pendingFiles: [],
+    fallbackEvidence: [
+      {
+        kind: "warming",
+        excerpt: "Repository index is warming; retry repository search or use direct filesystem search.",
+      },
+    ],
+  };
+  const bounded = boundSearchPayload("x".repeat(512), warming, 512, undefined, "warming");
+  expect(Buffer.byteLength(bounded.text, "utf8")).toBeLessThanOrEqual(512);
+  expect(bounded.payload.fallbackEvidence).toEqual(warming.fallbackEvidence);
+  expect(bounded.payload.truncatedFields).toContain("query");
 });
 
 it("renders deterministic complete-row truncation within the 512-byte minimum", () => {
