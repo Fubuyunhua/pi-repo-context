@@ -30,16 +30,9 @@
     ],
     "duplicateToolNames": [],
     "commandCount": 1,
-    "commands": [
-      "context-vault"
-    ],
+    "commands": ["context-vault"],
     "eventHandlerCount": 4,
-    "events": [
-      "session_start",
-      "tool_result",
-      "context",
-      "session_shutdown"
-    ]
+    "events": ["session_start", "tool_result", "context", "session_shutdown"]
   },
   "repo": {
     "toolCount": 3,
@@ -71,14 +64,9 @@
     ],
     "duplicateToolNames": [],
     "commandCount": 1,
-    "commands": [
-      "repo-context"
-    ],
+    "commands": ["repo-context"],
     "eventHandlerCount": 2,
-    "events": [
-      "session_start",
-      "session_shutdown"
-    ]
+    "events": ["session_start", "session_shutdown"]
   },
   "both": {
     "toolCount": 6,
@@ -134,18 +122,8 @@
     ],
     "duplicateToolNames": [],
     "commandCount": 2,
-    "commands": [
-      "context-vault",
-      "repo-context"
-    ],
+    "commands": ["context-vault", "repo-context"],
     "eventHandlerCount": 6,
-    "events": [
-      "session_start",
-      "tool_result",
-      "context",
-      "session_shutdown",
-      "session_start",
-      "session_shutdown"
-    ]
+    "events": ["session_start", "tool_result", "context", "session_shutdown", "session_start", "session_shutdown"]
   }
 }

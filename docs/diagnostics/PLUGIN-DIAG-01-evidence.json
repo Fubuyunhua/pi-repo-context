@@ -9,9 +9,7 @@
         "providerError": 2,
         "noDiff": 0,
         "testFail": 6,
-        "recordedArms": [
-          "none"
-        ],
+        "recordedArms": ["none"],
         "toolCalls": 174,
         "pluginToolCalls": 0
       },
@@ -21,9 +19,7 @@
         "providerError": 1,
         "noDiff": 0,
         "testFail": 7,
-        "recordedArms": [
-          "none"
-        ],
+        "recordedArms": ["none"],
         "toolCalls": 213,
         "pluginToolCalls": 0
       },
@@ -33,9 +29,7 @@
         "providerError": 1,
         "noDiff": 0,
         "testFail": 7,
-        "recordedArms": [
-          "none"
-        ],
+        "recordedArms": ["none"],
         "toolCalls": 230,
         "pluginToolCalls": 8
       },
@@ -45,9 +39,7 @@
         "providerError": 1,
         "noDiff": 0,
         "testFail": 8,
-        "recordedArms": [
-          "none"
-        ],
+        "recordedArms": ["none"],
         "toolCalls": 210,
         "pluginToolCalls": 1
       }
@@ -245,20 +237,7 @@
         "classification": "pass",
         "durationMs": 62184,
         "diffBytes": 2002,
-        "tools": [
-          "bash",
-          "bash",
-          "read",
-          "read",
-          "bash",
-          "read",
-          "edit",
-          "edit",
-          "bash",
-          "edit",
-          "bash",
-          "bash"
-        ],
+        "tools": ["bash", "bash", "read", "read", "bash", "read", "edit", "edit", "bash", "edit", "bash", "bash"],
         "assistantMessages": 13,
         "errorCount": 0,
         "providerErrorCount": 0,
@@ -531,12 +510,7 @@
         "classification": "provider-error",
         "durationMs": 65229,
         "diffBytes": 0,
-        "tools": [
-          "bash",
-          "bash",
-          "read",
-          "bash"
-        ],
+        "tools": ["bash", "bash", "read", "bash"],
         "assistantMessages": 5,
         "errorCount": 1,
         "providerErrorCount": 1,

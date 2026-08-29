@@ -16,9 +16,7 @@
     {
       "query": "metadata key",
       "results": 1,
-      "observationIds": [
-        "obs_487c91852d5349c6bce57fe8"
-      ],
+      "observationIds": ["obs_487c91852d5349c6bce57fe8"],
       "firstMatches": [
         "    \"Return an extra metadata key named exactly `_meta_b79410b8` whose value is a dict with an integer field `unresolved` equal to the total number of unresolved ${NAME} occurrences across all values.\","
       ]
@@ -26,9 +24,7 @@
     {
       "query": "unresolved",
       "results": 1,
-      "observationIds": [
-        "obs_487c91852d5349c6bce57fe8"
-      ],
+      "observationIds": ["obs_487c91852d5349c6bce57fe8"],
       "firstMatches": [
         "    \"Leave unresolved ${NAME} occurrences unchanged.\",",
         "    \"Return an extra metadata key named exactly `_meta_b79410b8` whose value is a dict with an integer field `unresolved` equal to the total number of unresolved ${NAME} occurrences across all values.\","
@@ -37,9 +33,7 @@
     {
       "query": "Return an extra metadata key",
       "results": 1,
-      "observationIds": [
-        "obs_487c91852d5349c6bce57fe8"
-      ],
+      "observationIds": ["obs_487c91852d5349c6bce57fe8"],
       "firstMatches": [
         "    \"Return an extra metadata key named exactly `_meta_b79410b8` whose value is a dict with an integer field `unresolved` equal to the total number of unresolved ${NAME} occurrences across all values.\","
       ]
