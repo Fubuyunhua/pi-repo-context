@@ -20,10 +20,13 @@ const MAX_FAILURE_BYTES = 512;
 const MAX_STATUS_PATHS = 64;
 const SEARCH_RESULT_TYPE = "repo_context_search_result" as const;
 const SEARCH_TRUST = "untrusted-derived-navigation-data" as const;
+const LEGACY_SEARCH_TOOL = "context_vault_repo_map" as const;
 const USAGE = "Usage: /repo-context status|rebuild|doctor" as const;
 const PUBLIC_ERRORS = Object.freeze({
   initialization: "Repository context initialization failed.",
   "repo-map": "Repository map runtime failed.",
+  disabled: "Repository context is disabled.",
+  unavailable: "Repository context is unavailable.",
   query: "Repository search failed.",
   rebuild: "Repository rebuild failed.",
   searchResult: "Repository search returned degraded results.",
@@ -311,6 +314,12 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     telemetry: new RepoContextTelemetry(),
   };
 
+  const setLegacySearchActive = (enabled: boolean): void => {
+    const active = pi.getActiveTools().filter((name) => name !== LEGACY_SEARCH_TOOL);
+    if (enabled) active.push(LEGACY_SEARCH_TOOL);
+    pi.setActiveTools(active);
+  };
+
   const dispose = async (): Promise<void> => {
     const map = runtime.repoMap;
     runtime.repoMap = undefined;
@@ -325,6 +334,9 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    // Pi activates newly registered tools by default. Remove only our deprecated
+    // alias before loading configuration so initialization failures stay closed.
+    setLegacySearchActive(false);
     await dispose();
     const next: RuntimeState = {
       initialized: false,
@@ -361,10 +373,12 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     }
     next.initialized = true;
     runtime = next;
+    setLegacySearchActive(next.config?.legacyContextVaultRepoMap === true);
     updateUi(ctx, runtime);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    setLegacySearchActive(false);
     await dispose();
     runtime = {
       initialized: false,
@@ -376,8 +390,10 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
   });
 
   const executeSearch = async (params: { query: string; limit?: number }, deprecated: boolean) => {
-    if (runtime.config?.enabled === false) throw new Error("Repository context is disabled.");
-    if (!runtime.available || !runtime.repoMap) throw new Error("Repository context is unavailable.");
+    if (!runtime.initialized || !runtime.available || !runtime.repoMap) {
+      if (runtime.initialized && runtime.config?.enabled === false) throw new Error(PUBLIC_ERRORS.disabled);
+      throw new Error(PUBLIC_ERRORS.unavailable);
+    }
 
     let result: RepoMapRuntimeQuery;
     try {
@@ -386,18 +402,24 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
       addFailure(runtime, "query", error);
       throw new Error(PUBLIC_ERRORS.query);
     }
-    const hasUsableDegradedEvidence =
-      result.freshness === "stale" && (result.results.length > 0 || result.fallbackEvidence.length > 0);
-    if (result.error !== undefined && !hasUsableDegradedEvidence) throw new Error(PUBLIC_ERRORS.searchResult);
 
-    const maxBytes = runtime.config?.searchMaxBytes ?? 6 * 1024;
-    const bounded = boundSearchPayload(params.query, result, maxBytes);
-    return {
-      content: [{ type: "text" as const, text: bounded.text }],
-      details: deprecated
-        ? { ...bounded.payload, deprecated: true as const, replacement: "repo_context_search" as const }
-        : bounded.payload,
-    };
+    try {
+      const bounded = boundSearchPayload(
+        params.query,
+        result,
+        runtime.config?.searchMaxBytes ?? 6 * 1024,
+        result.error === undefined ? undefined : PUBLIC_ERRORS.searchResult,
+      );
+      return {
+        content: [{ type: "text" as const, text: bounded.text }],
+        details: deprecated
+          ? { ...bounded.payload, deprecated: true as const, replacement: "repo_context_search" as const }
+          : bounded.payload,
+      };
+    } catch (error) {
+      addFailure(runtime, "query", error);
+      throw new Error(PUBLIC_ERRORS.query);
+    }
   };
 
   const searchParameters = Type.Object(
@@ -411,11 +433,15 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     name: "repo_context_search",
     label: "Repository Search",
     description: "Search the live revision-aware repository index with explicit freshness evidence.",
+    promptSnippet: "Search the live repository index with explicit freshness evidence",
+    promptGuidelines: [
+      "Use repo_context_search to find relevant repository files and symbols before broad filesystem searches.",
+    ],
     parameters: searchParameters,
     execute: async (_toolCallId, params) => executeSearch(params, false),
   });
   pi.registerTool({
-    name: "context_vault_repo_map",
+    name: LEGACY_SEARCH_TOOL,
     label: "Repository Map (deprecated)",
     description: "Deprecated alias for repo_context_search.",
     parameters: searchParameters,

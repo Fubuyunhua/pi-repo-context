@@ -17,6 +17,7 @@ it("loads only .pi/repo-context.json with exact defaults and rejects legacy/unkn
     join(root, ".pi", "repo-context.json"),
     JSON.stringify({
       enabled: false,
+      legacyContextVaultRepoMap: true,
       searchMaxBytes: 512,
       debounceMs: 1,
       generationRetention: 1,
@@ -26,6 +27,7 @@ it("loads only .pi/repo-context.json with exact defaults and rejects legacy/unkn
   );
   expect(await loadConfig(root)).toEqual({
     enabled: false,
+    legacyContextVaultRepoMap: true,
     searchMaxBytes: 512,
     debounceMs: 1,
     generationRetention: 1,
@@ -36,6 +38,8 @@ it("loads only .pi/repo-context.json with exact defaults and rejects legacy/unkn
   for (const invalid of [
     { repoMapEnabled: true },
     { mapInjectionMode: "off" },
+    { legacyContextVaultRepoMap: 1 },
+    { legacyContextVaultRepoMap: "true" },
     { searchMaxBytes: 511 },
     { excludePatterns: [""] },
   ]) {

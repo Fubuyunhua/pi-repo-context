@@ -32,7 +32,16 @@ Repo Context `0.1.0` is Tool-first and performs **no automatic repository-contex
 
 - `repo_context_search` — live freshness reconciliation followed by bounded repository search.
 - `repo_context_status` — lifecycle, freshness, state and repository-only telemetry.
-- `context_vault_repo_map` — deprecated 0.1.x alias for `repo_context_search`; planned removal in 0.2.0.
+- `context_vault_repo_map` — deprecated 0.1.x alias for `repo_context_search`; registered for compatibility,
+  inactive by default, and planned for removal in 0.2.0.
+
+Hard search failures (before initialization, disabled/unavailable runtime, startup failure, or rejected query) are Pi Tool
+errors. Fulfilled stale/degraded searches that still provide bounded navigation evidence remain successful Tool results and
+carry sanitized degradation metadata.
+
+Search preserves dotted and underscored identifiers, boosts exact symbols, exports, and qualified paths, and applies
+query-aware de-boosts to vendor, minified, and locale-catalog paths. Those paths remain searchable when requested
+explicitly. Result `matchReasons` are bounded transient diagnostics; the persisted snapshot remains schema 1.
 
 The model-visible `repo_context_status` payload omits absolute project and internal state paths. Explicit local
 `/repo-context status` and `/repo-context doctor` commands retain those paths for troubleshooting.
@@ -58,6 +67,7 @@ Optional project file `.pi/repo-context.json`:
 ```json
 {
   "enabled": true,
+  "legacyContextVaultRepoMap": false,
   "searchMaxBytes": 6144,
   "debounceMs": 300,
   "generationRetention": 3,
@@ -66,7 +76,10 @@ Optional project file `.pi/repo-context.json`:
 }
 ```
 
-Unknown keys are rejected. Repo Context never reads or writes `.pi/context-vault.json`.
+Unknown keys are rejected, and `enabled` and `legacyContextVaultRepoMap` accept JSON booleans only. Set
+`legacyContextVaultRepoMap` to `true` only while migrating callers that still use the deprecated alias; Repo Context
+updates only that alias in Pi's active Tool set and preserves unrelated active Tools. Invalid or unreadable configuration
+leaves the alias inactive. Repo Context never reads or writes `.pi/context-vault.json`.
 
 ## Migration from pi-context-vault
 

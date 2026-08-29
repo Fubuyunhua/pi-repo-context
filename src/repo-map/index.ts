@@ -168,6 +168,8 @@ export interface RepoMapQueryResult {
   score: number;
   kind: RepoMapFileKind;
   matchedSymbols: string[];
+  /** Additive, bounded explanations for the transient search ranking. */
+  matchReasons?: string[];
   symbols: RepoMapSymbol[];
   dependencies: string[];
 }
@@ -176,11 +178,118 @@ interface SearchDocument {
   id: string;
   path: string;
   fileName: string;
+  pathAliases: string;
   symbols: string;
   signatures: string;
   exports: string;
   imports: string;
   terms: string;
+}
+
+interface SearchMetadata {
+  file: RepoMapFile;
+  pathAliases: string[];
+  qualifiedPathAliases: Set<string>;
+  lexicalTerms: Set<string>;
+}
+
+const SEARCH_CANDIDATE_MULTIPLIER = 20;
+const MIN_SEARCH_CANDIDATES = 100;
+const MAX_SEARCH_CANDIDATES = 1_000;
+const MAX_MATCH_REASONS = 5;
+const MAX_REASON_VALUE_LENGTH = 64;
+
+/** Keep linked identifiers while also making their components independently searchable. */
+function linkedIdentifierTokens(text: string): string[] {
+  const identifiers = text.match(/[$_\p{L}\p{N}]+(?:[.-][$_\p{L}\p{N}]+)*/gu) ?? [];
+  const tokens: string[] = [];
+  for (const identifier of identifiers) {
+    tokens.push(identifier);
+    for (const dottedPart of identifier.split(".")) {
+      tokens.push(dottedPart);
+      tokens.push(...dottedPart.split(/[_-]+/u));
+    }
+  }
+  return [...new Set(tokens.filter(Boolean))];
+}
+
+function structuredIdentifiers(text: string): Set<string> {
+  const identifiers = text.match(/[$_\p{L}\p{N}]+(?:[.-][$_\p{L}\p{N}]+)*/gu) ?? [];
+  const structured = identifiers.flatMap((identifier) => {
+    const dottedParts = identifier.split(".");
+    return [identifier, ...dottedParts.filter((part) => /[_-]/u.test(part))];
+  });
+  return new Set(
+    structured.filter((identifier) => /[._-]/u.test(identifier)).map((identifier) => identifier.toLowerCase()),
+  );
+}
+
+function searchPathAliases(file: RepoMapFile): { indexed: string[]; qualified: Set<string> } {
+  const path = file.path.replaceAll("\\", "/");
+  const extension = extname(path);
+  const withoutExtension = extension ? path.slice(0, -extension.length) : path;
+  const segments = withoutExtension.split("/").filter(Boolean);
+  const indexed = new Set([path, withoutExtension, basename(path), basename(withoutExtension)]);
+  const qualified = new Set<string>();
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const alias = segments.slice(index).join(".");
+    indexed.add(alias);
+    qualified.add(alias.toLowerCase());
+  }
+  if (file.packageName) {
+    indexed.add(file.packageName);
+    qualified.add(file.packageName.toLowerCase());
+    for (const symbol of file.symbols) {
+      const alias = `${file.packageName}.${symbol.name}`;
+      indexed.add(alias);
+      qualified.add(alias.toLowerCase());
+    }
+  }
+  return { indexed: [...indexed], qualified };
+}
+
+function stablePathCompare(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+function boundedReason(label: string, values: string[]): string {
+  const shown = values.slice(0, 2).map((value) => value.slice(0, MAX_REASON_VALUE_LENGTH));
+  return shown.length > 0 ? `${label}: ${shown.join(", ")}` : label;
+}
+
+function noiseKinds(path: string): Array<"vendor" | "minified" | "locale-catalog"> {
+  const lowerPath = path.toLowerCase();
+  const segments = lowerPath.split("/");
+  const kinds: Array<"vendor" | "minified" | "locale-catalog"> = [];
+  if (segments.includes("vendor")) kinds.push("vendor");
+  if (/\.min\.[^/]+$/u.test(lowerPath)) kinds.push("minified");
+  if (
+    /\.(?:po|pot|mo)$/u.test(lowerPath) &&
+    segments.some((segment) => segment === "locale" || segment === "locales" || segment === "lc_messages")
+  ) {
+    kinds.push("locale-catalog");
+  }
+  return kinds;
+}
+
+function explicitlyTargetsNoise(
+  kind: "vendor" | "minified" | "locale-catalog",
+  normalizedQuery: string,
+  queryIdentifiers: Set<string>,
+  file: RepoMapFile,
+): boolean {
+  const lowerPath = file.path.toLowerCase();
+  const fileName = basename(lowerPath);
+  if (normalizedQuery === lowerPath || normalizedQuery === fileName) return true;
+  if (kind === "vendor") return queryIdentifiers.has("vendor");
+  if (kind === "minified") return normalizedQuery.includes(".min.");
+  return (
+    queryIdentifiers.has("locale") ||
+    queryIdentifiers.has("locales") ||
+    queryIdentifiers.has("lc_messages") ||
+    /\.(?:po|pot|mo)(?:\s|$)/u.test(normalizedQuery)
+  );
 }
 
 function slash(path: string): string {
@@ -747,54 +856,139 @@ export async function loadRepoMapSnapshot(path: string): Promise<RepoMapSnapshot
 }
 
 export class RepoMapSearch {
-  readonly #snapshot: RepoMapSnapshot;
   readonly #index: MiniSearch<SearchDocument>;
+  readonly #metadata = new Map<string, SearchMetadata>();
 
   constructor(snapshot: RepoMapSnapshot) {
-    this.#snapshot = snapshot;
     this.#index = new MiniSearch<SearchDocument>({
-      fields: ["path", "fileName", "symbols", "signatures", "exports", "imports", "terms"],
+      fields: ["path", "fileName", "pathAliases", "symbols", "signatures", "exports", "imports", "terms"],
       storeFields: ["path"],
+      tokenize: linkedIdentifierTokens,
       searchOptions: {
-        boost: { symbols: 4, fileName: 3, path: 2.5, signatures: 2, exports: 2, imports: 1.5, terms: 1 },
+        boost: {
+          symbols: 6,
+          exports: 5,
+          pathAliases: 4,
+          fileName: 3,
+          path: 2.5,
+          signatures: 2,
+          imports: 1.5,
+          terms: 1,
+        },
         fuzzy: 0.15,
         prefix: true,
       },
     });
-    this.#index.addAll(
-      snapshot.files.map((file) => ({
+    const documents = snapshot.files.map((file) => {
+      const pathAliases = searchPathAliases(file);
+      this.#metadata.set(file.path, {
+        file,
+        pathAliases: pathAliases.indexed.map((alias) => alias.toLowerCase()),
+        qualifiedPathAliases: pathAliases.qualified,
+        lexicalTerms: new Set(file.lexicalTerms.map((term) => term.toLowerCase())),
+      });
+      return {
         id: file.path,
         path: file.path,
         fileName: basename(file.path),
+        pathAliases: pathAliases.indexed.join(" "),
         symbols: file.symbols.map((symbol) => symbol.name).join(" "),
         signatures: file.symbols.map((symbol) => symbol.signature).join(" "),
         exports: file.exports.map((item) => item.name).join(" "),
         imports: file.imports.flatMap((item) => [item.source, ...item.names]).join(" "),
         terms: file.lexicalTerms.join(" "),
-      })),
-    );
+      };
+    });
+    this.#index.addAll(documents);
   }
 
   query(query: string, options: RepoMapQueryOptions = {}): RepoMapQueryResult[] {
     const limit = options.limit ?? 10;
     if (!Number.isInteger(limit) || limit <= 0) throw new Error("query limit must be a positive integer");
-    const queryTerms = query.toLowerCase().match(/[\p{L}\p{N}_$-]{2,}/gu) ?? [];
-    const found = this.#index.search(query).slice(0, limit);
-    return found.flatMap((result) => {
-      const file = this.#snapshot.files.find((candidate) => candidate.path === result.id);
-      if (!file) return [];
+    const normalizedQuery = query.trim().replaceAll("\\", "/").toLowerCase();
+    const queryIdentifiers = new Set(linkedIdentifierTokens(query).map((identifier) => identifier.toLowerCase()));
+    const structuredQueryIdentifiers = structuredIdentifiers(query);
+    const candidateLimit = Math.min(
+      this.#metadata.size,
+      Math.max(
+        limit,
+        Math.min(MAX_SEARCH_CANDIDATES, Math.max(MIN_SEARCH_CANDIDATES, limit * SEARCH_CANDIDATE_MULTIPLIER)),
+      ),
+    );
+    const found = this.#index.search(query).slice(0, candidateLimit);
+    const ranked = found.flatMap((result) => {
+      const metadata = this.#metadata.get(String(result.id));
+      if (!metadata) return [];
+      const exactSymbols = [
+        ...new Set(
+          metadata.file.symbols
+            .filter((symbol) => queryIdentifiers.has(symbol.name.toLowerCase()))
+            .map((symbol) => symbol.name),
+        ),
+      ];
+      const exactExports = [
+        ...new Set(
+          metadata.file.exports
+            .filter((item) => queryIdentifiers.has(item.name.toLowerCase()))
+            .map((item) => item.name),
+        ),
+      ];
+      const exactIdentifiers = [...structuredQueryIdentifiers].filter((identifier) =>
+        metadata.lexicalTerms.has(identifier),
+      );
+      const qualifiedAliases = [...metadata.qualifiedPathAliases].filter((alias) => queryIdentifiers.has(alias));
+      const exactPath = metadata.pathAliases.includes(normalizedQuery);
+      const matchedQueryTerms = new Set(result.queryTerms.map((term) => term.toLowerCase()));
+      const searchableQueryTerms = new Set([...queryIdentifiers].filter((term) => term.length >= 2));
+      const coverage =
+        searchableQueryTerms.size > 0
+          ? [...searchableQueryTerms].filter((term) => matchedQueryTerms.has(term)).length / searchableQueryTerms.size
+          : 0;
+
+      let score = Math.log1p(result.score) + coverage * 3;
+      score += exactSymbols.length * 12;
+      score += exactExports.length * 8;
+      score += exactIdentifiers.length * 8;
+      score += qualifiedAliases.length * 14;
+      if (exactPath) score += 16;
+
+      const reasons: string[] = [];
+      if (exactSymbols.length > 0) reasons.push(boundedReason("exact symbol", exactSymbols));
+      if (exactExports.length > 0) reasons.push(boundedReason("exact export", exactExports));
+      if (qualifiedAliases.length > 0) reasons.push(boundedReason("qualified path", qualifiedAliases));
+      if (exactPath) reasons.push("exact path");
+      if (exactIdentifiers.length > 0) reasons.push(boundedReason("exact identifier", exactIdentifiers));
+
+      for (const kind of noiseKinds(metadata.file.path)) {
+        if (explicitlyTargetsNoise(kind, normalizedQuery, queryIdentifiers, metadata.file)) continue;
+        score *= kind === "minified" ? 0.3 : kind === "vendor" ? 0.35 : 0.4;
+        reasons.push(`de-boosted ${kind}`);
+      }
+      if (matchedQueryTerms.size > 0) reasons.push(boundedReason("matched terms", [...matchedQueryTerms].sort()));
+
+      const matchedSymbols = metadata.file.symbols
+        .filter((symbol) =>
+          [...queryIdentifiers].some((term) => term.length >= 2 && symbol.name.toLowerCase().includes(term)),
+        )
+        .map((symbol) => symbol.name);
       return [
         {
-          path: file.path,
-          score: result.score,
-          kind: file.kind,
-          matchedSymbols: file.symbols
-            .filter((symbol) => queryTerms.some((term) => symbol.name.toLowerCase().includes(term)))
-            .map((symbol) => symbol.name),
-          symbols: file.symbols,
-          dependencies: file.dependencies,
+          file: metadata.file,
+          score,
+          matchedSymbols,
+          matchReasons: reasons.slice(0, MAX_MATCH_REASONS),
         },
       ];
     });
+    ranked.sort((left, right) => right.score - left.score || stablePathCompare(left.file.path, right.file.path));
+    return ranked.slice(0, limit).map(({ file, score, matchedSymbols, matchReasons }) => ({
+      path: file.path,
+      score,
+      kind: file.kind,
+      matchedSymbols,
+      matchReasons,
+      symbols: file.symbols,
+      dependencies: file.dependencies,
+    }));
   }
 }

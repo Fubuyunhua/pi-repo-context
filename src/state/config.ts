@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 export interface RepoContextConfig {
   enabled: boolean;
+  legacyContextVaultRepoMap: boolean;
   searchMaxBytes: number;
   debounceMs: number;
   generationRetention: number;
@@ -14,6 +15,7 @@ export const REPO_CONTEXT_CONFIG_PATH = ".pi/repo-context.json" as const;
 
 export const DEFAULT_CONFIG: Readonly<RepoContextConfig> = Object.freeze({
   enabled: true,
+  legacyContextVaultRepoMap: false,
   searchMaxBytes: 6 * 1024,
   debounceMs: 300,
   generationRetention: 3,
@@ -23,6 +25,7 @@ export const DEFAULT_CONFIG: Readonly<RepoContextConfig> = Object.freeze({
 
 const KEYS = new Set<keyof RepoContextConfig>([
   "enabled",
+  "legacyContextVaultRepoMap",
   "searchMaxBytes",
   "debounceMs",
   "generationRetention",
@@ -49,6 +52,9 @@ export async function loadConfig(projectRoot: string): Promise<RepoContextConfig
     if (!KEYS.has(key as keyof RepoContextConfig)) throw new Error(`Unknown Repo Context option: ${key}`);
   }
   if ("enabled" in override && typeof override.enabled !== "boolean") throw new Error("enabled must be a boolean");
+  if ("legacyContextVaultRepoMap" in override && typeof override.legacyContextVaultRepoMap !== "boolean") {
+    throw new Error("legacyContextVaultRepoMap must be a boolean");
+  }
   for (const key of ["searchMaxBytes", "debounceMs", "generationRetention", "quotaBytes"] as const) {
     const value = override[key];
     if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0)) {
@@ -68,6 +74,8 @@ export async function loadConfig(projectRoot: string): Promise<RepoContextConfig
 
   return {
     enabled: (override.enabled as boolean | undefined) ?? DEFAULT_CONFIG.enabled,
+    legacyContextVaultRepoMap:
+      (override.legacyContextVaultRepoMap as boolean | undefined) ?? DEFAULT_CONFIG.legacyContextVaultRepoMap,
     searchMaxBytes: (override.searchMaxBytes as number | undefined) ?? DEFAULT_CONFIG.searchMaxBytes,
     debounceMs: (override.debounceMs as number | undefined) ?? DEFAULT_CONFIG.debounceMs,
     generationRetention: (override.generationRetention as number | undefined) ?? DEFAULT_CONFIG.generationRetention,

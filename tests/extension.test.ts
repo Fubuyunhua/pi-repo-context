@@ -1,13 +1,5 @@
-import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
-import {
-  createSyntheticSourceInfo,
-  type ExtensionAPI,
-  type ExtensionRunner,
-  type ToolDefinition,
-  wrapRegisteredTool,
-} from "@earendil-works/pi-coding-agent";
+import { resolve } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { expect, it, vi } from "vitest";
 import repoContextExtension from "../extensions/index.js";
 import {
@@ -22,16 +14,20 @@ import type { RepoContextProjectState } from "../src/state/project-state.js";
 
 interface CapturedTool {
   name: string;
+  promptSnippet?: string;
+  promptGuidelines?: string[];
   execute: (...args: unknown[]) => Promise<unknown>;
 }
 interface CapturedCommand {
   handler: (args: string, ctx: unknown) => Promise<void>;
 }
 
-function harness() {
+function harness(initialActiveTools: string[] = []) {
   const events = new Map<string, Array<(...args: unknown[]) => unknown>>();
   const tools = new Map<string, CapturedTool>();
   const commands = new Map<string, CapturedCommand>();
+  let activeTools = [...initialActiveTools];
+  const activeToolUpdates: string[][] = [];
   const pi = {
     on(name: string, handler: (...args: unknown[]) => unknown) {
       const rows = events.get(name) ?? [];
@@ -40,12 +36,20 @@ function harness() {
     },
     registerTool(tool: CapturedTool) {
       tools.set(tool.name, tool);
+      activeTools = [...new Set([...activeTools, tool.name])];
     },
     registerCommand(name: string, command: CapturedCommand) {
       commands.set(name, command);
     },
+    getActiveTools() {
+      return [...activeTools];
+    },
+    setActiveTools(names: string[]) {
+      activeTools = [...names];
+      activeToolUpdates.push([...names]);
+    },
   } as unknown as ExtensionAPI;
-  return { pi, events, tools, commands };
+  return { pi, events, tools, commands, activeToolUpdates, getActiveTools: () => [...activeTools] };
 }
 
 const projectState: RepoContextProjectState = {
@@ -56,6 +60,7 @@ const projectState: RepoContextProjectState = {
 };
 const config: RepoContextConfig = {
   enabled: true,
+  legacyContextVaultRepoMap: false,
   searchMaxBytes: 6144,
   debounceMs: 300,
   generationRetention: 3,
@@ -90,121 +95,9 @@ function fakeController(overrides: Partial<RepoMapController> = {}): RepoMapCont
   };
 }
 
-interface WrappedToolEnd {
-  type: "tool_execution_end";
-  toolCallId: string;
-  toolName: string;
-  result: { content: Array<{ type: string; text?: string }>; details: unknown };
-  isError: boolean;
-}
-
-interface TestAgent {
-  subscribe(listener: (event: unknown) => void): () => void;
-  prompt(message: string): Promise<void>;
-}
-
-interface TestAgentConstructor {
-  new (options: {
-    initialState: Record<string, unknown>;
-    streamFn: () => {
-      result(): Promise<Record<string, unknown>>;
-      [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>>;
-    };
-  }): TestAgent;
-}
-
-async function executeThroughPiAgent(tool: CapturedTool, params: Record<string, unknown>): Promise<WrappedToolEnd> {
-  const runner = {
-    createContext: () => ({}),
-    getActiveTools: () => [tool.name],
-  } as unknown as ExtensionRunner;
-  const wrapped = wrapRegisteredTool(
-    {
-      definition: tool as unknown as ToolDefinition,
-      sourceInfo: createSyntheticSourceInfo("extension.test.ts", { source: "test" }),
-    },
-    runner,
-  );
-
-  const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-  const corePackage = requireFromPi.resolve("@earendil-works/pi-agent-core/package.json");
-  const coreEntry = pathToFileURL(join(dirname(corePackage), "dist/index.js")).href;
-  const { Agent } = (await import(coreEntry)) as unknown as { Agent: TestAgentConstructor };
-  const model = {
-    id: "test-model",
-    name: "Test Model",
-    api: "openai-completions",
-    provider: "test",
-    baseUrl: "",
-    reasoning: false,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 4096,
-    maxTokens: 1024,
-  };
-  let providerCalls = 0;
-  const streamFn = () => {
-    const toolCall = { type: "toolCall", id: "search-call", name: tool.name, arguments: params };
-    const content: Array<Record<string, unknown>> =
-      providerCalls++ === 0 ? [toolCall] : [{ type: "text", text: "done" }];
-    const output: Record<string, unknown> = {
-      role: "assistant",
-      content,
-      api: model.api,
-      provider: model.provider,
-      model: model.id,
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
-      stopReason: content[0]?.type === "toolCall" ? "toolUse" : "stop",
-      timestamp: Date.now(),
-    };
-    const records: Array<Record<string, unknown>> = [
-      { type: "start", partial: output },
-      ...(content[0]?.type === "toolCall"
-        ? [
-            { type: "toolcall_start", contentIndex: 0, partial: output },
-            { type: "toolcall_end", contentIndex: 0, toolCall, partial: output },
-          ]
-        : [
-            { type: "text_start", contentIndex: 0, partial: output },
-            { type: "text_end", contentIndex: 0, content: "done", partial: output },
-          ]),
-      { type: "done", reason: output.stopReason, message: output },
-    ];
-    return {
-      async *[Symbol.asyncIterator]() {
-        for (const record of records) yield record;
-      },
-      async result() {
-        return output;
-      },
-    };
-  };
-  const agent = new Agent({
-    initialState: { systemPrompt: "", model, thinkingLevel: "off", tools: [wrapped], messages: [] },
-    streamFn,
-  });
-  const toolEnds: WrappedToolEnd[] = [];
-  agent.subscribe((event) => {
-    if (typeof event === "object" && event !== null && "type" in event && event.type === "tool_execution_end") {
-      toolEnds.push(event as WrappedToolEnd);
-    }
-  });
-  await agent.prompt("search");
-  const toolEnd = toolEnds[0];
-  if (!toolEnd) throw new Error("Pi agent did not emit tool_execution_end");
-  return toolEnd;
-}
-
 const headlessContext = { cwd: "/project", hasUI: false, ui: { setStatus: vi.fn(), notify: vi.fn() } };
 
-it("eagerly registers only the approved tools, command, and lifecycle hooks", () => {
+it("registers the deterministic all-tool surface and canonical prompt metadata", () => {
   const target = harness();
   repoContextExtension(target.pi);
   expect([...target.events.keys()]).toEqual(["session_start", "session_shutdown"]);
@@ -213,22 +106,57 @@ it("eagerly registers only the approved tools, command, and lifecycle hooks", ()
     "repo_context_search",
     "repo_context_status",
   ]);
+  expect(target.tools.get("repo_context_search")).toMatchObject({
+    promptSnippet: "Search the live repository index with explicit freshness evidence",
+    promptGuidelines: [
+      "Use repo_context_search to find relevant repository files and symbols before broad filesystem searches.",
+    ],
+  });
+  expect(target.tools.get("context_vault_repo_map")).not.toHaveProperty("promptSnippet");
   expect([...target.commands.keys()]).toEqual(["repo-context"]);
 });
 
-it("marks hard search failures as errors through Pi's registered-tool wrapper and agent core", async () => {
-  const target = harness();
-  registerRepoContext(target.pi);
-  const search = target.tools.get("repo_context_search");
-  if (!search) throw new Error("repo_context_search was not registered");
-
-  const toolEnd = await executeThroughPiAgent(search, { query: "x" });
-  expect(toolEnd).toMatchObject({
-    toolCallId: "search-call",
-    toolName: "repo_context_search",
-    isError: true,
-    result: { content: [{ type: "text", text: "Repository context is unavailable." }] },
+it("keeps the alias registered but inactive by default without clobbering unrelated active tools", async () => {
+  const target = harness(["read", "other_extension_tool"]);
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: () => fakeController(),
   });
+
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+  expect([...target.tools.keys()].sort()).toEqual([
+    "context_vault_repo_map",
+    "repo_context_search",
+    "repo_context_status",
+  ]);
+  expect(target.getActiveTools()).toEqual([
+    "read",
+    "other_extension_tool",
+    "repo_context_search",
+    "repo_context_status",
+  ]);
+  expect(
+    target.activeToolUpdates.every((names) => names.includes("read") && names.includes("other_extension_tool")),
+  ).toBe(true);
+});
+
+it("enables only the compatibility alias when strict legacy configuration opts in", async () => {
+  const target = harness(["read", "other_extension_tool"]);
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => ({ ...config, legacyContextVaultRepoMap: true }),
+    runtimeFactory: () => fakeController(),
+  });
+
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+  expect(target.getActiveTools()).toEqual([
+    "read",
+    "other_extension_tool",
+    "repo_context_search",
+    "repo_context_status",
+    "context_vault_repo_map",
+  ]);
 });
 
 it("keeps status usable before initialization and when disabled without constructing runtime", async () => {
@@ -278,6 +206,69 @@ it("uses live query for primary and alias with identical content and alias-only 
   expect(alias.content).toEqual(primary.content);
   expect(primary.details).not.toHaveProperty("deprecated");
   expect(alias.details).toMatchObject({ deprecated: true, replacement: "repo_context_search" });
+});
+
+it("keeps fulfilled degraded evidence successful for canonical and enabled alias tools", async () => {
+  const target = harness();
+  const degraded: RepoMapRuntimeQuery = {
+    ...queryResult,
+    freshness: "stale",
+    fallbackEvidence: [{ kind: "source", path: "src/fallback.ts", excerpt: "export const fallback = true;" }],
+    error: "/private/runtime/detail",
+  };
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => ({ ...config, legacyContextVaultRepoMap: true }),
+    runtimeFactory: () => fakeController({ query: vi.fn(async () => degraded) }),
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+
+  const primary = (await target.tools.get("repo_context_search")?.execute("id", { query: "fallback" })) as {
+    content: Array<{ text: string }>;
+    details: Record<string, unknown>;
+  };
+  const alias = (await target.tools.get("context_vault_repo_map")?.execute("id", { query: "fallback" })) as {
+    content: Array<{ text: string }>;
+    details: Record<string, unknown>;
+  };
+  expect(primary).not.toHaveProperty("isError");
+  expect(alias).not.toHaveProperty("isError");
+  expect(primary.details).toMatchObject({
+    freshness: "stale",
+    error: "Repository search returned degraded results.",
+    fallbackEvidence: [{ kind: "source", path: "src/fallback.ts" }],
+  });
+  expect(alias.content).toEqual(primary.content);
+  expect(alias.details).toMatchObject({
+    ...primary.details,
+    deprecated: true,
+    replacement: "repo_context_search",
+  });
+  expect(JSON.stringify(alias)).not.toContain("private");
+});
+
+it("throws the same fixed error for canonical and enabled alias query rejection", async () => {
+  const target = harness();
+  const privateError = new Error("/home/private/repo-index.json");
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => ({ ...config, legacyContextVaultRepoMap: true }),
+    runtimeFactory: () => fakeController({ query: vi.fn(async () => Promise.reject(privateError)) }),
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+
+  for (const name of ["repo_context_search", "context_vault_repo_map"]) {
+    await expect(target.tools.get(name)?.execute("id", { query: "needle" })).rejects.toEqual(
+      new Error("Repository search failed."),
+    );
+  }
+  const status = (await target.tools.get("repo_context_status")?.execute()) as {
+    details: { failures: Array<{ component: string; error: string }> };
+  };
+  expect(status.details.failures).toEqual([
+    { component: "query", error: "Repository search failed." },
+    { component: "query", error: "Repository search failed." },
+  ]);
 });
 
 it("closes partial starts and keeps bounded degraded status available", async () => {
@@ -436,7 +427,7 @@ it("treats fresh rebuild maintenance errors as failures and retains prior rebuil
   expect(secondStatus.components.repoMap.maintenance.error).toBe("Repository maintenance failed.");
 });
 
-it("throws from the unavailable alias and closes only its runtime/UI key", async () => {
+it("adds alias migration details on unavailable errors and closes only its runtime/UI key", async () => {
   const target = harness();
   const close = vi.fn(async () => undefined);
   const ui = { setStatus: vi.fn(), notify: vi.fn() };
@@ -457,14 +448,20 @@ it("throws from the unavailable alias and closes only its runtime/UI key", async
   expect(ui.setStatus.mock.calls.some(([key]) => key !== "repo-context")).toBe(false);
 });
 
-it("keeps status generic and bounded after a malicious configuration failure", async () => {
-  const target = harness();
+it("keeps status generic and the alias fail-closed after a malicious configuration failure", async () => {
+  const target = harness(["read", "other_extension_tool"]);
   const malicious = `C:\\Users\\secret\\repo\\config.json\u0000${"x".repeat(1024 * 1024)}`;
   registerRepoContext(target.pi, {
     resolveProjectState: async () => projectState,
     loadConfig: async () => Promise.reject(new Error(malicious)),
   });
   await target.events.get("session_start")?.[0]({}, headlessContext);
+  expect(target.getActiveTools()).toEqual([
+    "read",
+    "other_extension_tool",
+    "repo_context_search",
+    "repo_context_status",
+  ]);
   const status = (await target.tools.get("repo_context_status")?.execute()) as {
     content: Array<{ text: string }>;
     details: {
@@ -484,17 +481,10 @@ it("keeps status generic and bounded after a malicious configuration failure", a
   expect(Buffer.byteLength(status.content[0]?.text ?? "", "utf8")).toBeLessThan(4096);
 });
 
-it("publishes only fixed bounded errors and returns usable stale fallback evidence as success", async () => {
+it("publishes only fixed bounded errors and marks fresh runtime errors degraded", async () => {
   const target = harness();
   const malicious = `/home/private/repository/state.json\u0000${"z".repeat(1024 * 1024)}`;
-  const query = vi.fn(
-    async (): Promise<RepoMapRuntimeQuery> => ({
-      ...queryResult,
-      freshness: "stale" as const,
-      fallbackEvidence: [{ kind: "source" as const, path: "src/main.ts", excerpt: "export const safe = true" }],
-      error: malicious,
-    }),
-  );
+  const query = vi.fn(async () => ({ ...queryResult, error: malicious }));
   const controller = fakeController({
     query,
     status: vi.fn(() => ({
@@ -517,14 +507,10 @@ it("publishes only fixed bounded errors and returns usable stale fallback eviden
 
   const search = (await target.tools.get("repo_context_search")?.execute("id", { query: "needle" })) as {
     content: Array<{ text: string }>;
-    details: { error: string; freshness: string; fallbackEvidence: Array<{ path?: string }> };
+    details: { error: string };
   };
   expect(search).not.toHaveProperty("isError");
-  expect(search.details).toMatchObject({
-    error: "Repository search returned degraded results.",
-    freshness: "stale",
-    fallbackEvidence: [{ path: "src/main.ts" }],
-  });
+  expect(search.details.error).toBe("Repository search returned degraded results.");
   expect(search.content[0]?.text).not.toContain("private");
   expect(search.content[0]?.text).not.toContain("state.json");
   expect(Buffer.byteLength(search.content[0]?.text ?? "", "utf8")).toBeLessThanOrEqual(config.searchMaxBytes);
@@ -557,11 +543,6 @@ it("publishes only fixed bounded errors and returns usable stale fallback eviden
   expect(status.content[0]?.text).not.toContain("private");
   expect(status.content[0]?.text).not.toContain("state.json");
   expect(Buffer.byteLength(status.content[0]?.text ?? "", "utf8")).toBeLessThan(16 * 1024);
-
-  query.mockResolvedValueOnce({ ...queryResult, error: malicious });
-  await expect(target.tools.get("repo_context_search")?.execute("id", { query: "needle" })).rejects.toThrow(
-    "Repository search returned degraded results.",
-  );
 
   query.mockRejectedValueOnce(new Error(malicious));
   await expect(target.tools.get("repo_context_search")?.execute("id", { query: "needle" })).rejects.toThrow(

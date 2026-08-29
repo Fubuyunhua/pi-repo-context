@@ -52,14 +52,22 @@ it("cold-builds in the new root without reading or mutating a valid legacy tree"
 
     const events = new Map<string, (...args: unknown[]) => unknown>();
     const tools = new Map<string, Tool>();
+    let activeTools: string[] = [];
     const pi = {
       on(name: string, handler: (...args: unknown[]) => unknown) {
         events.set(name, handler);
       },
       registerTool(tool: Tool) {
         tools.set(tool.name, tool);
+        activeTools.push(tool.name);
       },
       registerCommand() {},
+      getActiveTools() {
+        return [...activeTools];
+      },
+      setActiveTools(names: string[]) {
+        activeTools = [...names];
+      },
     } as unknown as ExtensionAPI;
     registerRepoContext(pi, {
       resolveProjectState: (cwd) => resolveProjectState(cwd, { PI_CODING_AGENT_DIR: piRoot }),

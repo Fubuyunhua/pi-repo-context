@@ -21,18 +21,23 @@ Repo Context is Tool-first and provides no automatic context injection.
 | Pre-split key | Repo Context key |
 | --- | --- |
 | `repoMapEnabled` | `enabled` |
+| No pre-split equivalent | `legacyContextVaultRepoMap` (default `false`) |
 | `mapContextMaxBytes` | `searchMaxBytes` |
 | `mapDebounceMs` | `debounceMs` |
 | `mapGenerationRetention` | `generationRetention` |
 | `mapQuotaBytes` | `quotaBytes` |
 | `mapExcludePatterns` | `excludePatterns` |
 
-`mapInjectionMode` has no Repo Context equivalent.
+`mapInjectionMode` has no Repo Context equivalent. `legacyContextVaultRepoMap` is a strict JSON boolean and controls
+only whether Repo Context activates its deprecated Tool alias. Leave it `false` for new callers. Set it to `true` only
+for a bounded migration period, then move callers to `repo_context_search`. Invalid or unreadable configuration fails
+closed with the alias inactive, and alias activation/deactivation preserves unrelated active Pi Tools.
 
 ## Ownership boundary
 
 Repo Context owns `repo_context_search`, `repo_context_status`, `/repo-context status|rebuild|doctor`, and the
-deprecated `context_vault_repo_map` `0.1.x` alias. The alias is planned for removal in Repo Context `0.2.0`.
+deprecated `context_vault_repo_map` `0.1.x` alias. The alias remains registered for compatibility but is inactive by
+default; `legacyContextVaultRepoMap: true` activates it. The alias is planned for removal in Repo Context `0.2.0`.
 
 The observation-only Context Vault `0.3.0` code line owns `/context-vault rebuild` as a non-executing migration stub
 that directs users to `/repo-context rebuild`. Its `/context-vault gc` collects only Vault artifacts, metadata, and

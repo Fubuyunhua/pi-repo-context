@@ -1,0 +1,135 @@
+{
+  "django": {
+    "query": "QuerySet.in_bulk implementation and tests for unique constraints field_name",
+    "implementation": "django/db/models/query.py",
+    "vendor": "django/contrib/admin/static/admin/js/vendor/xregexp/xregexp.js",
+    "minified": "django/contrib/admin/static/admin/js/vendor/xregexp/xregexp.min.js",
+    "explicitMinifiedQuery": "django/contrib/admin/static/admin/js/vendor/xregexp/xregexp.min.js",
+    "files": [
+      {
+        "path": "django/db/models/query.py",
+        "terms": "queryset in_bulk implementation unique constraints field_name database filter"
+      },
+      {
+        "path": "django/contrib/admin/static/admin/js/vendor/xregexp/xregexp.js",
+        "terms": "queryset in bulk implementation tests unique constraints field name queryset constraints"
+      },
+      {
+        "path": "django/contrib/admin/static/admin/js/vendor/xregexp/xregexp.min.js",
+        "terms": "queryset in bulk implementation tests unique constraints field name queryset constraints"
+      },
+      {
+        "path": "docs/ref/models/querysets.txt",
+        "terms": "queryset in_bulk unique constraints field_name documentation"
+      },
+      {
+        "path": "tests/queries/tests.py",
+        "terms": "queryset in_bulk tests unique field_name"
+      },
+      {
+        "path": "tests/model_forms/tests.py",
+        "terms": "queryset tests unique constraints field_name"
+      },
+      {
+        "path": "docs/releases/1.7.txt",
+        "terms": "queryset implementation unique constraints"
+      },
+      {
+        "path": "tests/constraints/tests.py",
+        "terms": "tests unique constraints field_name"
+      }
+    ]
+  },
+  "sphinx": {
+    "query": "HTML rendering Python signatures default argument tuples parameter list add_lines color=(1, 1, 1)",
+    "implementation": "sphinx/pycode/ast.py",
+    "qualifiedQuery": "sphinx.util.inspect",
+    "qualifiedImplementation": "sphinx/util/inspect.py",
+    "exactQuery": "LaTeX writer inline code syntax highlighting sphinxcode sphinxupquote code role tests test_build_latex",
+    "exactImplementation": "tests/test_build_latex.py",
+    "files": [
+      {
+        "path": "sphinx/pycode/ast.py",
+        "terms": "html rendering python signatures default argument tuples parameter list add_lines color"
+      },
+      {
+        "path": "tests/test_domain_py.py",
+        "terms": "tests html python signatures default argument tuples parameter list add_lines"
+      },
+      {
+        "path": "tests/test_pycode_ast.py",
+        "terms": "tests html rendering python default argument tuples add_lines color"
+      },
+      {
+        "path": "sphinx/search/ja.py",
+        "terms": "html rendering python signatures default argument tuples parameter list color search"
+      },
+      {
+        "path": "sphinx/locale/bg/LC_MESSAGES/sphinx.po",
+        "terms": "html rendering python signatures default argument tuples parameter list color"
+      },
+      {
+        "path": "sphinx/locale/pt/LC_MESSAGES/sphinx.po",
+        "terms": "html rendering python signatures default argument tuples parameter list color"
+      },
+      {
+        "path": "sphinx/locale/te/LC_MESSAGES/sphinx.po",
+        "terms": "html rendering python signatures default argument tuples parameter list color"
+      },
+      {
+        "path": "sphinx/locale/ur/LC_MESSAGES/sphinx.po",
+        "terms": "html rendering python signatures default argument tuples parameter list color"
+      },
+      {
+        "path": "sphinx/locale/hi_IN/LC_MESSAGES/sphinx.po",
+        "terms": "html rendering python signatures default argument tuples parameter list color"
+      },
+      {
+        "path": "sphinx/locale/sr@latin/LC_MESSAGES/sphinx.po",
+        "terms": "html rendering python signatures default argument tuples parameter list color"
+      },
+      {
+        "path": "sphinx/locale/sphinx.pot",
+        "terms": "html rendering python signatures default argument tuples parameter list color"
+      },
+      {
+        "path": "sphinx/util/inspect.py",
+        "terms": "python signature default value enum formatting stringify inspect"
+      },
+      {
+        "path": "tests/test_util_inspect.py",
+        "terms": "tests python signature default value inspect"
+      },
+      {
+        "path": "tests/test_build_latex.py",
+        "terms": "latex writer inline code syntax highlighting sphinxcode sphinxupquote role tests test_build_latex"
+      },
+      {
+        "path": "sphinx/writers/latex.py",
+        "terms": "latex writer inline code syntax highlighting sphinxcode sphinxupquote role"
+      }
+    ]
+  },
+  "symbols": {
+    "files": [
+      {
+        "path": "src/query-set.ts",
+        "terms": "queryset in_bulk",
+        "symbols": ["QuerySet"],
+        "exports": ["QuerySet"]
+      },
+      {
+        "path": "docs/query-set.md",
+        "terms": "queryset queryset queryset guide"
+      },
+      {
+        "path": "src/a.ts",
+        "terms": "deterministic_tie_marker"
+      },
+      {
+        "path": "src/b.ts",
+        "terms": "deterministic_tie_marker"
+      }
+    ]
+  }
+}
