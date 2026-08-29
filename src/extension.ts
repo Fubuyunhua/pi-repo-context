@@ -193,19 +193,6 @@ export function boundSearchPayload(
   return { payload, text };
 }
 
-function unavailableQuery(message: string): RepoMapRuntimeQuery {
-  return {
-    results: [],
-    freshness: "unsupported",
-    generation: 0,
-    gitHead: "no-head",
-    workspaceRevision: "unavailable",
-    pendingFiles: [],
-    fallbackEvidence: [],
-    error: message,
-  };
-}
-
 export function isOutsideRelativePath(path: string): boolean {
   return isAbsolute(path) || path === ".." || path.startsWith(`..${sep}`);
 }
@@ -389,36 +376,27 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
   });
 
   const executeSearch = async (params: { query: string; limit?: number }, deprecated: boolean) => {
+    if (runtime.config?.enabled === false) throw new Error("Repository context is disabled.");
+    if (!runtime.available || !runtime.repoMap) throw new Error("Repository context is unavailable.");
+
     let result: RepoMapRuntimeQuery;
-    let publicError: string | undefined;
-    let isError = false;
-    if (runtime.config?.enabled === false) {
-      publicError = "Repository context is disabled.";
-      result = unavailableQuery(publicError);
-      isError = true;
-    } else if (!runtime.available || !runtime.repoMap) {
-      publicError = "Repository context is unavailable.";
-      result = unavailableQuery(publicError);
-      isError = true;
-    } else {
-      try {
-        result = await runtime.repoMap.query(params.query, { limit: params.limit });
-        isError = result.error !== undefined;
-      } catch (error) {
-        addFailure(runtime, "query", error);
-        publicError = PUBLIC_ERRORS.query;
-        result = unavailableQuery(publicError);
-        isError = true;
-      }
+    try {
+      result = await runtime.repoMap.query(params.query, { limit: params.limit });
+    } catch (error) {
+      addFailure(runtime, "query", error);
+      throw new Error(PUBLIC_ERRORS.query);
     }
+    const hasUsableDegradedEvidence =
+      result.freshness === "stale" && (result.results.length > 0 || result.fallbackEvidence.length > 0);
+    if (result.error !== undefined && !hasUsableDegradedEvidence) throw new Error(PUBLIC_ERRORS.searchResult);
+
     const maxBytes = runtime.config?.searchMaxBytes ?? 6 * 1024;
-    const bounded = boundSearchPayload(params.query, result, maxBytes, publicError);
+    const bounded = boundSearchPayload(params.query, result, maxBytes);
     return {
       content: [{ type: "text" as const, text: bounded.text }],
       details: deprecated
         ? { ...bounded.payload, deprecated: true as const, replacement: "repo_context_search" as const }
         : bounded.payload,
-      ...(isError ? { isError: true } : {}),
     };
   };
 
