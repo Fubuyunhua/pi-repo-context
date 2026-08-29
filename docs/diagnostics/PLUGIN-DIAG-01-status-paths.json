@@ -6,10 +6,7 @@
     "exposedPathFieldCount": 2,
     "exposedAbsolutePathCount": 2,
     "exposesPrivateHomeSegment": true,
-    "exposedPathFields": [
-      "project.root",
-      "project.stateRoot"
-    ]
+    "exposedPathFields": ["project.root", "project.stateRoot"]
   },
   "repo": {
     "name": "repo",
@@ -17,10 +14,6 @@
     "exposedPathFieldCount": 3,
     "exposedAbsolutePathCount": 3,
     "exposesPrivateHomeSegment": true,
-    "exposedPathFields": [
-      "project.root",
-      "project.stateRoot",
-      "project.mapRoot"
-    ]
+    "exposedPathFields": ["project.root", "project.stateRoot", "project.mapRoot"]
   }
 }

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -349,10 +349,18 @@ describe("initial repository map", () => {
       file: { kind: "lexical", degradedReason: expect.stringContaining("parse") },
       warning: { code: "parse-error" },
     });
-    await chmod(join(root, "src/good.ts"), 0o000);
-    await expect(indexRepoMapFile(root, "src/good.ts")).resolves.toMatchObject({
+    await expect(
+      indexRepoMapFile(root, "src/good.ts", {
+        fileSystem: {
+          lstat,
+          async readFile() {
+            throw Object.assign(new Error("simulated EACCES"), { code: "EACCES" });
+          },
+        },
+      }),
+    ).resolves.toMatchObject({
       kind: "read-error",
-      warning: { code: "read-error", message: expect.any(String) },
+      warning: { code: "read-error", message: expect.stringContaining("simulated EACCES") },
     });
   });
 

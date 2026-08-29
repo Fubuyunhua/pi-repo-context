@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import MiniSearch from "minisearch";
 import ts from "typescript";
 import { atomicWriteFile } from "../state/atomic.js";
-import { analyzeJava } from "./java.js";
+import { analyzeJava, JAVA_ANALYZER_VERSION } from "./java.js";
 
 const execFileAsync = promisify(execFile);
 export const REPO_MAP_SCHEMA_VERSION = 1;
@@ -108,7 +108,7 @@ export interface RepoMapSnapshot {
     generatorVersion: "0.1.0";
     parser: "typescript-compiler-api";
     typescriptVersion: string;
-    javaParser?: "java-parser@3.0.1";
+    javaParser?: "java-parser@3.0.1" | typeof JAVA_ANALYZER_VERSION;
     generatedAt: string;
     projectRoot: string;
   };
@@ -120,6 +120,8 @@ export interface BuildRepoMapOptions {
   projectRoot: string;
   exclude?: string[];
   outputPath?: string;
+  /** Injectable file operations for deterministic full-build read failures. */
+  fileSystem?: RepoMapFileSystem;
 }
 
 export interface RepoMapQueryOptions {
@@ -672,7 +674,7 @@ export async function indexRepoMapFile(
         file: {
           ...base,
           ...(language === "java"
-            ? analyzeJava(content.toString("utf8"))
+            ? await analyzeJava(content.toString("utf8"))
             : analyzeSemantic(normalizedPath, content.toString("utf8"))),
           kind: "semantic",
           language,
@@ -701,7 +703,13 @@ export async function buildRepoMap(options: BuildRepoMapOptions): Promise<RepoMa
   const projectRoot = await realpath(resolve(options.projectRoot));
   const paths = await enumerateRepoMapFiles(projectRoot, options.exclude ?? []);
   const indexed = await Promise.all(
-    paths.map((path) => indexRepoMapFile(projectRoot, path, { exclude: options.exclude, checkGitIgnore: false })),
+    paths.map((path) =>
+      indexRepoMapFile(projectRoot, path, {
+        exclude: options.exclude,
+        checkGitIgnore: false,
+        ...(options.fileSystem ? { fileSystem: options.fileSystem } : {}),
+      }),
+    ),
   );
   const snapshot: RepoMapSnapshot = {
     schemaVersion: REPO_MAP_SCHEMA_VERSION,
@@ -711,7 +719,7 @@ export async function buildRepoMap(options: BuildRepoMapOptions): Promise<RepoMa
       generatorVersion: "0.1.0",
       parser: "typescript-compiler-api",
       typescriptVersion: ts.version,
-      javaParser: "java-parser@3.0.1",
+      javaParser: JAVA_ANALYZER_VERSION,
       generatedAt: new Date().toISOString(),
       projectRoot,
     },

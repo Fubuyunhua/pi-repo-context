@@ -456,7 +456,9 @@ function isRepoMapSnapshot(value: unknown): value is RepoMapSnapshot {
     provenance.generatorVersion === "0.1.0" &&
     provenance.parser === "typescript-compiler-api" &&
     typeof provenance.typescriptVersion === "string" &&
-    (provenance.javaParser === undefined || provenance.javaParser === "java-parser@3.0.1") &&
+    (provenance.javaParser === undefined ||
+      provenance.javaParser === "java-parser@3.0.1" ||
+      provenance.javaParser === "web-tree-sitter@0.26.11+tree-sitter-java-orchard@0.5.10") &&
     typeof provenance.generatedAt === "string" &&
     Number.isFinite(Date.parse(provenance.generatedAt)) &&
     typeof provenance.projectRoot === "string" &&
@@ -1120,6 +1122,9 @@ export class RepoMapRuntime {
       return;
     }
     if (resolve(active.snapshot.provenance.projectRoot) !== this.#projectRoot) return;
+    // Legacy Java analyzer generations remain portable/readable, but reusing
+    // their files would mix incompatible analyzer output into this runtime.
+    if (active.snapshot.provenance.javaParser === "java-parser@3.0.1") return;
     this.#generation = active.generation;
     this.#head = active.gitHead;
     this.#dirty = new Map(active.dirtyFiles.map(({ path, contentHash }) => [path, contentHash]));
@@ -1203,7 +1208,11 @@ export class RepoMapRuntime {
     let snapshot: RepoMapSnapshot;
     try {
       head = await gitHead(this.#projectRoot, this.#gitRunner, this.#telemetry, this.#monotonicNow);
-      snapshot = await this.#snapshotBuilder({ projectRoot: this.#projectRoot, exclude: this.#options.exclude });
+      snapshot = await this.#snapshotBuilder({
+        projectRoot: this.#projectRoot,
+        exclude: this.#options.exclude,
+        ...(this.#options.indexFileSystem ? { fileSystem: this.#options.indexFileSystem } : {}),
+      });
     } catch (error) {
       this.#baseBuildFailed = true;
       this.#degrade(error);

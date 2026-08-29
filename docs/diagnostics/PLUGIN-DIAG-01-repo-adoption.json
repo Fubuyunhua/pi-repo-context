@@ -50,18 +50,9 @@
       ],
       "top1UsedLater": false,
       "anyTop5UsedLater": false,
-      "usedPaths": [
-        "tests/force_insert_update/tests.py",
-        "django/db/models/base.py"
-      ],
-      "editedFiles": [
-        ".pi/repo-context.json",
-        "django/db/models/base.py",
-        "tests/basic/tests.py"
-      ],
-      "editedHits": [
-        "django/db/models/base.py"
-      ],
+      "usedPaths": ["tests/force_insert_update/tests.py", "django/db/models/base.py"],
+      "editedFiles": [".pi/repo-context.json", "django/db/models/base.py", "tests/basic/tests.py"],
+      "editedHits": ["django/db/models/base.py"],
       "laterToolCalls": [
         "bash",
         "read",
@@ -130,10 +121,7 @@
         "django/forms/models.py",
         "tests/model_forms/tests.py"
       ],
-      "editedHits": [
-        "tests/model_forms/tests.py",
-        "django/forms/models.py"
-      ],
+      "editedHits": ["tests/model_forms/tests.py", "django/forms/models.py"],
       "laterToolCalls": [
         "bash",
         "read",
@@ -192,18 +180,14 @@
       ],
       "top1UsedLater": false,
       "anyTop5UsedLater": false,
-      "usedPaths": [
-        "django/db/models/query.py"
-      ],
+      "usedPaths": ["django/db/models/query.py"],
       "editedFiles": [
         ".pi/repo-context.json",
         "django/db/models/query.py",
         "tests/lookup/models.py",
         "tests/lookup/tests.py"
       ],
-      "editedHits": [
-        "django/db/models/query.py"
-      ],
+      "editedHits": ["django/db/models/query.py"],
       "laterToolCalls": [
         "bash",
         "bash",
@@ -257,20 +241,9 @@
       ],
       "top1UsedLater": true,
       "anyTop5UsedLater": true,
-      "usedPaths": [
-        "tests/test_build_latex.py",
-        "sphinx/writers/latex.py"
-      ],
-      "editedFiles": [
-        ".pi/repo-context.json",
-        "sphinx/writers/latex.py",
-        "tests/test_build_latex.py",
-        "tox.ini"
-      ],
-      "editedHits": [
-        "tests/test_build_latex.py",
-        "sphinx/writers/latex.py"
-      ],
+      "usedPaths": ["tests/test_build_latex.py", "sphinx/writers/latex.py"],
+      "editedFiles": [".pi/repo-context.json", "sphinx/writers/latex.py", "tests/test_build_latex.py", "tox.ini"],
+      "editedHits": ["tests/test_build_latex.py", "sphinx/writers/latex.py"],
       "laterToolCalls": [
         "bash",
         "bash",
@@ -393,9 +366,7 @@
       ],
       "top1UsedLater": false,
       "anyTop5UsedLater": false,
-      "usedPaths": [
-        "sphinx/writers/html.py"
-      ],
+      "usedPaths": ["sphinx/writers/html.py"],
       "editedFiles": [
         ".pi/repo-context.json",
         "setup.py",
@@ -468,11 +439,7 @@
       ],
       "top1UsedLater": true,
       "anyTop5UsedLater": true,
-      "usedPaths": [
-        "sphinx/ext/autodoc/__init__.py",
-        "sphinx/util/inspect.py",
-        "tests/test_util_inspect.py"
-      ],
+      "usedPaths": ["sphinx/ext/autodoc/__init__.py", "sphinx/util/inspect.py", "tests/test_util_inspect.py"],
       "editedFiles": [
         ".pi/repo-context.json",
         "setup.py",
@@ -480,10 +447,7 @@
         "tests/test_util_inspect.py",
         "tox.ini"
       ],
-      "editedHits": [
-        "sphinx/util/inspect.py",
-        "tests/test_util_inspect.py"
-      ],
+      "editedHits": ["sphinx/util/inspect.py", "tests/test_util_inspect.py"],
       "laterToolCalls": [
         "bash",
         "bash",
@@ -536,10 +500,7 @@
       ],
       "top1UsedLater": true,
       "anyTop5UsedLater": true,
-      "usedPaths": [
-        "sphinx/util/inspect.py",
-        "tests/test_util_inspect.py"
-      ],
+      "usedPaths": ["sphinx/util/inspect.py", "tests/test_util_inspect.py"],
       "editedFiles": [
         ".pi/context-vault.json",
         ".pi/repo-context.json",
@@ -548,24 +509,8 @@
         "tests/test_util_inspect.py",
         "tox.ini"
       ],
-      "editedHits": [
-        "sphinx/util/inspect.py",
-        "tests/test_util_inspect.py"
-      ],
-      "laterToolCalls": [
-        "bash",
-        "bash",
-        "read",
-        "read",
-        "bash",
-        "read",
-        "read",
-        "read",
-        "edit",
-        "edit",
-        "bash",
-        "bash"
-      ]
+      "editedHits": ["sphinx/util/inspect.py", "tests/test_util_inspect.py"],
+      "laterToolCalls": ["bash", "bash", "read", "read", "bash", "read", "read", "read", "edit", "edit", "bash", "bash"]
     }
   ]
 }

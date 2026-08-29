@@ -1,22 +1,11 @@
 import { execFile } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import {
-  chmod,
-  lstat,
-  mkdir,
-  mkdtemp,
-  readdir,
-  readFile,
-  realpath,
-  rm,
-  stat,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import type { RepoMapFileSystem } from "../src/repo-map/index.js";
 import {
   isWatcherIgnoredPath,
   loadActiveRepoMapGeneration,
@@ -30,6 +19,30 @@ import { Telemetry } from "../src/telemetry.js";
 function tickingClock(): () => number {
   let tick = 0;
   return () => tick++;
+}
+
+function controlledReadFailures(): {
+  fileSystem: RepoMapFileSystem;
+  fail(path: string, code?: string): void;
+  recover(path: string): void;
+} {
+  const failures = new Map<string, string>();
+  return {
+    fileSystem: {
+      lstat,
+      async readFile(path) {
+        const code = failures.get(path);
+        if (code !== undefined) throw Object.assign(new Error(`simulated ${code}: ${path}`), { code });
+        return readFile(path);
+      },
+    },
+    fail(path, code = "EACCES") {
+      failures.set(path, code);
+    },
+    recover(path) {
+      failures.delete(path);
+    },
+  };
 }
 
 const execFileAsync = promisify(execFile);
@@ -603,10 +616,16 @@ describe("incremental repository map runtime", () => {
 
   it("preserves coherent content and stays stale on transient read errors until recovery", async () => {
     const { root, stateRoot } = await fixture({ "src/value.ts": "export const coherentValue = true;" });
-    const runtime = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    const failures = controlledReadFailures();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      indexFileSystem: failures.fileSystem,
+    });
     await runtime.start();
     const initialRevision = runtime.status().workspaceRevision;
-    await chmod(join(root, "src/value.ts"), 0o000);
+    failures.fail(join(root, "src/value.ts"));
     runtime.notify("change", "src/value.ts");
     await runtime.flush();
 
@@ -617,7 +636,7 @@ describe("incremental repository map runtime", () => {
     expect(stale.fallbackEvidence.length).toBeGreaterThan(0);
     expect(stale.error?.length).toBeLessThanOrEqual(512);
 
-    await chmod(join(root, "src/value.ts"), 0o644);
+    failures.recover(join(root, "src/value.ts"));
     await runtime.flush();
     expect(runtime.status()).toMatchObject({ freshness: "fresh", pendingFiles: [] });
     await runtime.close();
@@ -662,14 +681,20 @@ describe("incremental repository map runtime", () => {
 
   it("keeps a prior dirty overlay when Git temporarily omits its read-error path", async () => {
     const { root, stateRoot } = await fixture({ "src/value.ts": "export const originalValue = true;" });
-    const runtime = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    const failures = controlledReadFailures();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      indexFileSystem: failures.fileSystem,
+    });
     await runtime.start();
     await writeFile(join(root, "src/value.ts"), "export const omittedDirtyValue = true;");
     runtime.notify("change", "src/value.ts");
     await runtime.flush();
     const dirtyRevision = runtime.status().workspaceRevision;
     await execFileAsync("git", ["update-index", "--assume-unchanged", "src/value.ts"], { cwd: root });
-    await chmod(join(root, "src/value.ts"), 0o000);
+    failures.fail(join(root, "src/value.ts"));
     runtime.notify("change", "src/value.ts");
     await runtime.flush();
 
@@ -677,20 +702,26 @@ describe("incremental repository map runtime", () => {
     expect(query).toMatchObject({ freshness: "stale", workspaceRevision: dirtyRevision });
     expect(query.results[0]?.path).toBe("src/value.ts");
     expect(runtime.status().dirtyFiles).toEqual(["src/value.ts"]);
-    await chmod(join(root, "src/value.ts"), 0o644);
+    failures.recover(join(root, "src/value.ts"));
     await runtime.close();
   });
 
   it("preserves a coherent dirty overlay when an explicit rebuild hits a read error", async () => {
     const { root, stateRoot } = await fixture({ "src/value.ts": "export const originalValue = true;" });
-    const runtime = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    const failures = controlledReadFailures();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      indexFileSystem: failures.fileSystem,
+    });
     await runtime.start();
     await writeFile(join(root, "src/value.ts"), "export const coherentDirtyValue = true;");
     runtime.notify("change", "src/value.ts");
     await runtime.flush();
     const dirtyRevision = runtime.status().workspaceRevision;
 
-    await chmod(join(root, "src/value.ts"), 0o000);
+    failures.fail(join(root, "src/value.ts"));
     await runtime.rebuild();
 
     const query = await runtime.query("coherentDirtyValue");
@@ -699,19 +730,25 @@ describe("incremental repository map runtime", () => {
     expect(query.pendingFiles).toEqual(["src/value.ts"]);
     expect(query.fallbackEvidence.length).toBeGreaterThan(0);
     expect(query.error?.length).toBeLessThanOrEqual(512);
-    await chmod(join(root, "src/value.ts"), 0o644);
+    failures.recover(join(root, "src/value.ts"));
     await runtime.close();
   });
 
   it("preserves coherent evidence when a HEAD-change rebuild hits a read error", async () => {
     const { root, stateRoot } = await fixture({ "src/value.ts": "export const coherentHeadValue = true;" });
-    const runtime = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    const failures = controlledReadFailures();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      indexFileSystem: failures.fileSystem,
+    });
     await runtime.start();
     const oldHead = runtime.status().gitHead;
     await writeFile(join(root, "README.md"), "new head\n");
     await execFileAsync("git", ["add", "README.md"], { cwd: root });
     await execFileAsync("git", ["commit", "-qm", "new head"], { cwd: root });
-    await chmod(join(root, "src/value.ts"), 0o000);
+    failures.fail(join(root, "src/value.ts"));
 
     const query = await runtime.query("coherentHeadValue");
     expect(query.gitHead).not.toBe(oldHead);
@@ -719,7 +756,7 @@ describe("incremental repository map runtime", () => {
     expect(query.results[0]?.path).toBe("src/value.ts");
     expect(query.pendingFiles).toEqual(["src/value.ts"]);
     expect(query.fallbackEvidence.length).toBeGreaterThan(0);
-    await chmod(join(root, "src/value.ts"), 0o644);
+    failures.recover(join(root, "src/value.ts"));
     await runtime.close();
   });
 
@@ -728,20 +765,27 @@ describe("incremental repository map runtime", () => {
     const first = new RepoMapRuntime({ projectRoot: withPrior.root, stateRoot: withPrior.stateRoot, watch: false });
     await first.start();
     await first.close();
-    await chmod(join(withPrior.root, "src/value.ts"), 0o000);
+    const failures = controlledReadFailures();
+    failures.fail(join(withPrior.root, "src/value.ts"));
 
-    const restarted = new RepoMapRuntime({ projectRoot: withPrior.root, stateRoot: withPrior.stateRoot, watch: false });
+    const restarted = new RepoMapRuntime({
+      projectRoot: withPrior.root,
+      stateRoot: withPrior.stateRoot,
+      watch: false,
+      indexFileSystem: failures.fileSystem,
+    });
     await restarted.start();
     const preserved = await restarted.query("restartValue");
     expect(preserved.freshness).toBe("stale");
     expect(preserved.results[0]?.path).toBe("src/value.ts");
 
     const withoutPrior = await fixture({ "src/value.ts": "export const unavailableValue = true;" });
-    await chmod(join(withoutPrior.root, "src/value.ts"), 0o000);
+    failures.fail(join(withoutPrior.root, "src/value.ts"));
     const cold = new RepoMapRuntime({
       projectRoot: withoutPrior.root,
       stateRoot: withoutPrior.stateRoot,
       watch: false,
+      indexFileSystem: failures.fileSystem,
     });
     await cold.start();
     const unavailable = await cold.query("unavailableValue");
@@ -751,8 +795,8 @@ describe("incremental repository map runtime", () => {
     expect(unavailable.fallbackEvidence).toEqual([
       { kind: "source", excerpt: "No indexed source file is available; use direct filesystem search." },
     ]);
-    await chmod(join(withPrior.root, "src/value.ts"), 0o644);
-    await chmod(join(withoutPrior.root, "src/value.ts"), 0o644);
+    failures.recover(join(withPrior.root, "src/value.ts"));
+    failures.recover(join(withoutPrior.root, "src/value.ts"));
     await restarted.close();
     await cold.close();
   });
@@ -1000,13 +1044,40 @@ describe("incremental repository map runtime", () => {
     await runtime.close();
   });
 
+  it("does not hydrate persisted java-parser generations and rebuilds with current analyzer provenance", async () => {
+    const { root, stateRoot } = await fixture({ "src/Value.java": "public class Value {}" });
+    const first = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    await first.start();
+    await first.close();
+
+    const activePath = join(stateRoot, "generations", "1.json");
+    const legacy = JSON.parse(await readFile(activePath, "utf8"));
+    legacy.snapshot.provenance.javaParser = "java-parser@3.0.1";
+    await writeFile(activePath, `${JSON.stringify(legacy)}\n`);
+    await expect(loadActiveRepoMapGeneration(stateRoot)).resolves.toMatchObject({ generation: 1 });
+
+    const second = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
+    await second.start();
+    await expect(loadActiveRepoMapGeneration(stateRoot)).resolves.toMatchObject({
+      generation: 2,
+      snapshot: {
+        provenance: {
+          javaParser: "web-tree-sitter@0.26.11+tree-sitter-java-orchard@0.5.10",
+        },
+      },
+    });
+    await second.close();
+  });
+
   it("accepts documented optional snapshot metadata", async () => {
     const { root, stateRoot } = await fixture({ "src/value.ts": "export const safeValue = 1;" });
     const runtime = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false });
     await runtime.start();
     const activePath = join(stateRoot, "generations", "1.json");
     const active = JSON.parse(await readFile(activePath, "utf8"));
-    Object.assign(active.snapshot.provenance, { javaParser: "java-parser@3.0.1" });
+    Object.assign(active.snapshot.provenance, {
+      javaParser: "web-tree-sitter@0.26.11+tree-sitter-java-orchard@0.5.10",
+    });
     Object.assign(active.snapshot.files[0], {
       packageName: "example",
       degradedReason: "documented optional reason",

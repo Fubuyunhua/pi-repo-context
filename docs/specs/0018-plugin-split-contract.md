@@ -392,14 +392,15 @@ Repo Context owns these runtime dependencies because its repository implementati
 
 ```text
 chokidar
-java-parser
 minisearch
 typescript
+web-tree-sitter
 ```
 
-After repository code and the bench are removed/excluded, Context Vault drops all four from **runtime**
-dependencies. It MUST retain `typescript` explicitly as a development dependency because its `typecheck` script
-uses `tsc`; this build-only dependency does not confer repository-analysis ownership. Repo Context retains
+The Java grammar is a pinned, packaged `tree-sitter-java-orchard` WASM artifact rather than an npm runtime dependency;
+its license and checksum are verified by the package smoke test. After repository code and the bench are
+removed/excluded, Context Vault drops all four from **runtime** dependencies. It MUST retain `typescript` explicitly
+as a development dependency because its `typecheck` script uses `tsc`; this build-only dependency does not confer repository-analysis ownership. Repo Context retains
 `typescript` as a runtime dependency and may use the same installation for typechecking. Both plugins keep
 `@earendil-works/pi-coding-agent` and `typebox` as peer dependencies and development dependencies for testing
 their own Tool/command adapters. Each also declares its own build/test development tools—Biome, Vitest, V8
