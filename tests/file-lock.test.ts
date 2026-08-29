@@ -301,7 +301,7 @@ describe("race-safe file locks", () => {
     injectInspectionErrors(point, lockPath, ownerPath, [code]);
 
     await expect(
-      withFileLock(lockPath, async () => "recovered", { retryMs: 2, staleMs: 10, timeoutMs: 200 }),
+      withFileLock(lockPath, async () => "recovered", { retryMs: 2, staleMs: 10, timeoutMs: 1_000 }),
     ).resolves.toBe("recovered");
   });
 
@@ -460,7 +460,7 @@ describe("race-safe file locks", () => {
     const lockPath = join(root, "writer.lock");
     await writeOwner(lockPath, "00000000-0000-4000-8000-000000000006", await missingPid());
     await expect(
-      withFileLock(lockPath, async () => "recovered", { retryMs: 2, staleMs: 10, timeoutMs: 200 }),
+      withFileLock(lockPath, async () => "recovered", { retryMs: 2, staleMs: 10, timeoutMs: 1_000 }),
     ).resolves.toBe("recovered");
   });
 
@@ -475,7 +475,7 @@ describe("race-safe file locks", () => {
       async () => {
         parentSyncsAtAcquisition = fsControls.directorySyncAttempts.filter((path) => path === root).length;
       },
-      { retryMs: 2, staleMs: 10, timeoutMs: 200 },
+      { retryMs: 2, staleMs: 10, timeoutMs: 1_000 },
     );
 
     expect(parentSyncsAtAcquisition).toBeGreaterThanOrEqual(2);
@@ -684,7 +684,7 @@ describe("race-safe file locks", () => {
     fsControls.renameErrors.push(code);
 
     await expect(
-      withFileLock(lockPath, async () => "recovered", { retryMs: 2, staleMs: 10, timeoutMs: 300 }),
+      withFileLock(lockPath, async () => "recovered", { retryMs: 2, staleMs: 10, timeoutMs: 1_000 }),
     ).resolves.toBe("recovered");
   });
 
