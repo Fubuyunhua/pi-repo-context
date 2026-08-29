@@ -1,5 +1,13 @@
-import { resolve } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createRequire } from "node:module";
+import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import {
+  createSyntheticSourceInfo,
+  type ExtensionAPI,
+  type ExtensionRunner,
+  type ToolDefinition,
+  wrapRegisteredTool,
+} from "@earendil-works/pi-coding-agent";
 import { expect, it, vi } from "vitest";
 import repoContextExtension from "../extensions/index.js";
 import {
@@ -82,6 +90,118 @@ function fakeController(overrides: Partial<RepoMapController> = {}): RepoMapCont
   };
 }
 
+interface WrappedToolEnd {
+  type: "tool_execution_end";
+  toolCallId: string;
+  toolName: string;
+  result: { content: Array<{ type: string; text?: string }>; details: unknown };
+  isError: boolean;
+}
+
+interface TestAgent {
+  subscribe(listener: (event: unknown) => void): () => void;
+  prompt(message: string): Promise<void>;
+}
+
+interface TestAgentConstructor {
+  new (options: {
+    initialState: Record<string, unknown>;
+    streamFn: () => {
+      result(): Promise<Record<string, unknown>>;
+      [Symbol.asyncIterator](): AsyncIterator<Record<string, unknown>>;
+    };
+  }): TestAgent;
+}
+
+async function executeThroughPiAgent(tool: CapturedTool, params: Record<string, unknown>): Promise<WrappedToolEnd> {
+  const runner = {
+    createContext: () => ({}),
+    getActiveTools: () => [tool.name],
+  } as unknown as ExtensionRunner;
+  const wrapped = wrapRegisteredTool(
+    {
+      definition: tool as unknown as ToolDefinition,
+      sourceInfo: createSyntheticSourceInfo("extension.test.ts", { source: "test" }),
+    },
+    runner,
+  );
+
+  const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+  const corePackage = requireFromPi.resolve("@earendil-works/pi-agent-core/package.json");
+  const coreEntry = pathToFileURL(join(dirname(corePackage), "dist/index.js")).href;
+  const { Agent } = (await import(coreEntry)) as unknown as { Agent: TestAgentConstructor };
+  const model = {
+    id: "test-model",
+    name: "Test Model",
+    api: "openai-completions",
+    provider: "test",
+    baseUrl: "",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 4096,
+    maxTokens: 1024,
+  };
+  let providerCalls = 0;
+  const streamFn = () => {
+    const toolCall = { type: "toolCall", id: "search-call", name: tool.name, arguments: params };
+    const content: Array<Record<string, unknown>> =
+      providerCalls++ === 0 ? [toolCall] : [{ type: "text", text: "done" }];
+    const output: Record<string, unknown> = {
+      role: "assistant",
+      content,
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: content[0]?.type === "toolCall" ? "toolUse" : "stop",
+      timestamp: Date.now(),
+    };
+    const records: Array<Record<string, unknown>> = [
+      { type: "start", partial: output },
+      ...(content[0]?.type === "toolCall"
+        ? [
+            { type: "toolcall_start", contentIndex: 0, partial: output },
+            { type: "toolcall_end", contentIndex: 0, toolCall, partial: output },
+          ]
+        : [
+            { type: "text_start", contentIndex: 0, partial: output },
+            { type: "text_end", contentIndex: 0, content: "done", partial: output },
+          ]),
+      { type: "done", reason: output.stopReason, message: output },
+    ];
+    return {
+      async *[Symbol.asyncIterator]() {
+        for (const record of records) yield record;
+      },
+      async result() {
+        return output;
+      },
+    };
+  };
+  const agent = new Agent({
+    initialState: { systemPrompt: "", model, thinkingLevel: "off", tools: [wrapped], messages: [] },
+    streamFn,
+  });
+  const toolEnds: WrappedToolEnd[] = [];
+  agent.subscribe((event) => {
+    if (typeof event === "object" && event !== null && "type" in event && event.type === "tool_execution_end") {
+      toolEnds.push(event as WrappedToolEnd);
+    }
+  });
+  await agent.prompt("search");
+  const toolEnd = toolEnds[0];
+  if (!toolEnd) throw new Error("Pi agent did not emit tool_execution_end");
+  return toolEnd;
+}
+
 const headlessContext = { cwd: "/project", hasUI: false, ui: { setStatus: vi.fn(), notify: vi.fn() } };
 
 it("eagerly registers only the approved tools, command, and lifecycle hooks", () => {
@@ -96,6 +216,21 @@ it("eagerly registers only the approved tools, command, and lifecycle hooks", ()
   expect([...target.commands.keys()]).toEqual(["repo-context"]);
 });
 
+it("marks hard search failures as errors through Pi's registered-tool wrapper and agent core", async () => {
+  const target = harness();
+  registerRepoContext(target.pi);
+  const search = target.tools.get("repo_context_search");
+  if (!search) throw new Error("repo_context_search was not registered");
+
+  const toolEnd = await executeThroughPiAgent(search, { query: "x" });
+  expect(toolEnd).toMatchObject({
+    toolCallId: "search-call",
+    toolName: "repo_context_search",
+    isError: true,
+    result: { content: [{ type: "text", text: "Repository context is unavailable." }] },
+  });
+});
+
 it("keeps status usable before initialization and when disabled without constructing runtime", async () => {
   const target = harness();
   const factory = vi.fn();
@@ -107,22 +242,18 @@ it("keeps status usable before initialization and when disabled without construc
   const statusTool = target.tools.get("repo_context_status");
   const before = (await statusTool?.execute()) as { details: { initialized: boolean; enabled: boolean | null } };
   expect(before.details).toMatchObject({ initialized: false, enabled: null });
-  const preInitSearch = (await target.tools.get("repo_context_search")?.execute("id", { query: "x" })) as {
-    details: { freshness: string; generation: number };
-    isError: boolean;
-  };
-  expect(preInitSearch).toMatchObject({ isError: true, details: { freshness: "unsupported", generation: 0 } });
+  await expect(target.tools.get("repo_context_search")?.execute("id", { query: "x" })).rejects.toThrow(
+    "Repository context is unavailable.",
+  );
   await target.events.get("session_start")?.[0]({}, headlessContext);
   const after = (await statusTool?.execute()) as {
     details: { initialized: boolean; enabled: boolean; degraded: boolean };
   };
   expect(after.details).toMatchObject({ initialized: true, enabled: false, degraded: false });
   expect(factory).not.toHaveBeenCalled();
-  const search = (await target.tools.get("repo_context_search")?.execute("id", { query: "x" })) as {
-    details: { freshness: string; generation: number };
-    isError: boolean;
-  };
-  expect(search).toMatchObject({ isError: true, details: { freshness: "unsupported", generation: 0 } });
+  await expect(target.tools.get("repo_context_search")?.execute("id", { query: "x" })).rejects.toThrow(
+    "Repository context is disabled.",
+  );
 });
 
 it("uses live query for primary and alias with identical content and alias-only details", async () => {
@@ -164,11 +295,9 @@ it("closes partial starts and keeps bounded degraded status available", async ()
   };
   expect(status.details).toMatchObject({ initialized: true, available: false, degraded: true });
   expect(status.details.failures[0].error).toBe("Repository map runtime failed.");
-  const unavailable = (await target.tools.get("repo_context_search")?.execute("id", { query: "x" })) as {
-    details: { freshness: string; generation: number };
-    isError: boolean;
-  };
-  expect(unavailable).toMatchObject({ isError: true, details: { freshness: "unsupported", generation: 0 } });
+  await expect(target.tools.get("repo_context_search")?.execute("id", { query: "x" })).rejects.toThrow(
+    "Repository context is unavailable.",
+  );
 });
 
 it("bounds status arrays and supports headless status, rebuild, doctor, and usage", async () => {
@@ -307,7 +436,7 @@ it("treats fresh rebuild maintenance errors as failures and retains prior rebuil
   expect(secondStatus.components.repoMap.maintenance.error).toBe("Repository maintenance failed.");
 });
 
-it("adds alias migration details on unavailable errors and closes only its runtime/UI key", async () => {
+it("throws from the unavailable alias and closes only its runtime/UI key", async () => {
   const target = harness();
   const close = vi.fn(async () => undefined);
   const ui = { setStatus: vi.fn(), notify: vi.fn() };
@@ -317,13 +446,9 @@ it("adds alias migration details on unavailable errors and closes only its runti
     loadConfig: async () => config,
     runtimeFactory: () => fakeController({ close }),
   });
-  const unavailable = (await target.tools.get("context_vault_repo_map")?.execute("id", { query: "x" })) as {
-    content: Array<{ text: string }>;
-    details: Record<string, unknown>;
-    isError: boolean;
-  };
-  expect(unavailable.isError).toBe(true);
-  expect(unavailable.details).toMatchObject({ deprecated: true, replacement: "repo_context_search" });
+  await expect(target.tools.get("context_vault_repo_map")?.execute("id", { query: "x" })).rejects.toThrow(
+    "Repository context is unavailable.",
+  );
 
   await target.events.get("session_start")?.[0]({}, context);
   await target.events.get("session_shutdown")?.[0]({}, context);
@@ -359,10 +484,17 @@ it("keeps status generic and bounded after a malicious configuration failure", a
   expect(Buffer.byteLength(status.content[0]?.text ?? "", "utf8")).toBeLessThan(4096);
 });
 
-it("publishes only fixed bounded errors and marks fresh runtime errors degraded", async () => {
+it("publishes only fixed bounded errors and returns usable stale fallback evidence as success", async () => {
   const target = harness();
   const malicious = `/home/private/repository/state.json\u0000${"z".repeat(1024 * 1024)}`;
-  const query = vi.fn(async () => ({ ...queryResult, error: malicious }));
+  const query = vi.fn(
+    async (): Promise<RepoMapRuntimeQuery> => ({
+      ...queryResult,
+      freshness: "stale" as const,
+      fallbackEvidence: [{ kind: "source" as const, path: "src/main.ts", excerpt: "export const safe = true" }],
+      error: malicious,
+    }),
+  );
   const controller = fakeController({
     query,
     status: vi.fn(() => ({
@@ -385,11 +517,14 @@ it("publishes only fixed bounded errors and marks fresh runtime errors degraded"
 
   const search = (await target.tools.get("repo_context_search")?.execute("id", { query: "needle" })) as {
     content: Array<{ text: string }>;
-    details: { error: string };
-    isError: boolean;
+    details: { error: string; freshness: string; fallbackEvidence: Array<{ path?: string }> };
   };
-  expect(search.isError).toBe(true);
-  expect(search.details.error).toBe("Repository search returned degraded results.");
+  expect(search).not.toHaveProperty("isError");
+  expect(search.details).toMatchObject({
+    error: "Repository search returned degraded results.",
+    freshness: "stale",
+    fallbackEvidence: [{ path: "src/main.ts" }],
+  });
   expect(search.content[0]?.text).not.toContain("private");
   expect(search.content[0]?.text).not.toContain("state.json");
   expect(Buffer.byteLength(search.content[0]?.text ?? "", "utf8")).toBeLessThanOrEqual(config.searchMaxBytes);
@@ -423,17 +558,21 @@ it("publishes only fixed bounded errors and marks fresh runtime errors degraded"
   expect(status.content[0]?.text).not.toContain("state.json");
   expect(Buffer.byteLength(status.content[0]?.text ?? "", "utf8")).toBeLessThan(16 * 1024);
 
+  query.mockResolvedValueOnce({ ...queryResult, error: malicious });
+  await expect(target.tools.get("repo_context_search")?.execute("id", { query: "needle" })).rejects.toThrow(
+    "Repository search returned degraded results.",
+  );
+
   query.mockRejectedValueOnce(new Error(malicious));
-  const thrown = (await target.tools.get("repo_context_search")?.execute("id", { query: "needle" })) as {
-    content: Array<{ text: string }>;
-    details: { error: string };
-  };
-  expect(thrown.details.error).toBe("Repository search failed.");
-  expect(thrown.content[0]?.text).not.toContain("private");
+  await expect(target.tools.get("repo_context_search")?.execute("id", { query: "needle" })).rejects.toThrow(
+    "Repository search failed.",
+  );
 
   query.mockRejectedValue(new Error(malicious));
   for (let index = 0; index < 25; index += 1) {
-    await target.tools.get("repo_context_search")?.execute("id", { query: "needle" });
+    await expect(target.tools.get("repo_context_search")?.execute("id", { query: "needle" })).rejects.toThrow(
+      "Repository search failed.",
+    );
   }
   const boundedFailures = (await target.tools.get("repo_context_status")?.execute()) as {
     content: Array<{ text: string }>;

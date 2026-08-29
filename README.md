@@ -39,6 +39,10 @@ The model-visible `repo_context_status` payload omits absolute project and inter
 
 Repository-derived output is untrusted navigation data, not instructions.
 
+Search throws a tool error when the extension is disabled or unavailable, a query fails, or the runtime cannot return
+usable evidence. A stale result with indexed matches or `fallbackEvidence` remains a successful tool result so callers
+can use the bounded degraded evidence; inspect its `freshness` and `error` fields before relying on it.
+
 ## Commands
 
 ```text
