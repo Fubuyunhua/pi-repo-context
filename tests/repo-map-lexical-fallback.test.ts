@@ -3,10 +3,20 @@ import { mkdir, mkdtemp, rename, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { LEXICAL_FALLBACK_LIMITS, scanLexicalFallback } from "../src/repo-map/lexical-fallback.js";
 
 const execFileAsync = promisify(execFile);
+
+function deferred(): { promise: Promise<void>; resolve: () => void; reject: (error: Error) => void } {
+  let resolve: () => void = () => {};
+  let reject: (error: Error) => void = () => {};
+  const promise = new Promise<void>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
 
 it("ranks linked dotted, underscored, and path terms with match-centered bounded excerpts", async () => {
   const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-"));
@@ -270,6 +280,67 @@ it("honors non-Git root ignore negation and skips symlinks and binary files", as
   for (const query of ["hiddenUniqueNeedle", "binaryUniqueNeedle", "outsideUniqueNeedle"]) {
     expect((await scanLexicalFallback({ projectRoot: root, query })).results).toEqual([]);
   }
+});
+
+it("returns at deadline from a gated batch and discards completed partial matches", async () => {
+  vi.useFakeTimers();
+  try {
+    const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-deadline-"));
+    await writeFile(join(root, "a-fast.ts"), "deadlineNeedle\n");
+    await writeFile(join(root, "z-gated.ts"), "deadlineNeedle\n");
+    const gate = deferred();
+    const entered = deferred();
+
+    const scan = scanLexicalFallback({
+      projectRoot: root,
+      query: "deadlineNeedle",
+      candidatePaths: ["a-fast.ts", "z-gated.ts"],
+      gitWorkspace: false,
+      limits: { deadlineMs: 60_000, concurrency: 2 },
+      async beforeOpen(path) {
+        if (!path.endsWith("z-gated.ts")) return;
+        entered.resolve();
+        await gate.promise;
+      },
+    });
+    await entered.promise;
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await scan;
+    expect(result).toMatchObject({ timedOut: true, cancelled: false, results: [], fallbackEvidence: [] });
+    expect(result.matchesReturned).toBe(0);
+    gate.reject(new Error("late gated failure must be drained"));
+    await Promise.resolve();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("returns on caller cancellation while a read gate is unresolved", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-cancel-read-"));
+  await writeFile(join(root, "pending.ts"), "cancelledPendingNeedle\n");
+  const gate = deferred();
+  const entered = deferred();
+  const controller = new AbortController();
+
+  const scan = scanLexicalFallback({
+    projectRoot: root,
+    query: "cancelledPendingNeedle",
+    candidatePaths: ["pending.ts"],
+    gitWorkspace: false,
+    signal: controller.signal,
+    limits: { deadlineMs: 60_000 },
+    async beforeRead() {
+      entered.resolve();
+      await gate.promise;
+    },
+  });
+  await entered.promise;
+  controller.abort();
+  const result = await scan;
+  expect(result).toMatchObject({ timedOut: false, cancelled: true, results: [], fallbackEvidence: [] });
+  expect(result.matchesReturned).toBe(0);
+  gate.resolve();
+  await Promise.resolve();
 });
 
 it("enforces source/file/result bounds and cancellation without leaking partial retired evidence", async () => {

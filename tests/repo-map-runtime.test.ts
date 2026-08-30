@@ -222,20 +222,18 @@ describe("incremental repository map runtime", () => {
     const scheduler = new ManualScheduler();
     const telemetry = new Telemetry();
     let armed = false;
-    let delayed = false;
+    let cutoffReached = false;
     const runtime = new RepoMapRuntime({
       projectRoot: root,
       stateRoot,
       watch: false,
       scheduler,
       telemetry,
+      flushMonotonicNow: () => (cutoffReached ? 1_001 : 0),
       indexFileSystem: {
         lstat,
         async readFile(path) {
-          if (armed && !delayed && path === join(root, "src", "file-00000.ts")) {
-            delayed = true;
-            await new Promise((resolve) => setTimeout(resolve, 1_050));
-          }
+          if (armed && path === join(root, "src", "file-00000.ts")) cutoffReached = true;
           return readFile(path);
         },
       },
@@ -245,7 +243,9 @@ describe("incremental repository map runtime", () => {
       Array.from({ length: 100 }, (_, index) =>
         writeFile(
           join(root, "src", `file-${String(index).padStart(5, "0")}.ts`),
-          `export const BATCH_MARKER_${index} = ${index};\n`,
+          index < 64 || index === 99
+            ? `export const BATCH_MARKER_${index} = ${index};\n`
+            : `export const TAIL_CHANGE_${index} = ${index};\n`,
         ),
       ),
     );
@@ -256,10 +256,11 @@ describe("incremental repository map runtime", () => {
 
     const first = await runtime.query("BATCH_MARKER_99");
 
-    expect(delayed).toBe(true);
+    expect(cutoffReached).toBe(true);
     expect(first.freshness).toBe("stale");
     expect(first.pendingFiles).toContain("src/file-00099.ts");
     expect(first.results[0]).toMatchObject({ path: "src/file-00099.ts", kind: "lexical" });
+    expect(first.results.findIndex((result) => result.path === "src/file-00019.ts")).toBeGreaterThan(0);
     expect(first.fallbackEvidence[0]).toMatchObject({
       kind: "source",
       path: "src/file-00099.ts",
@@ -293,17 +294,27 @@ describe("incremental repository map runtime", () => {
           options.signal?.addEventListener("abort", () => resolve(), { once: true }),
         );
         return {
-          results: [],
-          fallbackEvidence: [],
+          results: [
+            {
+              path: "src/pending.ts",
+              score: 999,
+              kind: "lexical" as const,
+              matchedSymbols: [],
+              matchReasons: ["must be discarded after retirement"],
+              symbols: [],
+              dependencies: [],
+            },
+          ],
+          fallbackEvidence: [{ kind: "source" as const, path: "src/pending.ts", excerpt: "retiredPendingNeedle" }],
           durationMs: 1,
-          filesScanned: 0,
-          bytesScanned: 0,
+          filesScanned: 1,
+          bytesScanned: 32,
           enumeratedPaths: 1,
           enumerationBytes: 15,
-          matchesReturned: 0,
+          matchesReturned: 1,
           capped: false,
           timedOut: false,
-          cancelled: true,
+          cancelled: false,
         };
       },
     });
@@ -315,7 +326,9 @@ describe("incremental repository map runtime", () => {
     const query = runtime.query("retiredPendingNeedle");
     await scanStarted.promise;
     const closing = runtime.close();
-    await query;
+    const retired = await query;
+    expect(retired.results).not.toContainEqual(expect.objectContaining({ path: "src/pending.ts" }));
+    expect(retired.fallbackEvidence).not.toContainEqual(expect.objectContaining({ excerpt: "retiredPendingNeedle" }));
     failures.recover(join(root, "src/pending.ts"));
     await closing;
 
@@ -324,6 +337,61 @@ describe("incremental repository map runtime", () => {
       pendingFallbackCancelledCount: 1,
       pendingFallbackUsedCount: 0,
     });
+  });
+
+  it("does not publish injected partial pending evidence after a timeout", async () => {
+    const { root, stateRoot } = await fixture({ "src/pending.ts": "export const oldTimeoutValue = true;" }, false);
+    const failures = controlledReadFailures();
+    const telemetry = new Telemetry();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      telemetry,
+      indexFileSystem: failures.fileSystem,
+      async pendingFallbackScanner() {
+        return {
+          results: [
+            {
+              path: "src/pending.ts",
+              score: 999,
+              kind: "lexical" as const,
+              matchedSymbols: [],
+              matchReasons: ["must be discarded after timeout"],
+              symbols: [],
+              dependencies: [],
+            },
+          ],
+          fallbackEvidence: [{ kind: "source" as const, path: "src/pending.ts", excerpt: "timedOutPendingNeedle" }],
+          durationMs: 750,
+          filesScanned: 1,
+          bytesScanned: 32,
+          enumeratedPaths: 1,
+          enumerationBytes: 15,
+          matchesReturned: 1,
+          capped: false,
+          timedOut: true,
+          cancelled: false,
+        };
+      },
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/pending.ts"), "export const timedOutPendingNeedle = true;");
+    failures.fail(join(root, "src/pending.ts"));
+    runtime.notify("change", "src/pending.ts");
+
+    const timedOut = await runtime.query("timedOutPendingNeedle");
+    expect(timedOut.results).not.toContainEqual(expect.objectContaining({ path: "src/pending.ts" }));
+    expect(timedOut.fallbackEvidence).not.toContainEqual(expect.objectContaining({ excerpt: "timedOutPendingNeedle" }));
+    expect(telemetry.snapshot()).toMatchObject({
+      pendingFallbackAttemptCount: 1,
+      pendingFallbackTimeoutCount: 1,
+      pendingFallbackUsedCount: 0,
+      pendingFallbackNoMatchCount: 0,
+      pendingFallbackMatchesReturned: 0,
+    });
+    failures.recover(join(root, "src/pending.ts"));
+    await runtime.close();
   });
 
   it("keeps queryCurrent fallback evidence coherent while a flush interleaves", async () => {

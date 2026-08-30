@@ -51,6 +51,8 @@ export interface LexicalFallbackOptions {
   gitignorePatterns?: readonly string[];
   /** Test-only race hook invoked after identity capture and before open. */
   beforeOpen?: (path: string) => Promise<void>;
+  /** Test-only race hook invoked after handle identity validation and before read. */
+  beforeRead?: (path: string) => Promise<void>;
 }
 
 export interface LexicalFallbackScanResult {
@@ -82,6 +84,43 @@ interface CandidateMatch {
   coverage: number;
   evidenceKind: "source" | "warming";
   excerpt: string;
+}
+
+const ABORTED = Symbol("lexical-fallback-aborted");
+
+/** Race an async operation against cancellation while always observing its settlement. */
+function abortRace<T>(operation: Promise<T>, signal: AbortSignal): Promise<T | typeof ABORTED> {
+  if (signal.aborted) {
+    void operation.catch(() => undefined);
+    return Promise.resolve(ABORTED);
+  }
+  return new Promise((resolveResult, rejectResult) => {
+    const onAbort = () => {
+      cleanup();
+      resolveResult(ABORTED);
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        cleanup();
+        resolveResult(value);
+      },
+      (error) => {
+        cleanup();
+        rejectResult(error);
+      },
+    );
+  });
+}
+
+function closeAfter<T>(operation: Promise<T>, handle: Awaited<ReturnType<typeof open>>): void {
+  void operation
+    .then(
+      () => handle.close(),
+      () => handle.close(),
+    )
+    .catch(() => undefined);
 }
 
 function slash(path: string): string {
@@ -394,21 +433,39 @@ async function readCandidate(
   maxFileBytes: number,
   signal: AbortSignal,
   beforeOpen?: (path: string) => Promise<void>,
+  beforeRead?: (path: string) => Promise<void>,
 ): Promise<{ text?: string; bytes: number; capped: boolean }> {
   if (budget <= 0 || signal.aborted) return { bytes: 0, capped: budget <= 0 };
   const absolute = resolve(projectRoot, path);
   const relativePath = relative(projectRoot, absolute);
   if (!safeRelativePath(slash(relativePath))) return { bytes: 0, capped: false };
   try {
-    const info = await lstat(absolute, { bigint: true });
-    if (!info.isFile() || signal.aborted) return { bytes: 0, capped: false };
-    const canonical = await realpath(absolute);
-    if (canonical !== absolute || !safeRelativePath(slash(relative(projectRoot, canonical))))
+    const info = await abortRace(lstat(absolute, { bigint: true }), signal);
+    if (info === ABORTED || !info.isFile()) return { bytes: 0, capped: false };
+    const canonical = await abortRace(realpath(absolute), signal);
+    if (canonical === ABORTED || canonical !== absolute || !safeRelativePath(slash(relative(projectRoot, canonical)))) {
       return { bytes: 0, capped: false };
-    await beforeOpen?.(absolute);
-    const handle = await open(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    }
+    if (beforeOpen) {
+      const openedGate = await abortRace(beforeOpen(absolute), signal);
+      if (openedGate === ABORTED) return { bytes: 0, capped: false };
+    }
+    const openOperation = open(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await abortRace(openOperation, signal);
+    if (opened === ABORTED) {
+      void openOperation.then((handle) => handle.close()).catch(() => undefined);
+      return { bytes: 0, capped: false };
+    }
+    const handle = opened;
+    let deferredClose = false;
     try {
-      const current = await handle.stat({ bigint: true });
+      const statOperation = handle.stat({ bigint: true });
+      const current = await abortRace(statOperation, signal);
+      if (current === ABORTED) {
+        deferredClose = true;
+        closeAfter(statOperation, handle);
+        return { bytes: 0, capped: false };
+      }
       // Opening by pathname cannot make every parent traversal race-free on
       // every supported platform. Identity-check the opened handle before any
       // content is read so a swapped parent/final entry cannot expose a
@@ -416,14 +473,29 @@ async function readCandidate(
       if (!current.isFile() || current.dev !== info.dev || current.ino !== info.ino) {
         return { bytes: 0, capped: false };
       }
+      if (beforeRead) {
+        const readGate = await abortRace(beforeRead(absolute), signal);
+        if (readGate === ABORTED) return { bytes: 0, capped: false };
+      }
       const length = Math.min(budget, maxFileBytes);
       const content = Buffer.alloc(length);
-      const { bytesRead } = await handle.read(content, 0, length, 0);
-      const bounded = content.subarray(0, bytesRead);
-      if (bounded.subarray(0, Math.min(8_192, bounded.length)).includes(0)) return { bytes: bytesRead, capped: false };
-      return { text: bounded.toString("utf8"), bytes: bytesRead, capped: current.size > bytesRead };
+      const readOperation = handle.read(content, 0, length, 0);
+      const read = await abortRace(readOperation, signal);
+      if (read === ABORTED) {
+        deferredClose = true;
+        closeAfter(readOperation, handle);
+        return { bytes: 0, capped: false };
+      }
+      const bounded = content.subarray(0, read.bytesRead);
+      if (bounded.subarray(0, Math.min(8_192, bounded.length)).includes(0)) {
+        return { bytes: read.bytesRead, capped: false };
+      }
+      return { text: bounded.toString("utf8"), bytes: read.bytesRead, capped: current.size > read.bytesRead };
     } finally {
-      await handle.close();
+      if (!deferredClose) {
+        const closeOperation = handle.close();
+        if ((await abortRace(closeOperation, signal)) === ABORTED) void closeOperation.catch(() => undefined);
+      }
     }
   } catch {
     return { bytes: 0, capped: false };
@@ -457,7 +529,7 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
   let capped = false;
   const matches: CandidateMatch[] = [];
   try {
-    enumeration = await enumerate(
+    const enumerationOperation = enumerate(
       options.projectRoot,
       signal,
       limits,
@@ -467,6 +539,12 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
       options.gitWorkspace,
       options.gitignorePatterns,
     );
+    const completedEnumeration = await abortRace(enumerationOperation, signal);
+    if (completedEnumeration === ABORTED) {
+      void enumerationOperation.catch(() => undefined);
+    } else {
+      enumeration = completedEnumeration;
+    }
     capped = enumeration.capped;
     const terms = queryTerms(options.query);
     for (let offset = 0; offset < enumeration.paths.length && !signal.aborted; offset += limits.concurrency) {
@@ -483,7 +561,7 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
       const allocations = batch.map((_, index) =>
         Math.min(limits.maxFileBytes, Math.floor((remaining + index) / batch.length)),
       );
-      const rows = await Promise.all(
+      const batchOperation = Promise.all(
         batch.map((path, index) =>
           readCandidate(
             options.projectRoot,
@@ -492,9 +570,16 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
             limits.maxFileBytes,
             signal,
             options.beforeOpen,
+            options.beforeRead,
           ),
         ),
       );
+      const completedBatch = await abortRace(batchOperation, signal);
+      if (completedBatch === ABORTED) {
+        void batchOperation.catch(() => undefined);
+        break;
+      }
+      const rows = completedBatch;
       for (let index = 0; index < batch.length; index += 1) {
         const row = rows[index];
         const path = batch[index];
@@ -512,12 +597,17 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
     clearTimeout(timeout);
   }
   const requestedLimit = Math.min(Math.max(1, options.limit ?? 10), limits.maxResults);
-  const ranked = matches
-    .sort(
-      (left, right) =>
-        right.score - left.score || right.coverage - left.coverage || stablePathCompare(left.path, right.path),
-    )
-    .slice(0, requestedLimit);
+  // A timeout or caller cancellation never publishes partial evidence. Reads
+  // already in flight are observed and drained by abortRace/readCandidate.
+  const discardMatches = signal.aborted || timedOut;
+  const ranked = discardMatches
+    ? []
+    : matches
+        .sort(
+          (left, right) =>
+            right.score - left.score || right.coverage - left.coverage || stablePathCompare(left.path, right.path),
+        )
+        .slice(0, requestedLimit);
   const results: RepoMapQueryResult[] = ranked.map((match) => ({
     path: match.path,
     score: match.score,

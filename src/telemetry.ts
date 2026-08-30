@@ -181,7 +181,8 @@ export class RepoContextTelemetry {
     this.#values.pendingFallbackBytesScanned += finiteNonnegative(result.bytesScanned);
     this.#values.pendingFallbackMatchesReturned += finiteNonnegative(returnedMatches);
     if (used) this.#values.pendingFallbackUsedCount += 1;
-    else if (!result.cancelled && result.matchesReturned === 0) this.#values.pendingFallbackNoMatchCount += 1;
+    else if (!result.cancelled && !result.timedOut && result.matchesReturned === 0)
+      this.#values.pendingFallbackNoMatchCount += 1;
     if (result.capped) this.#values.pendingFallbackCappedCount += 1;
     if (result.timedOut) this.#values.pendingFallbackTimeoutCount += 1;
     if (result.cancelled) this.#values.pendingFallbackCancelledCount += 1;

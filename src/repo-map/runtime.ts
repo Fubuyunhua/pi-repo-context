@@ -155,6 +155,10 @@ export interface RepoMapRuntimeOptions {
   pendingFallbackScanner?: (options: LexicalFallbackOptions) => Promise<LexicalFallbackScanResult>;
   /** Test-only race hook invoked before a pending fallback candidate is opened. */
   beforePendingFallbackOpen?: (path: string) => Promise<void>;
+  /** Test-only race hook invoked before a pending fallback candidate is read. */
+  beforePendingFallbackRead?: (path: string) => Promise<void>;
+  /** Test-only monotonic clock for deterministic flush cutoffs. */
+  flushMonotonicNow?: () => number;
   now?: () => Date;
   /** Injectable monotonic clock used for deterministic telemetry tests. */
   monotonicNow?: () => number;
@@ -567,6 +571,8 @@ export class RepoMapRuntime {
   readonly #snapshotBuilder: typeof buildRepoMap;
   readonly #pendingFallbackScanner: (options: LexicalFallbackOptions) => Promise<LexicalFallbackScanResult>;
   readonly #beforePendingFallbackOpen?: (path: string) => Promise<void>;
+  readonly #beforePendingFallbackRead?: (path: string) => Promise<void>;
+  readonly #flushMonotonicNow: () => number;
   #projectRoot = "";
   #base?: RepoMapSnapshot;
   #effective?: RepoMapSnapshot;
@@ -626,6 +632,8 @@ export class RepoMapRuntime {
     this.#snapshotBuilder = options.snapshotBuilder ?? buildRepoMap;
     this.#pendingFallbackScanner = options.pendingFallbackScanner ?? scanLexicalFallback;
     this.#beforePendingFallbackOpen = options.beforePendingFallbackOpen;
+    this.#beforePendingFallbackRead = options.beforePendingFallbackRead;
+    this.#flushMonotonicNow = options.flushMonotonicNow ?? performance.now.bind(performance);
   }
 
   async start(): Promise<void> {
@@ -719,7 +727,7 @@ export class RepoMapRuntime {
       this.#scheduler.cancel(this.#scheduled);
       this.#scheduled = undefined;
     }
-    const startedAt = performance.now();
+    const startedAt = this.#flushMonotonicNow();
     for (let pass = 1; ; pass += 1) {
       const epoch = this.#mutationEpoch;
       await this.#drainWatcherUpdates();
@@ -745,7 +753,7 @@ export class RepoMapRuntime {
       // promise resolution. A notification observed during any awaited phase
       // changes the epoch and normally forces another complete pass.
       if (epoch === this.#mutationEpoch && this.#watcherUpdates.length === 0) return;
-      if (pass >= MAX_FLUSH_PASSES || performance.now() - startedAt >= MAX_FLUSH_DURATION_MS) {
+      if (pass >= MAX_FLUSH_PASSES || this.#flushMonotonicNow() - startedAt >= MAX_FLUSH_DURATION_MS) {
         this.#deferRemainingFlushWork();
         return;
       }
@@ -814,6 +822,7 @@ export class RepoMapRuntime {
         gitWorkspace: this.#gitWorkspace,
         gitignorePatterns: this.#nonGitIgnorePatterns,
         ...(this.#beforePendingFallbackOpen ? { beforeOpen: this.#beforePendingFallbackOpen } : {}),
+        ...(this.#beforePendingFallbackRead ? { beforeRead: this.#beforePendingFallbackRead } : {}),
       });
     } catch {
       result = {
@@ -831,6 +840,15 @@ export class RepoMapRuntime {
       };
     } finally {
       this.#pendingFallbackControllers.delete(controller);
+    }
+    if (controller.signal.aborted || result.cancelled || result.timedOut) {
+      return {
+        ...result,
+        results: [],
+        fallbackEvidence: [],
+        matchesReturned: 0,
+        cancelled: controller.signal.aborted || result.cancelled,
+      };
     }
     return result;
   }

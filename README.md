@@ -64,8 +64,9 @@ usable evidence. A stale result with indexed matches or `fallbackEvidence` remai
 can use the bounded degraded evidence; inspect its `freshness` and `error` fields before relying on it. A live stale query
 also scans only its still-pending watcher paths so an exact changed-file match can outrank stale indexed partials without
 clearing pending state. That scan is fixed at 128 candidate/files, 64 KiB of candidate paths, 4 MiB of source, 512 KiB per
-file, four concurrent reads, 20 results, 512-byte excerpts, and a 750 ms deadline; aggregate numeric telemetry reports its
-attempts, use/no-match, caps, timeout/cancellation, duration, files, bytes, and returned matches.
+file, four concurrent reads, 20 results, 512-byte excerpts, and a 750 ms logical deadline. Timeout or session/caller
+cancellation discards partial matches while safely draining already-started operations. Aggregate numeric telemetry
+reports attempts, use/no-match, caps, timeout/cancellation, duration, completed files/bytes, and returned matches.
 
 ## Commands
 
