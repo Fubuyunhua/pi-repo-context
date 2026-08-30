@@ -1,0 +1,69 @@
+{
+  "generatedAt": "2026-08-30T17:42:02.177Z",
+  "durationMs": 3896.84,
+  "workers": [
+    {
+      "code": 0,
+      "payload": {
+        "worker": 0,
+        "durationMs": 2163.39,
+        "top": "src/file-0999.ts",
+        "results": 10,
+        "freshness": "fresh",
+        "generation": 1
+      },
+      "stderr": ""
+    },
+    {
+      "code": 0,
+      "payload": {
+        "worker": 1,
+        "durationMs": 2265.46,
+        "top": "src/file-0999.ts",
+        "results": 10,
+        "freshness": "fresh",
+        "generation": 1
+      },
+      "stderr": ""
+    },
+    {
+      "code": 0,
+      "payload": {
+        "worker": 2,
+        "durationMs": 1917.23,
+        "top": "src/file-0999.ts",
+        "results": 10,
+        "freshness": "fresh",
+        "generation": 1
+      },
+      "stderr": ""
+    },
+    {
+      "code": 0,
+      "payload": {
+        "worker": 3,
+        "durationMs": 2003.18,
+        "top": "src/file-0999.ts",
+        "results": 10,
+        "freshness": "fresh",
+        "generation": 1
+      },
+      "stderr": ""
+    }
+  ],
+  "verify": {
+    "top": "src/file-0999.ts",
+    "results": 10,
+    "freshness": "fresh",
+    "generation": 1,
+    "status": {
+      "freshness": "fresh",
+      "generation": 1,
+      "gitHead": "43d8b57f6c749de05b9c29587661a6aecbf2687b",
+      "workspaceRevision": "52000432b61465439a147e62ad86b34b5f6039ce9a06ca8545b979e955c031e3",
+      "pendingFiles": [],
+      "dirtyFiles": []
+    }
+  },
+  "accepted": true
+}
