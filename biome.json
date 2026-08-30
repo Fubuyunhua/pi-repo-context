@@ -1,7 +1,14 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.5.8/schema.json",
   "files": {
-    "includes": ["**", "!node_modules", "!coverage", "!.pi", "!docs/diagnostics/*.json"]
+    "includes": [
+      "**",
+      "!node_modules",
+      "!coverage",
+      "!.pi",
+      "!docs/diagnostics/*.json",
+      "!docs/diagnostics/PLUGIN-DIAG-*-repro-*.ts"
+    ]
   },
   "formatter": {
     "enabled": true,
