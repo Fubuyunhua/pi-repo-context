@@ -39,7 +39,7 @@ entry before content is read. Binary, unreadable, disappearing, replaced, and no
 - at most `min(requested limit, 20)` results
 - 512 UTF-8 bytes per match-centered excerpt
 
-Deadlines are cooperative between asynchronous operations. File/path/byte/result limits are hard work limits. Evidence is
+The logical return deadline and cancellation are hard: filesystem operations and hooks are raced against retirement, and timed-out/cancelled scans publish no evidence. Node/OS operations that cannot be cancelled may continue after logical return; every settlement remains observed, closure of every owned open handle is initiated immediately, and late-opened handles initiate closure when they arrive. Logical return does not claim that OS work or closure has completed. File/path/byte/result limits are hard work limits. Evidence is
 not guaranteed when a repository has no literal match, a match lies beyond the envelope, or a path/evidence pair cannot fit
 the configured payload minimum. When enumeration reaches a cap, the admitted subset can depend on filesystem directory
 iteration order; ranking within the captured subset remains deterministic.

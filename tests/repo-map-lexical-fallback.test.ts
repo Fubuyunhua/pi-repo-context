@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rename, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, type open, type opendir, realpath, rename, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, it, vi } from "vitest";
 import {
   LEXICAL_FALLBACK_LIMITS,
+  type LexicalFallbackFileSystem,
   type LexicalFallbackOperationStage,
   scanLexicalFallback,
 } from "../src/repo-map/lexical-fallback.js";
@@ -212,12 +213,14 @@ it("fails closed on ambiguous Git candidate-admission errors", async () => {
   await writeFile(join(root, ".git", "config"), "this is not valid git config\n");
   await writeFile(join(root, "secret.ts"), "ambiguousGitSecret\n");
 
-  const result = await scanLexicalFallback({
+  const candidate = await scanLexicalFallback({
     projectRoot: root,
     query: "ambiguousGitSecret",
     candidatePaths: ["secret.ts"],
   });
-  expect(result).toMatchObject({ capped: true, results: [], fallbackEvidence: [] });
+  expect(candidate).toMatchObject({ capped: true, results: [], fallbackEvidence: [] });
+  const full = await scanLexicalFallback({ projectRoot: root, query: "ambiguousGitSecret" });
+  expect(full).toMatchObject({ capped: true, results: [], fallbackEvidence: [] });
 });
 
 it("uses only explicit candidates with hardened non-Git ignore and work bounds", async () => {
@@ -452,6 +455,211 @@ it("hard-bounds non-Git directory open, iteration, and close", async () => {
     controller.abort();
     await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
     gate.resolve();
+  }
+});
+
+it("hard-bounds actual lstat and realpath operations and observes late rejection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-actual-path-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await writeFile(join(root, "pending.ts"), "actualPathNeedle\n");
+  await execFileAsync("git", ["add", "pending.ts"], { cwd: root });
+
+  for (const stage of ["lstat", "realpath"] as const) {
+    const controller = new AbortController();
+    const entered = deferred();
+    const operation = deferred<never>();
+    const fileSystem: Partial<LexicalFallbackFileSystem> =
+      stage === "lstat"
+        ? {
+            lstat: ((path: string, options?: object) => {
+              if (path.endsWith("pending.ts")) {
+                entered.resolve();
+                return operation.promise;
+              }
+              return lstat(path, options as never);
+            }) as LexicalFallbackFileSystem["lstat"],
+          }
+        : {
+            realpath: ((path: string) => {
+              if (path.endsWith("pending.ts")) {
+                entered.resolve();
+                return operation.promise;
+              }
+              return realpath(path);
+            }) as LexicalFallbackFileSystem["realpath"],
+          };
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualPathNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      fileSystem,
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    operation.reject(new Error(`late actual ${stage} rejection`));
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+});
+
+it("initiates owned file closure immediately for stalled stat/read and closes late opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-actual-file-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  const target = join(root, "pending.ts");
+  await writeFile(target, "actualFileNeedle\n");
+  await execFileAsync("git", ["add", "pending.ts"], { cwd: root });
+  const info = await lstat(target, { bigint: true });
+
+  // A handle that arrives only after retirement is still closed.
+  {
+    const controller = new AbortController();
+    const entered = deferred();
+    const opening = deferred<Awaited<ReturnType<typeof open>>>();
+    const close = vi.fn(async () => undefined);
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualFileNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      fileSystem: {
+        open: (() => {
+          entered.resolve();
+          return opening.promise;
+        }) as LexicalFallbackFileSystem["open"],
+      },
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [] });
+    opening.resolve({ close } as unknown as Awaited<ReturnType<typeof open>>);
+    await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+  }
+
+  for (const stage of ["stat", "read"] as const) {
+    const controller = new AbortController();
+    const entered = deferred();
+    const stalled = deferred<never>();
+    const close = vi.fn(async () => undefined);
+    const handle = {
+      stat: vi.fn(async () => {
+        if (stage === "stat") {
+          entered.resolve();
+          return stalled.promise;
+        }
+        return info;
+      }),
+      read: vi.fn(async (buffer: Buffer) => {
+        if (stage === "read") {
+          entered.resolve();
+          return stalled.promise;
+        }
+        return { bytesRead: 0, buffer };
+      }),
+      close,
+    } as unknown as Awaited<ReturnType<typeof open>>;
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualFileNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      fileSystem: { open: (async () => handle) as LexicalFallbackFileSystem["open"] },
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    expect(close).toHaveBeenCalledOnce();
+    stalled.reject(new Error(`late actual ${stage} rejection`));
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  // A never-settling close is initiated once but cannot hold logical return.
+  {
+    const controller = new AbortController();
+    const closeEntered = deferred();
+    const close = vi.fn(() => {
+      closeEntered.resolve();
+      return new Promise<void>(() => undefined);
+    });
+    const content = Buffer.from("actualFileNeedle\n");
+    const handle = {
+      stat: vi.fn(async () => info),
+      read: vi.fn(async (buffer: Buffer) => {
+        content.copy(buffer);
+        return { bytesRead: content.byteLength, buffer };
+      }),
+      close,
+    } as unknown as Awaited<ReturnType<typeof open>>;
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualFileNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      fileSystem: { open: (async () => handle) as LexicalFallbackFileSystem["open"] },
+    });
+    await closeEntered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    expect(close).toHaveBeenCalledOnce();
+  }
+});
+
+it("initiates owned directory closure for stalled iteration and observes late operations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-actual-dir-"));
+  await writeFile(join(root, "pending.ts"), "actualDirectoryNeedle\n");
+
+  // A directory arriving after cancellation is closed.
+  {
+    const controller = new AbortController();
+    const entered = deferred();
+    const opening = deferred<Awaited<ReturnType<typeof opendir>>>();
+    const close = vi.fn(async () => undefined);
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualDirectoryNeedle",
+      signal: controller.signal,
+      fileSystem: {
+        opendir: (() => {
+          entered.resolve();
+          return opening.promise;
+        }) as LexicalFallbackFileSystem["opendir"],
+      },
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [] });
+    opening.resolve({ close } as unknown as Awaited<ReturnType<typeof opendir>>);
+    await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+  }
+
+  // A never-settling read triggers immediate owned closure; late rejection is observed.
+  {
+    const controller = new AbortController();
+    const readEntered = deferred();
+    const reading = deferred<never>();
+    const close = vi.fn(async () => undefined);
+    const directory = {
+      read: vi.fn(() => {
+        readEntered.resolve();
+        return reading.promise;
+      }),
+      close,
+    } as unknown as Awaited<ReturnType<typeof opendir>>;
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualDirectoryNeedle",
+      signal: controller.signal,
+      fileSystem: { opendir: (async () => directory) as LexicalFallbackFileSystem["opendir"] },
+    });
+    await readEntered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    expect(close).toHaveBeenCalledOnce();
+    reading.reject(new Error("late actual directory read rejection"));
+    await Promise.resolve();
+    await Promise.resolve();
   }
 });
 

@@ -49,6 +49,15 @@ export type LexicalFallbackOperationStage =
   | "read"
   | "close";
 
+export interface LexicalFallbackFileSystem {
+  lstat: typeof lstat;
+  realpath: typeof realpath;
+  open: typeof open;
+  opendir: typeof opendir;
+}
+
+const DEFAULT_FILE_SYSTEM: LexicalFallbackFileSystem = { lstat, realpath, open, opendir };
+
 export interface LexicalFallbackOptions {
   projectRoot: string;
   query: string;
@@ -67,6 +76,8 @@ export interface LexicalFallbackOptions {
   beforeRead?: (path: string) => Promise<void>;
   /** Test-only operation hook used to gate hard-bound cancellation stages. */
   operationHook?: (stage: LexicalFallbackOperationStage, path: string) => Promise<void>;
+  /** Test-only injectable filesystem operations for actual-operation races. */
+  fileSystem?: Partial<LexicalFallbackFileSystem>;
 }
 
 export interface LexicalFallbackScanResult {
@@ -173,6 +184,17 @@ async function operationGate(
 }
 
 /** Start the real operation before a test gate, then hard-race its result. */
+function ownedClose(start: () => Promise<void>): () => Promise<void> {
+  let closePromise: Promise<void> | undefined;
+  return () => {
+    if (!closePromise) {
+      closePromise = Promise.resolve().then(start);
+      void closePromise.catch(() => undefined);
+    }
+    return closePromise;
+  };
+}
+
 async function stagedOperation<T>(
   hook: OperationHook,
   stage: LexicalFallbackOperationStage,
@@ -405,25 +427,37 @@ function spawnGitEnumeration(
   signal: AbortSignal,
   limits: Readonly<LexicalFallbackLimits>,
   excluded: (path: string) => boolean,
-): Promise<EnumerationResult> {
+): Promise<EnumerationResult | undefined> {
   return new Promise((resolveEnumeration) => {
     const paths: string[] = [];
     let observedPaths = 0;
     let bytes = 0;
     let buffered = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
     let capped = false;
     let finished = false;
-    const child = spawn("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
-      cwd: projectRoot,
-      stdio: ["ignore", "pipe", "ignore"],
-      signal,
-    });
-    const finish = (git: boolean, cancelled = false) => {
+    const child = spawn(
+      "git",
+      ["-c", "core.quotepath=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+      {
+        cwd: projectRoot,
+        env: { ...process.env, LC_ALL: "C" },
+        stdio: ["ignore", "pipe", "pipe"],
+        signal,
+      },
+    );
+    const finish = (result: EnumerationResult | undefined) => {
       if (finished) return;
       finished = true;
-      resolveEnumeration({ paths, observedPaths, bytes, capped, cancelled, git });
+      resolveEnumeration(result);
     };
-    child.on("error", (error) => finish(false, signal.aborted || error.name === "AbortError"));
+    child.on("error", (error) => {
+      if (signal.aborted || error.name === "AbortError") {
+        finish({ paths: [], observedPaths, bytes, capped: false, cancelled: true, git: true });
+      } else {
+        finish({ paths: [], observedPaths, bytes, capped: true, cancelled: false, git: true });
+      }
+    });
     child.stdout.on("data", (chunk: Buffer) => {
       if (finished) return;
       buffered = Buffer.concat([buffered, chunk]);
@@ -449,7 +483,22 @@ function spawnGitEnumeration(
         separator = buffered.indexOf(0);
       }
     });
-    child.on("close", (code) => finish(code === 0 || capped, signal.aborted));
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.byteLength < 4_096) stderr = Buffer.concat([stderr, chunk]).subarray(0, 4_096);
+    });
+    child.on("close", (code) => {
+      if (signal.aborted) {
+        finish({ paths: [], observedPaths, bytes, capped: false, cancelled: true, git: true });
+      } else if (code === 0 || capped) {
+        finish({ paths, observedPaths, bytes, capped, cancelled: false, git: true });
+      } else if (stderr.toString("utf8").includes("not a git repository")) {
+        // LC_ALL=C makes this the only explicit permission to use the hardened
+        // non-Git filesystem walk. Every other Git failure remains fail closed.
+        finish(undefined);
+      } else {
+        finish({ paths: [], observedPaths, bytes, capped: true, cancelled: false, git: true });
+      }
+    });
   });
 }
 
@@ -458,14 +507,17 @@ async function fallbackEnumeration(
   signal: AbortSignal,
   limits: Readonly<LexicalFallbackLimits>,
   excluded: (path: string) => boolean,
-  beforeOpen?: (path: string) => Promise<void>,
-  beforeRead?: (path: string) => Promise<void>,
-  operationHook?: OperationHook,
+  beforeOpen: ((path: string) => Promise<void>) | undefined,
+  beforeRead: ((path: string) => Promise<void>) | undefined,
+  operationHook: OperationHook,
+  fileSystem: LexicalFallbackFileSystem,
 ): Promise<EnumerationResult> {
   let ignorePatterns: string[] = [];
   const ignorePath = join(projectRoot, ".gitignore");
   try {
-    const ignoreInfo = await stagedOperation(operationHook, "lstat", ignorePath, signal, () => lstat(ignorePath));
+    const ignoreInfo = await stagedOperation(operationHook, "lstat", ignorePath, signal, () =>
+      fileSystem.lstat(ignorePath),
+    );
     if (ignoreInfo === ABORTED) {
       return { paths: [], observedPaths: 0, bytes: 0, capped: false, cancelled: true, git: false };
     }
@@ -481,6 +533,7 @@ async function fallbackEnumeration(
       beforeOpen,
       beforeRead,
       operationHook,
+      fileSystem,
     );
     if (ignore.text === undefined || ignore.capped) {
       return { paths: [], observedPaths: 0, bytes: 0, capped: true, cancelled: signal.aborted, git: false };
@@ -505,29 +558,25 @@ async function fallbackEnumeration(
     if (!directory) break;
     const childDirectories: string[] = [];
     let entries: Awaited<ReturnType<typeof opendir>> | undefined;
-    let deferredClose = false;
+    let initiateDirectoryClose: (() => Promise<void>) | undefined;
     try {
       const opened = await stagedOperation(
         operationHook,
         "directory-open",
         directory,
         signal,
-        () => opendir(directory),
+        () => fileSystem.opendir(directory),
         (lateEntries) => lateEntries.close(),
       );
       if (opened === ABORTED) break;
       entries = opened;
+      initiateDirectoryClose = ownedClose(() => opened.close());
       while (!signal.aborted) {
-        const entry = await stagedOperation(
-          operationHook,
-          "directory-read",
-          directory,
-          signal,
-          () => (entries as Awaited<ReturnType<typeof opendir>>).read(),
-          () => (entries as Awaited<ReturnType<typeof opendir>>).close(),
+        const entry = await stagedOperation(operationHook, "directory-read", directory, signal, () =>
+          (entries as Awaited<ReturnType<typeof opendir>>).read(),
         );
         if (entry === ABORTED) {
-          deferredClose = true;
+          initiateDirectoryClose();
           break;
         }
         if (entry === null) break;
@@ -547,13 +596,13 @@ async function fallbackEnumeration(
     } catch {
       // An unreadable directory is skipped. Cancellation is represented below.
     } finally {
-      if (entries && !deferredClose) {
+      if (entries && initiateDirectoryClose) {
         await stagedOperation(
           operationHook,
           "directory-close",
           directory,
           signal,
-          () => (entries as Awaited<ReturnType<typeof opendir>>).close(),
+          initiateDirectoryClose,
           undefined,
           true,
         );
@@ -572,9 +621,10 @@ async function candidateEnumeration(
   limits: Readonly<LexicalFallbackLimits>,
   candidatePaths: readonly string[],
   excluded: (path: string) => boolean,
-  beforeOpen?: (path: string) => Promise<void>,
-  beforeRead?: (path: string) => Promise<void>,
-  operationHook?: OperationHook,
+  beforeOpen: ((path: string) => Promise<void>) | undefined,
+  beforeRead: ((path: string) => Promise<void>) | undefined,
+  operationHook: OperationHook,
+  fileSystem: LexicalFallbackFileSystem,
 ): Promise<EnumerationResult> {
   const normalized: string[] = [];
   const conclusiveExcludedPaths: string[] = [];
@@ -641,7 +691,9 @@ async function candidateEnumeration(
   let ignorePatterns: string[] = [];
   const ignorePath = join(projectRoot, ".gitignore");
   try {
-    const ignoreInfo = await stagedOperation(operationHook, "lstat", ignorePath, signal, () => lstat(ignorePath));
+    const ignoreInfo = await stagedOperation(operationHook, "lstat", ignorePath, signal, () =>
+      fileSystem.lstat(ignorePath),
+    );
     if (ignoreInfo === ABORTED) {
       return { paths: [], observedPaths, bytes, capped: false, cancelled: true, git: false };
     }
@@ -657,6 +709,7 @@ async function candidateEnumeration(
       beforeOpen,
       beforeRead,
       operationHook,
+      fileSystem,
     );
     if (ignore.text === undefined || ignore.capped) {
       return { paths: [], observedPaths, bytes, capped: true, cancelled: signal.aborted, git: false };
@@ -689,9 +742,10 @@ async function enumerate(
   signal: AbortSignal,
   limits: Readonly<LexicalFallbackLimits>,
   exclude: string[],
-  beforeOpen?: (path: string) => Promise<void>,
-  beforeRead?: (path: string) => Promise<void>,
-  operationHook?: OperationHook,
+  beforeOpen: ((path: string) => Promise<void>) | undefined,
+  beforeRead: ((path: string) => Promise<void>) | undefined,
+  operationHook: OperationHook,
+  fileSystem: LexicalFallbackFileSystem,
   candidatePaths?: readonly string[],
 ): Promise<EnumerationResult> {
   if (exclude.length > limits.maxExcludePatterns) {
@@ -715,10 +769,11 @@ async function enumerate(
       beforeOpen,
       beforeRead,
       operationHook,
+      fileSystem,
     );
   }
   const git = await spawnGitEnumeration(projectRoot, signal, limits, excluded);
-  if (git.git || git.cancelled) return { ...git, paths: [...new Set(git.paths)].sort(stablePathCompare) };
+  if (git) return { ...git, paths: [...new Set(git.paths)].sort(stablePathCompare) };
   const fallback = await fallbackEnumeration(
     projectRoot,
     signal,
@@ -727,6 +782,7 @@ async function enumerate(
     beforeOpen,
     beforeRead,
     operationHook,
+    fileSystem,
   );
   return { ...fallback, paths: [...new Set(fallback.paths)].sort(stablePathCompare) };
 }
@@ -737,9 +793,10 @@ async function readCandidate(
   budget: number,
   maxFileBytes: number,
   signal: AbortSignal,
-  beforeOpen?: (path: string) => Promise<void>,
-  beforeRead?: (path: string) => Promise<void>,
-  operationHook?: OperationHook,
+  beforeOpen: ((path: string) => Promise<void>) | undefined,
+  beforeRead: ((path: string) => Promise<void>) | undefined,
+  operationHook: OperationHook,
+  fileSystem: LexicalFallbackFileSystem,
 ): Promise<CandidateRead> {
   if (budget <= 0 || signal.aborted) return { bytes: 0, capped: budget <= 0, outcome: "unresolved" };
   const absolute = resolve(projectRoot, path);
@@ -747,11 +804,13 @@ async function readCandidate(
   if (!safeRelativePath(slash(relativePath))) return { bytes: 0, capped: false, outcome: "conclusive" };
   try {
     const info = await stagedOperation(operationHook, "lstat", absolute, signal, () =>
-      lstat(absolute, { bigint: true }),
+      fileSystem.lstat(absolute, { bigint: true }),
     );
     if (info === ABORTED) return { bytes: 0, capped: false, outcome: "unresolved" };
     if (!info.isFile()) return { bytes: 0, capped: false, outcome: "conclusive" };
-    const canonical = await stagedOperation(operationHook, "realpath", absolute, signal, () => realpath(absolute));
+    const canonical = await stagedOperation(operationHook, "realpath", absolute, signal, () =>
+      fileSystem.realpath(absolute),
+    );
     if (canonical === ABORTED || canonical !== absolute || !safeRelativePath(slash(relative(projectRoot, canonical)))) {
       return { bytes: 0, capped: false, outcome: "unresolved" };
     }
@@ -768,23 +827,18 @@ async function readCandidate(
       "open",
       absolute,
       signal,
-      () => open(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)),
+      () => fileSystem.open(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)),
       (lateHandle) => lateHandle.close(),
     );
     if (opened === ABORTED) return { bytes: 0, capped: false, outcome: "unresolved" };
     const handle = opened;
-    let deferredClose = false;
+    const initiateClose = ownedClose(() => handle.close());
     try {
-      const current = await stagedOperation(
-        operationHook,
-        "stat",
-        absolute,
-        signal,
-        () => handle.stat({ bigint: true }),
-        () => handle.close(),
+      const current = await stagedOperation(operationHook, "stat", absolute, signal, () =>
+        handle.stat({ bigint: true }),
       );
       if (current === ABORTED) {
-        deferredClose = true;
+        initiateClose();
         return { bytes: 0, capped: false, outcome: "unresolved" };
       }
       // Opening by pathname cannot make every parent traversal race-free on
@@ -804,16 +858,11 @@ async function readCandidate(
       }
       const length = Math.min(budget, maxFileBytes);
       const content = Buffer.alloc(length);
-      const read = await stagedOperation(
-        operationHook,
-        "read",
-        absolute,
-        signal,
-        () => handle.read(content, 0, length, 0),
-        () => handle.close(),
+      const read = await stagedOperation(operationHook, "read", absolute, signal, () =>
+        handle.read(content, 0, length, 0),
       );
       if (read === ABORTED) {
-        deferredClose = true;
+        initiateClose();
         return { bytes: 0, capped: false, outcome: "unresolved" };
       }
       const bounded = content.subarray(0, read.bytesRead);
@@ -827,9 +876,9 @@ async function readCandidate(
         outcome: "text",
       };
     } finally {
-      if (!deferredClose) {
-        await stagedOperation(operationHook, "close", absolute, signal, () => handle.close(), undefined, true);
-      }
+      // Always initiate owned-handle closure exactly once. Cancellation never
+      // waits for OS completion, but both operation and close settlements stay observed.
+      await stagedOperation(operationHook, "close", absolute, signal, initiateClose, undefined, true);
     }
   } catch (error) {
     return {
@@ -844,6 +893,7 @@ async function readCandidate(
 export async function scanLexicalFallback(options: LexicalFallbackOptions): Promise<LexicalFallbackScanResult> {
   const started = Date.now();
   const limits = { ...LEXICAL_FALLBACK_LIMITS, ...options.limits };
+  const fileSystem: LexicalFallbackFileSystem = { ...DEFAULT_FILE_SYSTEM, ...options.fileSystem };
   const timeoutController = new AbortController();
   let timedOut = false;
   const timeout = setTimeout(() => {
@@ -878,6 +928,7 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
       options.beforeOpen,
       options.beforeRead,
       options.operationHook,
+      fileSystem,
       options.candidatePaths,
     );
     const completedEnumeration = await abortRace(enumerationOperation, signal);
@@ -911,6 +962,7 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
             options.beforeOpen,
             options.beforeRead,
             options.operationHook,
+            fileSystem,
           ),
         ),
       );
