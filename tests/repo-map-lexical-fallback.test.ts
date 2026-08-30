@@ -165,6 +165,94 @@ it("uses authoritative Git admission, including tracked files later ignored", as
   ).toMatchObject({ results: [] });
 });
 
+it("scans only bounded pending candidates with Git and non-Git admission parity", async () => {
+  const gitRoot = await mkdtemp(join(tmpdir(), "repo-context-lexical-candidates-git-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: gitRoot });
+  await writeFile(join(gitRoot, "tracked.log"), "pendingTrackedNeedle\n");
+  await execFileAsync("git", ["add", "tracked.log"], { cwd: gitRoot });
+  await writeFile(join(gitRoot, ".gitignore"), "*.log\nignored.ts\n");
+  await writeFile(join(gitRoot, "ignored.ts"), "pendingIgnoredNeedle\n");
+  await writeFile(join(gitRoot, "unlisted.ts"), "pendingTrackedNeedle\n");
+  const gitResult = await scanLexicalFallback({
+    projectRoot: gitRoot,
+    query: "pendingTrackedNeedle",
+    candidatePaths: ["ignored.ts", "tracked.log"],
+    gitWorkspace: true,
+  });
+  expect(gitResult.results.map((result) => result.path)).toEqual(["tracked.log"]);
+  expect(gitResult.enumeratedPaths).toBe(2);
+  await expect(
+    scanLexicalFallback({
+      projectRoot: gitRoot,
+      query: "pendingTrackedNeedle",
+      candidatePaths: ["tracked.log"],
+      gitWorkspace: true,
+      exclude: ["tracked.log"],
+    }),
+  ).resolves.toMatchObject({ results: [], fallbackEvidence: [] });
+
+  const plainRoot = await mkdtemp(join(tmpdir(), "repo-context-lexical-candidates-plain-"));
+  await writeFile(join(plainRoot, "kept.ts"), "pendingPlainNeedle\n");
+  await writeFile(join(plainRoot, "ignored.ts"), "pendingIgnoredNeedle\n");
+  await writeFile(join(plainRoot, "unlisted.ts"), "pendingPlainNeedle\n");
+  const plainResult = await scanLexicalFallback({
+    projectRoot: plainRoot,
+    query: "pendingPlainNeedle",
+    candidatePaths: ["ignored.ts", "kept.ts"],
+    gitWorkspace: false,
+    gitignorePatterns: ["ignored.ts"],
+  });
+  expect(plainResult.results.map((result) => result.path)).toEqual(["kept.ts"]);
+  expect(plainResult.filesScanned).toBe(1);
+});
+
+it("honors pending-candidate caps, cancellation, exclusion, deletion, binary, and symlink safety", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-candidate-safety-"));
+  const outside = await mkdtemp(join(tmpdir(), "repo-context-lexical-candidate-outside-"));
+  await writeFile(join(root, "kept.ts"), "candidateSafetyNeedle\n");
+  await writeFile(join(root, "excluded.ts"), "candidateSafetyNeedle\n");
+  await writeFile(join(root, "unreadable.ts"), "candidateSafetyNeedle\n");
+  await writeFile(join(root, "binary.ts"), Buffer.from("candidateSafetyNeedle\0tail"));
+  await writeFile(join(outside, "outside.ts"), "candidateSafetyNeedle\n");
+  await symlink(join(outside, "outside.ts"), join(root, "escape.ts"));
+
+  const capped = await scanLexicalFallback({
+    projectRoot: root,
+    query: "candidateSafetyNeedle",
+    candidatePaths: ["binary.ts", "deleted.ts", "escape.ts", "excluded.ts", "kept.ts"],
+    gitWorkspace: false,
+    exclude: ["excluded.ts"],
+    limits: { maxEnumeratedPaths: 4, maxFiles: 4, concurrency: 1 },
+  });
+  expect(capped.capped).toBe(true);
+  expect(capped.results).toEqual([]);
+  expect(capped.enumeratedPaths).toBe(4);
+  expect(capped.filesScanned).toBeLessThanOrEqual(4);
+
+  const isolated = await scanLexicalFallback({
+    projectRoot: root,
+    query: "candidateSafetyNeedle",
+    candidatePaths: ["deleted.ts", "kept.ts", "unreadable.ts"],
+    gitWorkspace: false,
+    async beforeOpen(path) {
+      if (path.endsWith("unreadable.ts")) throw Object.assign(new Error("simulated unreadable"), { code: "EACCES" });
+    },
+  });
+  expect(isolated.results.map((result) => result.path)).toEqual(["kept.ts"]);
+
+  const controller = new AbortController();
+  controller.abort();
+  await expect(
+    scanLexicalFallback({
+      projectRoot: root,
+      query: "candidateSafetyNeedle",
+      candidatePaths: ["kept.ts"],
+      gitWorkspace: false,
+      signal: controller.signal,
+    }),
+  ).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+});
+
 it("honors non-Git root ignore negation and skips symlinks and binary files", async () => {
   const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-walk-"));
   const outside = await mkdtemp(join(tmpdir(), "repo-context-lexical-outside-"));

@@ -33,6 +33,12 @@ import {
   repoMapBuildCompatibilityKey,
 } from "./index.js";
 import {
+  type LexicalFallbackLimits,
+  type LexicalFallbackOptions,
+  type LexicalFallbackScanResult,
+  scanLexicalFallback,
+} from "./lexical-fallback.js";
+import {
   RepositoryCheckpointStore,
   type RepositorySnapshotHandle,
   RepositorySnapshotUnavailableError,
@@ -47,6 +53,22 @@ const MAX_FLUSH_PASSES = 8;
 const MAX_WATCHER_UPDATES_PER_PASS = 64;
 const MAX_FLUSH_DURATION_MS = 1_000;
 const CHECKPOINT_PUBLICATION_ERROR = "repository snapshot checkpoint publication failed";
+
+/** Fixed work envelope for stale live queries over watcher paths not yet reconciled. */
+export const PENDING_FALLBACK_LIMITS: Readonly<LexicalFallbackLimits> = Object.freeze({
+  deadlineMs: 750,
+  maxEnumeratedPaths: 128,
+  maxEnumerationBytes: 64 * 1024,
+  maxIgnoreBytes: 256 * 1024,
+  maxExcludePatterns: 256,
+  maxExcludeBytes: 64 * 1024,
+  maxFiles: 128,
+  maxSourceBytes: 4 * 1024 * 1024,
+  maxFileBytes: 512 * 1024,
+  concurrency: 4,
+  maxResults: 20,
+  maxExcerptBytes: 512,
+});
 
 export type RepoMapFreshness = "fresh" | "dirty" | "stale" | "unsupported";
 export type RepoMapChangeEvent = "add" | "change" | "unlink";
@@ -129,6 +151,10 @@ export interface RepoMapRuntimeOptions {
   searchFactory?: (snapshot: RepoMapSnapshot) => RepoMapSearch;
   /** Injectable full-snapshot builder used by deterministic checkpoint failure tests. */
   snapshotBuilder?: typeof buildRepoMap;
+  /** Injectable bounded pending-path scanner used by deterministic stale-query tests. */
+  pendingFallbackScanner?: (options: LexicalFallbackOptions) => Promise<LexicalFallbackScanResult>;
+  /** Test-only race hook invoked before a pending fallback candidate is opened. */
+  beforePendingFallbackOpen?: (path: string) => Promise<void>;
   now?: () => Date;
   /** Injectable monotonic clock used for deterministic telemetry tests. */
   monotonicNow?: () => number;
@@ -539,6 +565,8 @@ export class RepoMapRuntime {
   readonly #gitRunner: RepoMapGitRunner;
   readonly #searchFactory: (snapshot: RepoMapSnapshot) => RepoMapSearch;
   readonly #snapshotBuilder: typeof buildRepoMap;
+  readonly #pendingFallbackScanner: (options: LexicalFallbackOptions) => Promise<LexicalFallbackScanResult>;
+  readonly #beforePendingFallbackOpen?: (path: string) => Promise<void>;
   #projectRoot = "";
   #base?: RepoMapSnapshot;
   #effective?: RepoMapSnapshot;
@@ -566,6 +594,7 @@ export class RepoMapRuntime {
   #baseBuildFailed = false;
   #checkpointPublicationFailed = false;
   #stateBoundary?: RepoStateBoundary;
+  readonly #pendingFallbackControllers = new Set<AbortController>();
   readonly #checkpoints = new RepositoryCheckpointStore();
 
   constructor(options: RepoMapRuntimeOptions) {
@@ -595,6 +624,8 @@ export class RepoMapRuntime {
     this.#gitRunner = options.gitRunner ?? defaultGitRunner;
     this.#searchFactory = options.searchFactory ?? ((snapshot) => new RepoMapSearch(snapshot));
     this.#snapshotBuilder = options.snapshotBuilder ?? buildRepoMap;
+    this.#pendingFallbackScanner = options.pendingFallbackScanner ?? scanLexicalFallback;
+    this.#beforePendingFallbackOpen = options.beforePendingFallbackOpen;
   }
 
   async start(): Promise<void> {
@@ -762,6 +793,49 @@ export class RepoMapRuntime {
     await operation;
   }
 
+  async #scanPendingFallback(
+    query: string,
+    options: RepoMapQueryOptions,
+    pendingFiles: readonly string[],
+  ): Promise<LexicalFallbackScanResult> {
+    const controller = new AbortController();
+    this.#pendingFallbackControllers.add(controller);
+    recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordPendingFallbackAttempt());
+    let result: LexicalFallbackScanResult;
+    try {
+      result = await this.#pendingFallbackScanner({
+        projectRoot: this.#projectRoot,
+        query,
+        ...(options.limit === undefined ? {} : { limit: options.limit }),
+        exclude: this.#options.exclude ?? [],
+        signal: controller.signal,
+        limits: PENDING_FALLBACK_LIMITS,
+        candidatePaths: pendingFiles,
+        gitWorkspace: this.#gitWorkspace,
+        gitignorePatterns: this.#nonGitIgnorePatterns,
+        ...(this.#beforePendingFallbackOpen ? { beforeOpen: this.#beforePendingFallbackOpen } : {}),
+      });
+    } catch {
+      result = {
+        results: [],
+        fallbackEvidence: [],
+        durationMs: 0,
+        filesScanned: 0,
+        bytesScanned: 0,
+        enumeratedPaths: 0,
+        enumerationBytes: 0,
+        matchesReturned: 0,
+        capped: false,
+        timedOut: false,
+        cancelled: controller.signal.aborted,
+      };
+    } finally {
+      this.#pendingFallbackControllers.delete(controller);
+    }
+    recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordPendingFallback(result, result.results.length > 0));
+    return result;
+  }
+
   /** Live query path used by the explicit tool: reconcile Git and watcher work first. */
   async query(query: string, options: RepoMapQueryOptions = {}): Promise<RepoMapRuntimeQuery> {
     const startedAt = monotonicReading(this.#monotonicNow);
@@ -819,6 +893,20 @@ export class RepoMapRuntime {
       }
       results = this.#search.query(query, options);
     }
+    if (freshness === "stale" && liveFallback && pendingFiles.length > 0) {
+      const pending = await this.#scanPendingFallback(query, options, pendingFiles);
+      const byPath = new Map<string, RepoMapQueryResult>();
+      for (const result of [...pending.results, ...results]) {
+        if (!byPath.has(result.path)) byPath.set(result.path, result);
+      }
+      const limit = options.limit ?? 10;
+      results = [...byPath.values()]
+        .sort(
+          (left, right) => right.score - left.score || (left.path === right.path ? 0 : left.path < right.path ? -1 : 1),
+        )
+        .slice(0, limit);
+      fallbackEvidence.push(...pending.fallbackEvidence.slice(0, 3));
+    }
     if (freshness === "stale") {
       const terms = query.toLowerCase().match(/[\p{L}\p{N}_$-]{2,}/gu) ?? [];
       for (const file of files) {
@@ -834,8 +922,10 @@ export class RepoMapRuntime {
               // Indexed terms remain useful when a live source read fails.
             }
           }
-          fallbackEvidence.push({ kind: "source", path: file.path, excerpt });
-          if (fallbackEvidence.length >= 3) break;
+          if (!fallbackEvidence.some((evidence) => evidence.path === file.path)) {
+            fallbackEvidence.push({ kind: "source", path: file.path, excerpt });
+          }
+          if (fallbackEvidence.filter((evidence) => evidence.kind === "source").length >= 3) break;
         }
       }
       if (liveFallback) {
@@ -921,6 +1011,7 @@ export class RepoMapRuntime {
 
   async close(): Promise<void> {
     this.#started = false;
+    for (const controller of this.#pendingFallbackControllers) controller.abort();
     if (this.#scheduled !== undefined) this.#scheduler.cancel(this.#scheduled);
     this.#scheduled = undefined;
     await this.#watcher?.close();

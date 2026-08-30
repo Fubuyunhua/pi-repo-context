@@ -43,6 +43,12 @@ export interface LexicalFallbackOptions {
   exclude?: string[];
   signal?: AbortSignal;
   limits?: Partial<LexicalFallbackLimits>;
+  /** Optional bounded path set used by the stale-index pending-file fallback. */
+  candidatePaths?: readonly string[];
+  /** Known repository mode for candidatePaths; omitted for full cold enumeration. */
+  gitWorkspace?: boolean;
+  /** Root ignore patterns already loaded by the non-Git runtime. */
+  gitignorePatterns?: readonly string[];
   /** Test-only race hook invoked after identity capture and before open. */
   beforeOpen?: (path: string) => Promise<void>;
 }
@@ -182,6 +188,7 @@ function spawnGitEnumeration(
   signal: AbortSignal,
   limits: Readonly<LexicalFallbackLimits>,
   excluded: (path: string) => boolean,
+  candidatePaths?: readonly string[],
 ): Promise<EnumerationResult> {
   return new Promise((resolveEnumeration) => {
     const paths: string[] = [];
@@ -190,11 +197,23 @@ function spawnGitEnumeration(
     let buffered = Buffer.alloc(0);
     let capped = false;
     let finished = false;
-    const child = spawn("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
-      cwd: projectRoot,
-      stdio: ["ignore", "pipe", "ignore"],
-      signal,
-    });
+    const child = spawn(
+      "git",
+      [
+        "--literal-pathspecs",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        ...(candidatePaths ? ["--", ...candidatePaths] : []),
+      ],
+      {
+        cwd: projectRoot,
+        stdio: ["ignore", "pipe", "ignore"],
+        signal,
+      },
+    );
     const finish = (git: boolean, cancelled = false) => {
       if (finished) return;
       finished = true;
@@ -307,6 +326,9 @@ async function enumerate(
   limits: Readonly<LexicalFallbackLimits>,
   exclude: string[],
   beforeOpen?: (path: string) => Promise<void>,
+  candidatePaths?: readonly string[],
+  gitWorkspace?: boolean,
+  gitignorePatterns?: readonly string[],
 ): Promise<EnumerationResult> {
   if (exclude.length > limits.maxExcludePatterns) {
     return { paths: [], observedPaths: 0, bytes: 0, capped: true, cancelled: signal.aborted, git: false };
@@ -319,6 +341,46 @@ async function enumerate(
     }
   }
   const excluded = repoMapPathExclusionMatcher(exclude);
+  if (candidatePaths) {
+    let bytes = 0;
+    let observedPaths = 0;
+    let capped = false;
+    const bounded: string[] = [];
+    for (const rawPath of [...new Set(candidatePaths.map(slash))].sort(stablePathCompare)) {
+      const pathBytes = Buffer.byteLength(rawPath, "utf8") + 1;
+      if (observedPaths >= limits.maxEnumeratedPaths || bytes + pathBytes > limits.maxEnumerationBytes) {
+        capped = true;
+        break;
+      }
+      observedPaths += 1;
+      bytes += pathBytes;
+      if (safeRelativePath(rawPath) && !excluded(rawPath)) bounded.push(rawPath);
+    }
+    if (bounded.length === 0) {
+      return { paths: [], observedPaths, bytes, capped, cancelled: signal.aborted, git: gitWorkspace === true };
+    }
+    if (gitWorkspace !== false) {
+      const git = await spawnGitEnumeration(projectRoot, signal, limits, excluded, bounded);
+      if (git.git || git.cancelled || gitWorkspace === true) {
+        return {
+          ...git,
+          observedPaths,
+          bytes,
+          capped: capped || git.capped || (gitWorkspace === true && !git.git),
+          paths: [...new Set(git.paths)].sort(stablePathCompare),
+        };
+      }
+    }
+    const ignored = rootGitignoreMatcher([...(gitignorePatterns ?? [])]);
+    return {
+      paths: bounded.filter((path) => !ignored(path)),
+      observedPaths,
+      bytes,
+      capped,
+      cancelled: signal.aborted,
+      git: false,
+    };
+  }
   const git = await spawnGitEnumeration(projectRoot, signal, limits, excluded);
   if (git.git || git.cancelled) return { ...git, paths: [...new Set(git.paths)].sort(stablePathCompare) };
   const fallback = await fallbackEnumeration(projectRoot, signal, limits, excluded, beforeOpen);
@@ -395,7 +457,16 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
   let capped = false;
   const matches: CandidateMatch[] = [];
   try {
-    enumeration = await enumerate(options.projectRoot, signal, limits, options.exclude ?? [], options.beforeOpen);
+    enumeration = await enumerate(
+      options.projectRoot,
+      signal,
+      limits,
+      options.exclude ?? [],
+      options.beforeOpen,
+      options.candidatePaths,
+      options.gitWorkspace,
+      options.gitignorePatterns,
+    );
     capped = enumeration.capped;
     const terms = queryTerms(options.query);
     for (let offset = 0; offset < enumeration.paths.length && !signal.aborted; offset += limits.concurrency) {

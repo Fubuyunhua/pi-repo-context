@@ -19,6 +19,16 @@ export interface RepoContextTelemetrySnapshot {
   lexicalFallbackFilesScanned: number;
   lexicalFallbackBytesScanned: number;
   lexicalFallbackMatchesReturned: number;
+  pendingFallbackAttemptCount: number;
+  pendingFallbackUsedCount: number;
+  pendingFallbackNoMatchCount: number;
+  pendingFallbackCappedCount: number;
+  pendingFallbackTimeoutCount: number;
+  pendingFallbackCancelledCount: number;
+  pendingFallbackDurationMsTotal: number;
+  pendingFallbackFilesScanned: number;
+  pendingFallbackBytesScanned: number;
+  pendingFallbackMatchesReturned: number;
   hydrationCount: number;
   hydrationDurationMsTotal: number;
   hydratedFastReuseCount: number;
@@ -66,6 +76,16 @@ export class RepoContextTelemetry {
     lexicalFallbackFilesScanned: 0,
     lexicalFallbackBytesScanned: 0,
     lexicalFallbackMatchesReturned: 0,
+    pendingFallbackAttemptCount: 0,
+    pendingFallbackUsedCount: 0,
+    pendingFallbackNoMatchCount: 0,
+    pendingFallbackCappedCount: 0,
+    pendingFallbackTimeoutCount: 0,
+    pendingFallbackCancelledCount: 0,
+    pendingFallbackDurationMsTotal: 0,
+    pendingFallbackFilesScanned: 0,
+    pendingFallbackBytesScanned: 0,
+    pendingFallbackMatchesReturned: 0,
     hydrationCount: 0,
     hydrationDurationMsTotal: 0,
     hydratedFastReuseCount: 0,
@@ -139,6 +159,31 @@ export class RepoContextTelemetry {
     if (result.capped) this.#values.lexicalFallbackCappedCount += 1;
     if (result.timedOut) this.#values.lexicalFallbackTimeoutCount += 1;
     if (result.cancelled) this.#values.lexicalFallbackCancelledCount += 1;
+  }
+  recordPendingFallbackAttempt(): void {
+    this.#values.pendingFallbackAttemptCount += 1;
+  }
+  recordPendingFallback(
+    result: {
+      durationMs: number;
+      filesScanned: number;
+      bytesScanned: number;
+      matchesReturned: number;
+      capped: boolean;
+      timedOut: boolean;
+      cancelled: boolean;
+    },
+    used: boolean,
+  ): void {
+    this.#values.pendingFallbackDurationMsTotal += finiteNonnegative(result.durationMs);
+    this.#values.pendingFallbackFilesScanned += finiteNonnegative(result.filesScanned);
+    this.#values.pendingFallbackBytesScanned += finiteNonnegative(result.bytesScanned);
+    this.#values.pendingFallbackMatchesReturned += finiteNonnegative(used ? result.matchesReturned : 0);
+    if (used) this.#values.pendingFallbackUsedCount += 1;
+    else if (!result.cancelled && result.matchesReturned === 0) this.#values.pendingFallbackNoMatchCount += 1;
+    if (result.capped) this.#values.pendingFallbackCappedCount += 1;
+    if (result.timedOut) this.#values.pendingFallbackTimeoutCount += 1;
+    if (result.cancelled) this.#values.pendingFallbackCancelledCount += 1;
   }
   recordHydration(durationMs: number): void {
     this.#values.hydrationCount += 1;

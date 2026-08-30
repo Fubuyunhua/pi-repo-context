@@ -118,6 +118,31 @@ it("exposes repository-only bounded telemetry", () => {
     },
     false,
   );
+  telemetry.recordPendingFallbackAttempt();
+  telemetry.recordPendingFallback(
+    {
+      durationMs: 7,
+      filesScanned: 3,
+      bytesScanned: 96,
+      matchesReturned: 2,
+      capped: true,
+      timedOut: true,
+      cancelled: false,
+    },
+    true,
+  );
+  telemetry.recordPendingFallback(
+    {
+      durationMs: 1,
+      filesScanned: 0,
+      bytesScanned: 0,
+      matchesReturned: 0,
+      capped: false,
+      timedOut: false,
+      cancelled: true,
+    },
+    false,
+  );
   telemetry.recordWarmingEmptyReturn();
   telemetry.recordIndexedResultReturn();
   telemetry.recordHydration(1);
@@ -144,6 +169,16 @@ it("exposes repository-only bounded telemetry", () => {
     lexicalFallbackFilesScanned: 3,
     lexicalFallbackBytesScanned: 80,
     lexicalFallbackMatchesReturned: 1,
+    pendingFallbackAttemptCount: 1,
+    pendingFallbackUsedCount: 1,
+    pendingFallbackNoMatchCount: 0,
+    pendingFallbackCappedCount: 1,
+    pendingFallbackTimeoutCount: 1,
+    pendingFallbackCancelledCount: 1,
+    pendingFallbackDurationMsTotal: 8,
+    pendingFallbackFilesScanned: 3,
+    pendingFallbackBytesScanned: 96,
+    pendingFallbackMatchesReturned: 2,
     hydrationCount: 1,
     hydrationDurationMsTotal: 1,
     hydratedFastReuseCount: 1,

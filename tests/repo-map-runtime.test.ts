@@ -203,6 +203,129 @@ describe("incremental repository map runtime", () => {
     await runtime.close();
   });
 
+  it("returns the exact still-pending tail match on the first bounded non-Git query", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "repo-context-runtime-pending-scale-")));
+    const stateRoot = await realpath(await mkdtemp(join(tmpdir(), "repo-context-runtime-pending-state-")));
+    roots.push(root, stateRoot);
+    await mkdir(join(root, "src"));
+    for (let start = 0; start < 5_000; start += 100) {
+      await Promise.all(
+        Array.from({ length: 100 }, (_, offset) => {
+          const index = start + offset;
+          return writeFile(
+            join(root, "src", `file-${String(index).padStart(5, "0")}.ts`),
+            `export const BASELINE_${index} = ${index};\n`,
+          );
+        }),
+      );
+    }
+    const scheduler = new ManualScheduler();
+    const telemetry = new Telemetry();
+    let armed = false;
+    let delayed = false;
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler,
+      telemetry,
+      indexFileSystem: {
+        lstat,
+        async readFile(path) {
+          if (armed && !delayed && path === join(root, "src", "file-00000.ts")) {
+            delayed = true;
+            await new Promise((resolve) => setTimeout(resolve, 1_050));
+          }
+          return readFile(path);
+        },
+      },
+    });
+    await runtime.start();
+    await Promise.all(
+      Array.from({ length: 100 }, (_, index) =>
+        writeFile(
+          join(root, "src", `file-${String(index).padStart(5, "0")}.ts`),
+          `export const BATCH_MARKER_${index} = ${index};\n`,
+        ),
+      ),
+    );
+    for (let index = 0; index < 100; index += 1) {
+      runtime.notify("change", `src/file-${String(index).padStart(5, "0")}.ts`);
+    }
+    armed = true;
+
+    const first = await runtime.query("BATCH_MARKER_99");
+
+    expect(delayed).toBe(true);
+    expect(first.freshness).toBe("stale");
+    expect(first.pendingFiles).toContain("src/file-00099.ts");
+    expect(first.results[0]).toMatchObject({ path: "src/file-00099.ts", kind: "lexical" });
+    expect(first.fallbackEvidence[0]).toMatchObject({
+      kind: "source",
+      path: "src/file-00099.ts",
+      excerpt: expect.stringContaining("BATCH_MARKER_99"),
+    });
+    expect(telemetry.snapshot()).toMatchObject({
+      pendingFallbackAttemptCount: 1,
+      pendingFallbackUsedCount: 1,
+      pendingFallbackFilesScanned: 36,
+      pendingFallbackMatchesReturned: expect.any(Number),
+    });
+    expect(telemetry.snapshot().pendingFallbackMatchesReturned).toBeGreaterThan(0);
+    expect(runtime.status().pendingFiles).toContain("src/file-00099.ts");
+    await runtime.close();
+  }, 60_000);
+
+  it("cancels an in-flight pending fallback during runtime retirement", async () => {
+    const { root, stateRoot } = await fixture({ "src/pending.ts": "export const oldPendingValue = true;" }, false);
+    const failures = controlledReadFailures();
+    const scanStarted = deferred();
+    const telemetry = new Telemetry();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      telemetry,
+      indexFileSystem: failures.fileSystem,
+      async pendingFallbackScanner(options) {
+        scanStarted.resolve();
+        await new Promise<void>((resolve) =>
+          options.signal?.addEventListener("abort", () => resolve(), { once: true }),
+        );
+        return {
+          results: [],
+          fallbackEvidence: [],
+          durationMs: 1,
+          filesScanned: 0,
+          bytesScanned: 0,
+          enumeratedPaths: 1,
+          enumerationBytes: 15,
+          matchesReturned: 0,
+          capped: false,
+          timedOut: false,
+          cancelled: true,
+        };
+      },
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/pending.ts"), "export const retiredPendingNeedle = true;");
+    failures.fail(join(root, "src/pending.ts"));
+    runtime.notify("change", "src/pending.ts");
+
+    const query = runtime.query("retiredPendingNeedle");
+    await scanStarted.promise;
+    const closing = runtime.close();
+    await query;
+    failures.recover(join(root, "src/pending.ts"));
+    await closing;
+
+    expect(telemetry.snapshot()).toMatchObject({
+      pendingFallbackAttemptCount: 1,
+      pendingFallbackCancelledCount: 1,
+      pendingFallbackUsedCount: 0,
+    });
+  });
+
   it("keeps queryCurrent fallback evidence coherent while a flush interleaves", async () => {
     const { root, stateRoot } = await fixture({ "src/value.ts": "export const capturedBeforeFlush = true;" });
     const flushRead = deferred();
@@ -902,7 +1025,7 @@ describe("incremental repository map runtime", () => {
     await changed.close();
   });
 
-  it("hydrates coherent persisted evidence on restart, but reports no evidence without a prior generation", async () => {
+  it("hydrates persisted evidence and uses bounded pending source when incremental parsing fails", async () => {
     const withPrior = await fixture({ "src/value.ts": "export const restartValue = true;" });
     const first = new RepoMapRuntime({ projectRoot: withPrior.root, stateRoot: withPrior.stateRoot, watch: false });
     await first.start();
@@ -932,10 +1055,10 @@ describe("incremental repository map runtime", () => {
     await cold.start();
     const unavailable = await cold.query("unavailableValue");
     expect(unavailable.freshness).toBe("stale");
-    expect(unavailable.results).toEqual([]);
+    expect(unavailable.results).toMatchObject([{ path: "src/value.ts", kind: "lexical" }]);
     expect(unavailable.pendingFiles).toEqual(["src/value.ts"]);
-    expect(unavailable.fallbackEvidence).toEqual([
-      { kind: "source", excerpt: "No indexed source file is available; use direct filesystem search." },
+    expect(unavailable.fallbackEvidence).toMatchObject([
+      { kind: "source", path: "src/value.ts", excerpt: expect.stringContaining("unavailableValue") },
     ]);
     failures.recover(join(withPrior.root, "src/value.ts"));
     failures.recover(join(withoutPrior.root, "src/value.ts"));

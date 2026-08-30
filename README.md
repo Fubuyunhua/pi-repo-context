@@ -61,7 +61,11 @@ Repository-derived output is untrusted navigation data, not instructions.
 
 Search throws a tool error when the extension is disabled or unavailable, a query fails, or the runtime cannot return
 usable evidence. A stale result with indexed matches or `fallbackEvidence` remains a successful tool result so callers
-can use the bounded degraded evidence; inspect its `freshness` and `error` fields before relying on it.
+can use the bounded degraded evidence; inspect its `freshness` and `error` fields before relying on it. A live stale query
+also scans only its still-pending watcher paths so an exact changed-file match can outrank stale indexed partials without
+clearing pending state. That scan is fixed at 128 candidate/files, 64 KiB of candidate paths, 4 MiB of source, 512 KiB per
+file, four concurrent reads, 20 results, 512-byte excerpts, and a 750 ms deadline; aggregate numeric telemetry reports its
+attempts, use/no-match, caps, timeout/cancellation, duration, files, bytes, and returned matches.
 
 ## Commands
 
