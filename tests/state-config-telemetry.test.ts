@@ -161,6 +161,83 @@ it("exposes repository-only bounded telemetry", () => {
   expect(Object.is(snapshot, telemetry.snapshot())).toBe(false);
 });
 
+it("records aggregate terminal reasons without retaining request content", () => {
+  const telemetry = new RepoContextTelemetry();
+  const base = {
+    durationMs: 1,
+    filesScanned: 1,
+    bytesScanned: 1,
+    matchesReturned: 0,
+    capped: false,
+    timedOut: false,
+    cancelled: false,
+  };
+  for (const terminalReason of [
+    "matched",
+    "no-match",
+    "enumeration-timeout",
+    "source-timeout",
+    "enumeration-path-cap",
+    "enumeration-byte-cap",
+    "source-byte-cap",
+    "file-count-cap",
+    "file-prefix-cap",
+    "cancelled",
+    "invalid-scanner-output",
+  ] as const) {
+    telemetry.recordLexicalFallback(
+      {
+        ...base,
+        terminalReason,
+        capped: terminalReason.endsWith("cap") || terminalReason === "invalid-scanner-output",
+        timedOut: terminalReason.endsWith("timeout"),
+        cancelled: terminalReason === "cancelled",
+      },
+      terminalReason === "matched",
+    );
+  }
+  expect(telemetry.snapshot()).toMatchObject({
+    lexicalFallbackMatchedCount: 1,
+    lexicalFallbackGenuineNoMatchCount: 1,
+    lexicalFallbackEnumerationTimeoutCount: 1,
+    lexicalFallbackSourceTimeoutCount: 1,
+    lexicalFallbackEnumerationPathCapCount: 1,
+    lexicalFallbackEnumerationByteCapCount: 1,
+    lexicalFallbackSourceByteCapCount: 1,
+    lexicalFallbackFileCountCapCount: 1,
+    lexicalFallbackFilePrefixCapCount: 1,
+    lexicalFallbackInvalidOutputCount: 1,
+    lexicalFallbackCancelledCount: 1,
+  });
+  expect(Object.values(telemetry.snapshot()).every((value) => typeof value === "number")).toBe(true);
+});
+
+it("records retirement telemetry ahead of malformed-output labels", () => {
+  const telemetry = new RepoContextTelemetry();
+  const base = {
+    durationMs: 1,
+    filesScanned: 1,
+    bytesScanned: 1,
+    matchesReturned: 9,
+    capped: true,
+    terminalReason: "invalid-scanner-output" as const,
+    terminalStage: "enumeration" as const,
+  };
+  telemetry.recordLexicalFallback({ ...base, timedOut: true, cancelled: false }, true, 9);
+  telemetry.recordLexicalFallback({ ...base, timedOut: true, cancelled: true }, true, 9);
+
+  expect(telemetry.snapshot()).toMatchObject({
+    lexicalFallbackTimeoutCount: 1,
+    lexicalFallbackEnumerationTimeoutCount: 1,
+    lexicalFallbackCancelledCount: 1,
+    lexicalFallbackInvalidOutputCount: 0,
+    lexicalFallbackCappedCount: 0,
+    lexicalFallbackUsedCount: 0,
+    lexicalFallbackNoMatchCount: 0,
+    lexicalFallbackMatchesReturned: 0,
+  });
+});
+
 it("records one truthful terminal lexical-fallback outcome per attempt", () => {
   const telemetry = new RepoContextTelemetry();
   const base = { durationMs: 1, filesScanned: 1, bytesScanned: 1, matchesReturned: 1 };

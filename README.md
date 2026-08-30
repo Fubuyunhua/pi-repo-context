@@ -38,7 +38,9 @@ Repo Context `0.1.0` is Tool-first and performs **no automatic repository-contex
 Enabled sessions resolve state/configuration and remain `dormant` until the first search or explicit rebuild. The first
 search lazily starts one shared initialization and waits through a fixed 250 ms logical budget. If initialization is still
 warming, that same Tool call performs a bounded, abortable direct lexical scan and returns actual matching source/path
-evidence when found while full initialization continues. These point-in-time reads report lifecycle `warming`, freshness
+evidence when found while full initialization continues. Full-repository cold scans can complete after a settled batch when
+a source candidate contains two independent structured query identifiers; generic prose and explicit pending-path scans do
+not use this shortcut. Full indexing uses fixed eight-file batches with an event-loop yield between batches. These point-in-time reads report lifecycle `warming`, freshness
 `stale`, generation `0`, and unavailable revision fields. If initialization wins, scanned evidence is discarded in favor of
 a coherent indexed query; a real startup failure remains a sanitized hard unavailable Tool error. Status reports lifecycle
 separately from repository freshness and never inspects a controller before startup completes.
@@ -46,7 +48,8 @@ separately from repository freshness and never inspects a controller before star
 Hard search failures (before initialization, disabled/unavailable runtime, settled startup failure, or rejected query) are
 Pi Tool errors. Fulfilled warming/stale/degraded searches remain successful Tool results and carry sanitized degradation
 metadata. The warming and stale-pending scanners follow Git/non-Git admission and exclusions, do not follow symlinks, and hard-bound
-the logical return across enumeration, hooks, reads, batches, cancellation, results, excerpts, duration, and the final UTF-8 payload. Uncancellable OS work may continue with observed settlements; owned closure is initiated immediately (or when a late open arrives) without claiming completion, and timed-out/cancelled scans publish no evidence. Stale-pending evidence is used
+the logical return across enumeration, hooks, reads, batches, cancellation, results, excerpts, duration, and the final UTF-8 payload.
+The built-in scanner's classified 1,900 ms deadline precedes the independent 2,000 ms caller fail-safe. Uncancellable OS work may continue with observed settlements; owned closure is initiated immediately (or when a late open arrives) without claiming completion, and timed-out/cancelled scans publish no evidence. Stale-pending evidence is used
 only by live search; coherent `queryCurrent()` snapshots never read pending source, and direct reads do not advance the
 reported generation or workspace revision. Due background timer flushes wait for overlapping live searches to finish,
 while notifications and explicit flush, rebuild, and close operations remain immediate retirement boundaries. A compatible hydrated clean

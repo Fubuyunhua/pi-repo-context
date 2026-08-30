@@ -10,6 +10,8 @@ import { analyzeJava, JAVA_ANALYZER_VERSION } from "./java.js";
 
 const execFileAsync = promisify(execFile);
 export const REPO_MAP_SCHEMA_VERSION = 1;
+/** Fixed cold-build read/parse fan-out; exported for deterministic bounds tests. */
+export const REPO_MAP_INDEX_CONCURRENCY = 8;
 /** Bump when repository admission or analyzer output changes incompatibly. */
 export const REPO_MAP_BUILD_COMPATIBILITY_VERSION = "repo-map-build/v1" as const;
 
@@ -842,15 +844,24 @@ export async function indexRepoMapFile(
 export async function buildRepoMap(options: BuildRepoMapOptions): Promise<RepoMapSnapshot> {
   const projectRoot = await realpath(resolve(options.projectRoot));
   const paths = await enumerateRepoMapFiles(projectRoot, options.exclude ?? []);
-  const indexed = await Promise.all(
-    paths.map((path) =>
-      indexRepoMapFile(projectRoot, path, {
-        exclude: options.exclude,
-        checkGitIgnore: false,
-        ...(options.fileSystem ? { fileSystem: options.fileSystem } : {}),
-      }),
-    ),
-  );
+  const indexed: RepoMapIndexOutcome[] = [];
+  for (let offset = 0; offset < paths.length; offset += REPO_MAP_INDEX_CONCURRENCY) {
+    const batch = paths.slice(offset, offset + REPO_MAP_INDEX_CONCURRENCY);
+    indexed.push(
+      ...(await Promise.all(
+        batch.map((path) =>
+          indexRepoMapFile(projectRoot, path, {
+            exclude: options.exclude,
+            checkGitIgnore: false,
+            ...(options.fileSystem ? { fileSystem: options.fileSystem } : {}),
+          }),
+        ),
+      )),
+    );
+    // Parsing and hashing have synchronous sections. Explicitly hand timers
+    // and fallback work an event-loop turn before beginning the next batch.
+    if (offset + batch.length < paths.length) await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+  }
   const snapshot: RepoMapSnapshot = {
     schemaVersion: REPO_MAP_SCHEMA_VERSION,
     provenance: {

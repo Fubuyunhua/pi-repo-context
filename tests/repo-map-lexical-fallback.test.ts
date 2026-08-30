@@ -7,9 +7,11 @@ import { expect, it, vi } from "vitest";
 import {
   LEXICAL_FALLBACK_LIMITS,
   LEXICAL_FALLBACK_OUTPUT_LIMITS,
+  LEXICAL_FALLBACK_SCANNER_DEADLINE_MS,
   type LexicalFallbackFileSystem,
   type LexicalFallbackOperationStage,
   normalizeLexicalFallbackPath,
+  runBoundedLexicalFallbackScan,
   sanitizeLexicalFallbackScan,
   scanLexicalFallback,
 } from "../src/repo-map/lexical-fallback.js";
@@ -100,6 +102,55 @@ it("sanitizes injected scan output and fails closed for hostile arrays and gette
     },
   });
   expect(sanitizeLexicalFallbackScan(hostile)).toMatchObject({ results: [], fallbackEvidence: [], capped: true });
+});
+
+it.each([
+  ["enumeration", "enumeration-timeout", "enumeration"],
+  [undefined, "source-timeout", "source"],
+] as const)(
+  "preserves %s timeout priority when scanner output is malformed",
+  (suppliedStage, terminalReason, terminalStage) => {
+    const sanitized = sanitizeLexicalFallbackScan({
+      ...successfulScan,
+      results: "malformed",
+      capped: true,
+      timedOut: true,
+      cancelled: false,
+      ...(suppliedStage === undefined ? {} : { terminalStage: suppliedStage }),
+    });
+    expect(sanitized).toMatchObject({
+      results: [],
+      fallbackEvidence: [],
+      matchesReturned: 0,
+      capped: false,
+      timedOut: true,
+      cancelled: false,
+      terminalReason,
+      terminalStage,
+    });
+  },
+);
+
+it("preserves cancellation over timeout when scanner output is malformed", () => {
+  const sanitized = sanitizeLexicalFallbackScan({
+    ...successfulScan,
+    results: "malformed",
+    capped: true,
+    timedOut: true,
+    cancelled: true,
+    terminalReason: "invalid-scanner-output",
+    terminalStage: "enumeration",
+  });
+  expect(sanitized).toMatchObject({
+    results: [],
+    fallbackEvidence: [],
+    matchesReturned: 0,
+    capped: false,
+    timedOut: false,
+    cancelled: true,
+    terminalReason: "cancelled",
+    terminalStage: "cancelled",
+  });
 });
 
 it("ranks linked dotted, underscored, and path terms with match-centered bounded excerpts", async () => {
@@ -833,6 +884,38 @@ it("initiates owned directory closure for stalled iteration and observes late op
   }
 });
 
+it("classifies genuine no-match and each scanner work cap", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-terminal-reasons-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await writeFile(join(root, "a.txt"), "ordinary alpha content\n");
+  await writeFile(join(root, "b.txt"), "ordinary beta content\n");
+  await execFileAsync("git", ["add", "a.txt", "b.txt"], { cwd: root });
+
+  const scan = (limits?: Parameters<typeof scanLexicalFallback>[0]["limits"]) =>
+    scanLexicalFallback({ projectRoot: root, query: "absentNeedle", limits });
+  await expect(scan()).resolves.toMatchObject({ terminalReason: "no-match", terminalStage: "complete" });
+  await expect(scan({ maxEnumeratedPaths: 1 })).resolves.toMatchObject({
+    terminalReason: "enumeration-path-cap",
+    terminalStage: "enumeration",
+  });
+  await expect(scan({ maxEnumerationBytes: 1 })).resolves.toMatchObject({
+    terminalReason: "enumeration-byte-cap",
+    terminalStage: "enumeration",
+  });
+  await expect(scan({ maxFiles: 1 })).resolves.toMatchObject({
+    terminalReason: "file-count-cap",
+    terminalStage: "source",
+  });
+  await expect(scan({ maxSourceBytes: 1 })).resolves.toMatchObject({
+    terminalReason: "source-byte-cap",
+    terminalStage: "source",
+  });
+  await expect(scan({ maxFileBytes: 1 })).resolves.toMatchObject({
+    terminalReason: "file-prefix-cap",
+    terminalStage: "source",
+  });
+});
+
 it("returns at the logical deadline while a read hook remains stalled", async () => {
   vi.useFakeTimers();
   try {
@@ -860,8 +943,50 @@ it("returns at the logical deadline while a read hook remains stalled", async ()
       capped: false,
       timedOut: true,
       cancelled: false,
+      terminalReason: "source-timeout",
+      terminalStage: "source",
     });
     gate.resolve();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("classifies an internal enumeration deadline before the outer fail-safe", async () => {
+  vi.useFakeTimers();
+  try {
+    const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-enumeration-deadline-"));
+    const entered = deferred();
+    const stalledOpen = deferred<Awaited<ReturnType<typeof opendir>>>();
+    const completion = runBoundedLexicalFallbackScan(
+      (signal) =>
+        scanLexicalFallback({
+          projectRoot: root,
+          query: "ordinary prose",
+          signal,
+          fileSystem: {
+            opendir: (async () => {
+              entered.resolve();
+              return stalledOpen.promise;
+            }) as LexicalFallbackFileSystem["opendir"],
+          },
+        }),
+      [],
+      LEXICAL_FALLBACK_LIMITS.deadlineMs,
+    );
+    await entered.promise;
+    await vi.advanceTimersByTimeAsync(LEXICAL_FALLBACK_SCANNER_DEADLINE_MS);
+    await expect(completion).resolves.toMatchObject({
+      status: "completed",
+      scan: {
+        terminalReason: "enumeration-timeout",
+        terminalStage: "enumeration",
+        timedOut: true,
+        enumeratedPaths: 0,
+      },
+    });
+    stalledOpen.reject(new Error("late directory open rejection"));
+    await Promise.resolve();
   } finally {
     vi.useRealTimers();
   }

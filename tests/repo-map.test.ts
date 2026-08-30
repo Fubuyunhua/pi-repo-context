@@ -3,12 +3,13 @@ import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildRepoMap,
   indexRepoMapFile,
   isRepoMapPathExcluded,
   loadRepoMapSnapshot,
+  REPO_MAP_INDEX_CONCURRENCY,
   RepoMapSearch,
 } from "../src/repo-map/index.js";
 
@@ -32,6 +33,60 @@ async function fixture(files: Record<string, string | Uint8Array>, git = false):
 }
 
 describe("initial repository map", () => {
+  it("bounds full-build indexing concurrency and yields between deterministic batches", async () => {
+    const files = Object.fromEntries(
+      Array.from({ length: REPO_MAP_INDEX_CONCURRENCY * 2 + 1 }, (_, index) => [
+        `src/file-${String(index).padStart(2, "0")}.txt`,
+        `fixture ${index}`,
+      ]),
+    );
+    const root = await fixture(files);
+    let active = 0;
+    let maximumActive = 0;
+    let releaseFirstBatch = () => {};
+    let firstBatchStarted = () => {};
+    const firstBatchGate = new Promise<void>((resolveGate) => {
+      releaseFirstBatch = resolveGate;
+    });
+    const firstBatchReady = new Promise<void>((resolveReady) => {
+      firstBatchStarted = resolveReady;
+    });
+    let reads = 0;
+    const immediate = globalThis.setImmediate;
+    const yieldSpy = vi
+      .spyOn(globalThis, "setImmediate")
+      .mockImplementation((callback, ...args) => immediate(callback, ...args));
+    try {
+      const building = buildRepoMap({
+        projectRoot: root,
+        fileSystem: {
+          lstat,
+          async readFile(path) {
+            reads += 1;
+            active += 1;
+            maximumActive = Math.max(maximumActive, active);
+            if (reads === REPO_MAP_INDEX_CONCURRENCY) firstBatchStarted();
+            if (reads <= REPO_MAP_INDEX_CONCURRENCY) await firstBatchGate;
+            const content = await readFile(path);
+            active -= 1;
+            return content;
+          },
+        },
+      });
+      await firstBatchReady;
+      expect(maximumActive).toBe(REPO_MAP_INDEX_CONCURRENCY);
+      const yieldsBeforeRelease = yieldSpy.mock.calls.length;
+      releaseFirstBatch();
+      const snapshot = await building;
+      expect(maximumActive).toBeLessThanOrEqual(REPO_MAP_INDEX_CONCURRENCY);
+      expect(yieldSpy.mock.calls.length).toBeGreaterThan(yieldsBeforeRelease);
+      expect(snapshot.files.map((file) => file.path)).toEqual(Object.keys(files).sort());
+    } finally {
+      yieldSpy.mockRestore();
+      releaseFirstBatch();
+    }
+  });
+
   it("honors gitignore, built-in exclusions, and configured exclusions", async () => {
     const root = await fixture(
       {

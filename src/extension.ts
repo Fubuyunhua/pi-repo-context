@@ -539,7 +539,10 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     if (runtime === next && ctx.hasUI) ctx.ui.setStatus(EXTENSION_ID, undefined);
   });
 
-  const emptyFallbackScan = (cancelled = false): LexicalFallbackScanResult => ({
+  const emptyFallbackScan = (
+    cancelled = false,
+    terminalReason: LexicalFallbackScanResult["terminalReason"] = cancelled ? "cancelled" : "no-match",
+  ): LexicalFallbackScanResult => ({
     results: [],
     fallbackEvidence: [],
     durationMs: 0,
@@ -551,20 +554,64 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     capped: false,
     timedOut: false,
     cancelled,
+    terminalReason,
+    terminalStage:
+      terminalReason === "cancelled"
+        ? "cancelled"
+        : terminalReason === "invalid-scanner-output"
+          ? "output"
+          : terminalReason?.startsWith("enumeration-")
+            ? "enumeration"
+            : terminalReason === "no-match" || terminalReason === "matched"
+              ? "complete"
+              : "source",
   });
 
-  const warmingResult = (scan?: LexicalFallbackScanResult): RepoMapRuntimeQuery => ({
-    results: scan?.results ?? [],
-    freshness: "stale",
-    generation: 0,
-    gitHead: "unavailable",
-    workspaceRevision: "unavailable",
-    pendingFiles: [],
-    fallbackEvidence:
-      scan && scan.fallbackEvidence.length > 0
-        ? scan.fallbackEvidence
-        : [{ kind: "warming", excerpt: "No lexical match found within the bounded warming scan." }],
-  });
+  const warmingEvidence = (scan?: LexicalFallbackScanResult): string => {
+    const prefix = "Repository initialization exceeded the 250 ms readiness grace. ";
+    switch (scan?.terminalReason) {
+      case "enumeration-timeout":
+        return `${prefix}Lexical fallback timed out during repository enumeration.`;
+      case "source-timeout":
+        return `${prefix}Lexical fallback timed out while reading admitted source.`;
+      case "enumeration-path-cap":
+        return `${prefix}Lexical fallback reached its repository path cap before completing.`;
+      case "enumeration-byte-cap":
+        return `${prefix}Lexical fallback reached its enumeration-byte cap before completing.`;
+      case "source-byte-cap":
+        return `${prefix}Lexical fallback reached its source-byte cap before completing.`;
+      case "file-count-cap":
+        return `${prefix}Lexical fallback reached its file-count cap before completing.`;
+      case "file-prefix-cap":
+        return `${prefix}Lexical fallback reached its per-file source prefix cap before completing.`;
+      case "invalid-scanner-output":
+        return `${prefix}Lexical fallback output failed validation.`;
+      case "cancelled":
+        return `${prefix}Lexical fallback was cancelled.`;
+      default:
+        return `${prefix}Lexical fallback completed without a match.`;
+    }
+  };
+
+  const warmingResult = (scan?: LexicalFallbackScanResult): RepoMapRuntimeQuery => {
+    const stageIncomplete =
+      scan?.terminalReason !== undefined && !["matched", "no-match"].includes(scan.terminalReason);
+    return {
+      results: scan?.results ?? [],
+      freshness: "stale",
+      generation: 0,
+      gitHead: "unavailable",
+      workspaceRevision: "unavailable",
+      pendingFiles: [],
+      fallbackEvidence:
+        scan && scan.fallbackEvidence.length > 0
+          ? [
+              ...scan.fallbackEvidence,
+              ...(stageIncomplete ? [{ kind: "warming" as const, excerpt: warmingEvidence(scan) }] : []),
+            ]
+          : [{ kind: "warming", excerpt: warmingEvidence(scan) }],
+    };
+  };
 
   const executeSearch = (params: { query: string; limit?: number }, deprecated: boolean, signal?: AbortSignal) => {
     const target = runtime;
@@ -609,8 +656,12 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
               scan =
                 race.result.status === "retired"
                   ? {
-                      ...emptyFallbackScan(race.result.cancelled),
+                      ...emptyFallbackScan(
+                        race.result.cancelled,
+                        race.result.cancelled ? "cancelled" : "source-timeout",
+                      ),
                       timedOut: race.result.timedOut,
+                      terminalStage: race.result.cancelled ? "cancelled" : "source",
                     }
                   : sanitizeLexicalFallbackScan(race.result.scan);
             }
@@ -619,7 +670,7 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
             // Scanner failures are private implementation details. Report the
             // bounded no-match warming outcome; retirement below is recorded
             // separately as cancellation.
-            scan = emptyFallbackScan(false);
+            scan = emptyFallbackScan(false, "invalid-scanner-output");
           } finally {
             target.fallbackControllers.delete(controller);
           }
@@ -633,12 +684,22 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
             };
           }
           if (signal?.aborted) {
-            target.telemetry.recordLexicalFallback({ ...scan, timedOut: false, cancelled: true }, false);
+            target.telemetry.recordLexicalFallback(
+              { ...scan, timedOut: false, cancelled: true, terminalReason: "cancelled", terminalStage: "cancelled" },
+              false,
+            );
             throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
           }
           if (!isCurrent(target)) {
             target.telemetry.recordLexicalFallback(
-              { ...scan, matchesReturned: 0, timedOut: false, cancelled: true },
+              {
+                ...scan,
+                matchesReturned: 0,
+                timedOut: false,
+                cancelled: true,
+                terminalReason: "cancelled",
+                terminalStage: "cancelled",
+              },
               false,
             );
             throw new Error(PUBLIC_ERRORS.unavailable);
@@ -668,7 +729,10 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
                 : bounded.payload,
             };
           }
-          target.telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false);
+          target.telemetry.recordLexicalFallback(
+            { ...scan, cancelled: true, terminalReason: "cancelled", terminalStage: "cancelled" },
+            false,
+          );
         }
       }
       if (target.lifecycle === "failed" || !target.available || !target.repoMap) {

@@ -15,6 +15,16 @@ export interface RepoContextTelemetrySnapshot {
   lexicalFallbackCappedCount: number;
   lexicalFallbackTimeoutCount: number;
   lexicalFallbackCancelledCount: number;
+  lexicalFallbackMatchedCount: number;
+  lexicalFallbackGenuineNoMatchCount: number;
+  lexicalFallbackEnumerationTimeoutCount: number;
+  lexicalFallbackSourceTimeoutCount: number;
+  lexicalFallbackEnumerationPathCapCount: number;
+  lexicalFallbackEnumerationByteCapCount: number;
+  lexicalFallbackSourceByteCapCount: number;
+  lexicalFallbackFileCountCapCount: number;
+  lexicalFallbackFilePrefixCapCount: number;
+  lexicalFallbackInvalidOutputCount: number;
   lexicalFallbackDurationMsTotal: number;
   lexicalFallbackFilesScanned: number;
   lexicalFallbackBytesScanned: number;
@@ -62,6 +72,16 @@ export class RepoContextTelemetry {
     lexicalFallbackCappedCount: 0,
     lexicalFallbackTimeoutCount: 0,
     lexicalFallbackCancelledCount: 0,
+    lexicalFallbackMatchedCount: 0,
+    lexicalFallbackGenuineNoMatchCount: 0,
+    lexicalFallbackEnumerationTimeoutCount: 0,
+    lexicalFallbackSourceTimeoutCount: 0,
+    lexicalFallbackEnumerationPathCapCount: 0,
+    lexicalFallbackEnumerationByteCapCount: 0,
+    lexicalFallbackSourceByteCapCount: 0,
+    lexicalFallbackFileCountCapCount: 0,
+    lexicalFallbackFilePrefixCapCount: 0,
+    lexicalFallbackInvalidOutputCount: 0,
     lexicalFallbackDurationMsTotal: 0,
     lexicalFallbackFilesScanned: 0,
     lexicalFallbackBytesScanned: 0,
@@ -126,6 +146,19 @@ export class RepoContextTelemetry {
       capped: boolean;
       timedOut: boolean;
       cancelled: boolean;
+      terminalReason?:
+        | "matched"
+        | "no-match"
+        | "enumeration-timeout"
+        | "source-timeout"
+        | "enumeration-path-cap"
+        | "enumeration-byte-cap"
+        | "source-byte-cap"
+        | "file-count-cap"
+        | "file-prefix-cap"
+        | "cancelled"
+        | "invalid-scanner-output";
+      terminalStage?: "enumeration" | "source" | "complete" | "cancelled" | "output";
     },
     used: boolean,
     returnedMatches = used ? result.matchesReturned : 0,
@@ -143,6 +176,48 @@ export class RepoContextTelemetry {
     else if (result.capped) this.#values.lexicalFallbackCappedCount += 1;
     else if (used) this.#values.lexicalFallbackUsedCount += 1;
     else this.#values.lexicalFallbackNoMatchCount += 1;
+
+    const terminalReason = result.cancelled
+      ? "cancelled"
+      : result.timedOut
+        ? result.terminalStage === "enumeration" || result.terminalReason === "enumeration-timeout"
+          ? "enumeration-timeout"
+          : "source-timeout"
+        : (result.terminalReason ?? (result.capped ? "source-byte-cap" : used ? "matched" : "no-match"));
+    switch (terminalReason) {
+      case "matched":
+        this.#values.lexicalFallbackMatchedCount += 1;
+        break;
+      case "no-match":
+        this.#values.lexicalFallbackGenuineNoMatchCount += 1;
+        break;
+      case "enumeration-timeout":
+        this.#values.lexicalFallbackEnumerationTimeoutCount += 1;
+        break;
+      case "source-timeout":
+        this.#values.lexicalFallbackSourceTimeoutCount += 1;
+        break;
+      case "enumeration-path-cap":
+        this.#values.lexicalFallbackEnumerationPathCapCount += 1;
+        break;
+      case "enumeration-byte-cap":
+        this.#values.lexicalFallbackEnumerationByteCapCount += 1;
+        break;
+      case "source-byte-cap":
+        this.#values.lexicalFallbackSourceByteCapCount += 1;
+        break;
+      case "file-count-cap":
+        this.#values.lexicalFallbackFileCountCapCount += 1;
+        break;
+      case "file-prefix-cap":
+        this.#values.lexicalFallbackFilePrefixCapCount += 1;
+        break;
+      case "invalid-scanner-output":
+        this.#values.lexicalFallbackInvalidOutputCount += 1;
+        break;
+      case "cancelled":
+        break;
+    }
   }
   recordHydration(durationMs: number): void {
     this.#values.hydrationCount += 1;

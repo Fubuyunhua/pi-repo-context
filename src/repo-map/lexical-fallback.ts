@@ -36,6 +36,13 @@ export const LEXICAL_FALLBACK_LIMITS: Readonly<LexicalFallbackLimits> = Object.f
   maxExcerptBytes: 512,
 });
 
+/**
+ * The built-in scanner retires before the independent caller fail-safe. This
+ * preserves the public two-second envelope while allowing normal scans to
+ * report their own stage and work counters.
+ */
+export const LEXICAL_FALLBACK_SCANNER_DEADLINE_MS = 1_900;
+
 /** Hard limits applied again at the trust boundary for injected scanner output. */
 export const LEXICAL_FALLBACK_OUTPUT_LIMITS = Object.freeze({
   maxResults: LEXICAL_FALLBACK_LIMITS.maxResults,
@@ -92,6 +99,21 @@ export interface LexicalFallbackOptions {
   fileSystem?: Partial<LexicalFallbackFileSystem>;
 }
 
+export type LexicalFallbackTerminalReason =
+  | "matched"
+  | "no-match"
+  | "enumeration-timeout"
+  | "source-timeout"
+  | "enumeration-path-cap"
+  | "enumeration-byte-cap"
+  | "source-byte-cap"
+  | "file-count-cap"
+  | "file-prefix-cap"
+  | "cancelled"
+  | "invalid-scanner-output";
+
+export type LexicalFallbackTerminalStage = "enumeration" | "source" | "complete" | "cancelled" | "output";
+
 export interface LexicalFallbackScanResult {
   results: RepoMapQueryResult[];
   fallbackEvidence: RepoMapFallbackEvidence[];
@@ -108,6 +130,10 @@ export interface LexicalFallbackScanResult {
   capped: boolean;
   timedOut: boolean;
   cancelled: boolean;
+  /** Additive classification; absent scanner output remains supported. */
+  terminalReason?: LexicalFallbackTerminalReason;
+  /** Additive coarse stage classification for aggregate telemetry. */
+  terminalStage?: LexicalFallbackTerminalStage;
 }
 
 interface EnumerationResult {
@@ -317,6 +343,44 @@ function utf8Prefix(value: string, maxBytes: number): string {
   return bytes.subarray(0, end).toString("utf8");
 }
 
+const TERMINAL_REASONS = new Set<LexicalFallbackTerminalReason>([
+  "matched",
+  "no-match",
+  "enumeration-timeout",
+  "source-timeout",
+  "enumeration-path-cap",
+  "enumeration-byte-cap",
+  "source-byte-cap",
+  "file-count-cap",
+  "file-prefix-cap",
+  "cancelled",
+  "invalid-scanner-output",
+]);
+const TERMINAL_STAGES = new Set<LexicalFallbackTerminalStage>([
+  "enumeration",
+  "source",
+  "complete",
+  "cancelled",
+  "output",
+]);
+
+function inferredTerminalReason(
+  result: Pick<LexicalFallbackScanResult, "results" | "capped" | "timedOut" | "cancelled">,
+): LexicalFallbackTerminalReason {
+  if (result.cancelled) return "cancelled";
+  if (result.timedOut) return "source-timeout";
+  if (result.capped) return "source-byte-cap";
+  return result.results.length > 0 ? "matched" : "no-match";
+}
+
+function terminalStageFor(reason: LexicalFallbackTerminalReason): LexicalFallbackTerminalStage {
+  if (reason.startsWith("enumeration-")) return "enumeration";
+  if (reason === "cancelled") return "cancelled";
+  if (reason === "invalid-scanner-output") return "output";
+  if (reason === "matched" || reason === "no-match") return "complete";
+  return "source";
+}
+
 function emptySanitizedScan(capped = true): LexicalFallbackScanResult {
   return {
     results: [],
@@ -332,6 +396,38 @@ function emptySanitizedScan(capped = true): LexicalFallbackScanResult {
     capped,
     timedOut: false,
     cancelled: false,
+    terminalReason: capped ? "invalid-scanner-output" : "no-match",
+    terminalStage: capped ? "output" : "complete",
+  };
+}
+
+function malformedSanitizedScan(
+  cancelled: boolean,
+  timedOut: boolean,
+  timedOutStage: "enumeration" | "source",
+  counters?: Partial<
+    Pick<
+      LexicalFallbackScanResult,
+      "durationMs" | "filesScanned" | "bytesScanned" | "enumeratedPaths" | "enumerationBytes"
+    >
+  >,
+): LexicalFallbackScanResult {
+  const retired = cancelled || timedOut;
+  const terminalReason: LexicalFallbackTerminalReason = cancelled
+    ? "cancelled"
+    : timedOut
+      ? timedOutStage === "enumeration"
+        ? "enumeration-timeout"
+        : "source-timeout"
+      : "invalid-scanner-output";
+  return {
+    ...emptySanitizedScan(!retired),
+    ...counters,
+    capped: !retired,
+    timedOut: timedOut && !cancelled,
+    cancelled,
+    terminalReason,
+    terminalStage: terminalStageFor(terminalReason),
   };
 }
 
@@ -359,14 +455,31 @@ export function sanitizeLexicalFallbackScan(
   input: unknown,
   candidatePaths?: readonly string[],
 ): LexicalFallbackScanResult {
+  let observedCancelled = false;
+  let observedTimedOut = false;
+  let observedTimedOutStage: "enumeration" | "source" = "source";
   try {
     if (typeof input !== "object" || input === null || Array.isArray(input)) return emptySanitizedScan();
     const scan = input as Record<string, unknown>;
     const timedOut = scan.timedOut;
     const cancelled = scan.cancelled;
+    observedCancelled = cancelled === true;
+    observedTimedOut = timedOut === true;
+    const suppliedStage = scan.terminalStage;
+    if (suppliedStage === "enumeration") observedTimedOutStage = "enumeration";
     const capped = scan.capped;
     if (typeof timedOut !== "boolean" || typeof cancelled !== "boolean" || typeof capped !== "boolean") {
-      return emptySanitizedScan();
+      return malformedSanitizedScan(observedCancelled, observedTimedOut, observedTimedOutStage);
+    }
+    const suppliedReason = scan.terminalReason;
+    if (
+      (suppliedReason !== undefined &&
+        (typeof suppliedReason !== "string" ||
+          !TERMINAL_REASONS.has(suppliedReason as LexicalFallbackTerminalReason))) ||
+      (suppliedStage !== undefined &&
+        (typeof suppliedStage !== "string" || !TERMINAL_STAGES.has(suppliedStage as LexicalFallbackTerminalStage)))
+    ) {
+      return malformedSanitizedScan(cancelled, timedOut, observedTimedOutStage);
     }
     const durationMs = boundedCounter(scan.durationMs, LEXICAL_FALLBACK_LIMITS.deadlineMs);
     const filesScanned = boundedCounter(scan.filesScanned, LEXICAL_FALLBACK_LIMITS.maxFiles);
@@ -380,19 +493,16 @@ export function sanitizeLexicalFallbackScan(
       enumeratedPaths === undefined ||
       enumerationBytes === undefined
     ) {
-      return emptySanitizedScan();
+      return malformedSanitizedScan(cancelled, timedOut, observedTimedOutStage);
     }
-    const failClosed = (): LexicalFallbackScanResult => ({
-      ...emptySanitizedScan(!(timedOut || cancelled)),
-      durationMs,
-      filesScanned,
-      bytesScanned,
-      enumeratedPaths,
-      enumerationBytes,
-      capped: !(timedOut || cancelled),
-      timedOut: cancelled ? false : timedOut,
-      cancelled,
-    });
+    const failClosed = (): LexicalFallbackScanResult =>
+      malformedSanitizedScan(cancelled, timedOut, observedTimedOutStage, {
+        durationMs,
+        filesScanned,
+        bytesScanned,
+        enumeratedPaths,
+        enumerationBytes,
+      });
     const resultsInput = scan.results;
     const evidenceInput = scan.fallbackEvidence;
     const conclusiveInput = scan.conclusivePaths;
@@ -515,6 +625,34 @@ export function sanitizeLexicalFallbackScan(
     const fallbackEvidence = retired
       ? []
       : pairedPaths.map((path) => evidenceByPath.get(path) as RepoMapFallbackEvidence);
+    const classified = {
+      results,
+      capped,
+      timedOut: cancelled ? false : timedOut,
+      cancelled,
+    };
+    const terminalReason =
+      (suppliedReason as LexicalFallbackTerminalReason | undefined) ?? inferredTerminalReason(classified);
+    const terminalStage =
+      (suppliedStage as LexicalFallbackTerminalStage | undefined) ?? terminalStageFor(terminalReason);
+    const capReasons = new Set<LexicalFallbackTerminalReason>([
+      "enumeration-path-cap",
+      "enumeration-byte-cap",
+      "source-byte-cap",
+      "file-count-cap",
+      "file-prefix-cap",
+      "invalid-scanner-output",
+    ]);
+    const reasonIsConsistent = cancelled
+      ? terminalReason === "cancelled"
+      : timedOut
+        ? terminalReason === "enumeration-timeout" || terminalReason === "source-timeout"
+        : capped
+          ? capReasons.has(terminalReason) || (paired.size > 0 && terminalReason === "matched")
+          : paired.size > 0
+            ? terminalReason === "matched"
+            : terminalReason === "no-match";
+    if (!reasonIsConsistent || terminalStage !== terminalStageFor(terminalReason)) return failClosed();
     return {
       results,
       fallbackEvidence,
@@ -533,9 +671,11 @@ export function sanitizeLexicalFallbackScan(
       capped,
       timedOut: cancelled ? false : timedOut,
       cancelled,
+      terminalReason,
+      terminalStage,
     };
   } catch {
-    return emptySanitizedScan();
+    return malformedSanitizedScan(observedCancelled, observedTimedOut, observedTimedOutStage);
   }
 }
 
@@ -572,6 +712,86 @@ function queryTerms(query: string): string[] {
   return [...new Set([normalized, ...linkedIdentifierTokens(query).map((term) => term.toLowerCase())])]
     .filter(Boolean)
     .sort((left, right) => right.length - left.length || stablePathCompare(left, right));
+}
+
+function structuredAnchorComponents(token: string): string[] {
+  return token
+    .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/gu, "$1 $2")
+    .split(/[_.\-\s]+/u)
+    .map((component) => component.toLowerCase())
+    .filter(Boolean);
+}
+
+function isDiscriminativeStructuredToken(token: string): boolean {
+  if (token.length < 5) return false;
+  const components = structuredAnchorComponents(token);
+  if (components.some((component) => component.length < 2 && !/^\d+$/u.test(component))) return false;
+  if (token.includes("_") || token.includes(".")) return true;
+  if (token.includes("-")) {
+    // Lowercase natural-language compounds are open-ended prose, not code.
+    return /\d/u.test(token) || /[A-Z]/u.test(token.slice(1));
+  }
+  const uppercase = token.match(/[A-Z]/gu)?.length ?? 0;
+  return /[a-z][A-Z]/u.test(token) || (uppercase >= 2 && /[a-z]/u.test(token));
+}
+
+/**
+ * Structured identifiers are selective enough to justify completed early
+ * success. Anchors nested within the same identifier component sequence form
+ * one family, so a nested or repeated spelling cannot satisfy early completion.
+ */
+export function discriminativeStructuredAnchors(query: string): string[] {
+  const candidates = new Map<string, Set<string>>();
+  for (const match of query.matchAll(/[A-Za-z][A-Za-z0-9]*(?:[_.-][A-Za-z0-9]+)*/gu)) {
+    const token = match[0];
+    if (!isDiscriminativeStructuredToken(token)) continue;
+    const normalized = token.toLowerCase();
+    candidates.set(normalized, new Set(structuredAnchorComponents(token)));
+  }
+  const anchors: string[] = [];
+  const admittedFamilies: string[][] = [];
+  const containsComponents = (outer: readonly string[], inner: readonly string[]): boolean => {
+    if (inner.length > outer.length) return false;
+    return outer.some((_, offset) => inner.every((component, index) => outer[offset + index] === component));
+  };
+  for (const [anchor, components] of [...candidates].sort(
+    ([left], [right]) => right.length - left.length || stablePathCompare(left, right),
+  )) {
+    const orderedComponents = [...components];
+    if (admittedFamilies.some((family) => containsComponents(family, orderedComponents))) continue;
+    anchors.push(anchor);
+    admittedFamilies.push(orderedComponents);
+  }
+  return anchors;
+}
+
+function hasIndependentStrongAnchors(text: string, anchors: readonly string[]): boolean {
+  if (anchors.length < 2) return false;
+  const lowerText = text.toLowerCase();
+  const matchedRanges: Array<{ start: number; end: number }> = [];
+  for (const anchor of anchors) {
+    let offset = 0;
+    while (offset < lowerText.length) {
+      const start = lowerText.indexOf(anchor, offset);
+      if (start < 0) break;
+      const end = start + anchor.length;
+      const before = lowerText[start - 1];
+      const after = lowerText[end];
+      const structuredBoundary = (value: string | undefined) => value !== undefined && /[a-z0-9_.-]/u.test(value);
+      if (
+        !structuredBoundary(before) &&
+        !structuredBoundary(after) &&
+        matchedRanges.every((range) => end <= range.start || start >= range.end)
+      ) {
+        matchedRanges.push({ start, end });
+        break;
+      }
+      offset = start + 1;
+    }
+    if (matchedRanges.length >= 2) return true;
+  }
+  return false;
 }
 
 function scoreCandidate(
@@ -1180,7 +1400,7 @@ async function readCandidate(
 }
 
 function boundedLexicalFallbackLimits(overrides: Partial<LexicalFallbackLimits> | undefined): LexicalFallbackLimits {
-  const limits = { ...LEXICAL_FALLBACK_LIMITS };
+  const limits = { ...LEXICAL_FALLBACK_LIMITS, deadlineMs: LEXICAL_FALLBACK_SCANNER_DEADLINE_MS };
   if (!overrides) return limits;
   for (const key of Object.keys(LEXICAL_FALLBACK_LIMITS) as Array<keyof LexicalFallbackLimits>) {
     const value = overrides[key];
@@ -1198,8 +1418,11 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
   const fileSystem: LexicalFallbackFileSystem = { ...DEFAULT_FILE_SYSTEM, ...options.fileSystem };
   const timeoutController = new AbortController();
   let timedOut = false;
+  let activeStage: "enumeration" | "source" = "enumeration";
+  let timedOutStage: "enumeration" | "source" = "enumeration";
   const timeout = setTimeout(() => {
     timedOut = true;
+    timedOutStage = activeStage;
     timeoutController.abort();
   }, limits.deadlineMs);
   timeout.unref();
@@ -1217,7 +1440,10 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
   let filesScanned = 0;
   let bytesScanned = 0;
   let capped = false;
+  let filePrefixCapped = false;
+  let earlySuccess = false;
   const matches: CandidateMatch[] = [];
+  const strongAnchors = options.candidatePaths === undefined ? discriminativeStructuredAnchors(options.query) : [];
   const conclusivePaths = new Set<string>();
   const unresolvedPaths = new Set<string>();
   const processedPaths = new Set<string>();
@@ -1236,6 +1462,7 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
     const completedEnumeration = await abortRace(enumerationOperation, signal);
     if (completedEnumeration !== ABORTED) enumeration = completedEnumeration;
     capped = enumeration.capped;
+    activeStage = "source";
     for (const path of enumeration.conclusiveExcludedPaths ?? []) conclusivePaths.add(path);
     for (const path of enumeration.unresolvedPaths ?? []) unresolvedPaths.add(path);
     const terms = queryTerms(options.query);
@@ -1279,6 +1506,7 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
         filesScanned += 1;
         bytesScanned += row.bytes;
         capped ||= row.capped;
+        filePrefixCapped ||= row.capped;
         if (row.outcome === "conclusive" || (row.outcome === "text" && !row.capped)) {
           conclusivePaths.add(path);
           unresolvedPaths.delete(path);
@@ -1287,9 +1515,21 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
         }
         if (row.text !== undefined) {
           const match = scoreCandidate(path, row.text, terms, options.query, limits.maxExcerptBytes);
-          if (match) matches.push(match);
+          if (match) {
+            matches.push(match);
+            if (
+              options.candidatePaths === undefined &&
+              match.evidenceKind === "source" &&
+              hasIndependentStrongAnchors(row.text, strongAnchors)
+            ) {
+              earlySuccess = true;
+            }
+          }
         }
       }
+      // Only a wholly settled and safely classified batch may complete early.
+      // This is deliberately disabled for explicit pending candidate paths.
+      if (earlySuccess) break;
     }
   } finally {
     clearTimeout(timeout);
@@ -1324,6 +1564,19 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
     symbols: [],
     dependencies: [],
   }));
+  let terminalReason: LexicalFallbackTerminalReason;
+  if (externallyCancelled || (enumeration.cancelled && !finalTimedOut)) terminalReason = "cancelled";
+  else if (finalTimedOut) terminalReason = timedOutStage === "enumeration" ? "enumeration-timeout" : "source-timeout";
+  else if (earlySuccess) terminalReason = "matched";
+  else if (enumeration.capped) {
+    terminalReason =
+      enumeration.observedPaths >= limits.maxEnumeratedPaths ? "enumeration-path-cap" : "enumeration-byte-cap";
+  } else if (filesScanned >= limits.maxFiles && processedPaths.size < enumeration.paths.length) {
+    terminalReason = "file-count-cap";
+  } else if (bytesScanned >= limits.maxSourceBytes) {
+    terminalReason = "source-byte-cap";
+  } else if (filePrefixCapped) terminalReason = "file-prefix-cap";
+  else terminalReason = ranked.length > 0 ? "matched" : "no-match";
   return {
     results,
     fallbackEvidence: ranked.map((match) => ({
@@ -1348,5 +1601,7 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
     capped: discardEvidence ? false : capped,
     timedOut: finalTimedOut,
     cancelled: externallyCancelled || (enumeration.cancelled && !finalTimedOut),
+    terminalReason,
+    terminalStage: terminalStageFor(terminalReason),
   };
 }

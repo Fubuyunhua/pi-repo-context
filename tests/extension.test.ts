@@ -453,7 +453,13 @@ it("discards malicious timed-out and cancelled warming evidence", async () => {
     };
     expect(result.details.results).toEqual([]);
     expect(result.details.fallbackEvidence).toEqual([
-      { kind: "warming", excerpt: "No lexical match found within the bounded warming scan." },
+      {
+        kind: "warming",
+        excerpt:
+          outcome === "timedOut"
+            ? "Repository initialization exceeded the 250 ms readiness grace. Lexical fallback timed out while reading admitted source."
+            : "Repository initialization exceeded the 250 ms readiness grace. Lexical fallback was cancelled.",
+      },
     ]);
     expect(result.content[0]?.text).not.toContain("privateLateWarmingEvidence");
     const status = (await target.tools.get("repo_context_status")?.execute()) as {
@@ -471,6 +477,72 @@ it("discards malicious timed-out and cancelled warming evidence", async () => {
     start.resolve();
   }
 });
+
+it.each([
+  [
+    "timeout",
+    false,
+    "Repository initialization exceeded the 250 ms readiness grace. Lexical fallback timed out during repository enumeration.",
+    1,
+    0,
+  ],
+  [
+    "cancellation",
+    true,
+    "Repository initialization exceeded the 250 ms readiness grace. Lexical fallback was cancelled.",
+    0,
+    1,
+  ],
+] as const)(
+  "reports malformed scanner output with terminal %s priority",
+  async (_outcome, cancelled, expectedMessage, timeoutCount, cancelledCount) => {
+    const target = harness();
+    const start = deferred();
+    const controller = fakeController({ start: vi.fn(() => start.promise) });
+    registerRepoContext(target.pi, {
+      resolveProjectState: async () => projectState,
+      loadConfig: async () => config,
+      runtimeFactory: () => controller,
+      initializationWaiter: async () => "timeout",
+      lexicalFallbackScanner: async () =>
+        ({
+          results: "malformed",
+          fallbackEvidence: [{ kind: "source", path: "private/late.ts", excerpt: "must not publish" }],
+          durationMs: 5,
+          filesScanned: 1,
+          bytesScanned: 16,
+          enumeratedPaths: 1,
+          enumerationBytes: 16,
+          matchesReturned: 1,
+          capped: true,
+          timedOut: true,
+          cancelled,
+          terminalReason: "invalid-scanner-output",
+          terminalStage: "enumeration",
+        }) as unknown as LexicalFallbackScanResult,
+    });
+    await target.events.get("session_start")?.[0]({}, headlessContext);
+
+    const result = (await target.tools.get("repo_context_search")?.execute("id", { query: "retired" })) as {
+      content: Array<{ text: string }>;
+      details: { results: unknown[]; fallbackEvidence: Array<{ excerpt: string }> };
+    };
+    expect(result.details.results).toEqual([]);
+    expect(result.details.fallbackEvidence).toEqual([{ kind: "warming", excerpt: expectedMessage }]);
+    expect(result.content[0]?.text).not.toContain("must not publish");
+    const status = (await target.tools.get("repo_context_status")?.execute()) as {
+      details: { telemetry: Record<string, number> };
+    };
+    expect(status.details.telemetry).toMatchObject({
+      lexicalFallbackTimeoutCount: timeoutCount,
+      lexicalFallbackCancelledCount: cancelledCount,
+      lexicalFallbackInvalidOutputCount: 0,
+      lexicalFallbackCappedCount: 0,
+      lexicalFallbackMatchesReturned: 0,
+    });
+    start.resolve();
+  },
+);
 
 it("sanitizes lexical scanner failures, cleans up, and records one terminal outcome", async () => {
   const target = harness();
@@ -492,7 +564,7 @@ it("sanitizes lexical scanner failures, cleans up, and records one terminal outc
     details: { results: unknown[]; fallbackEvidence: Array<{ excerpt: string }> };
   };
   expect(result.details.results).toEqual([]);
-  expect(result.details.fallbackEvidence[0]?.excerpt).toContain("No lexical match found");
+  expect(result.details.fallbackEvidence[0]?.excerpt).toContain("output failed validation");
   expect(result.content[0]?.text).not.toContain("/private/project");
   const status = (await target.tools.get("repo_context_status")?.execute()) as {
     details: { telemetry: Record<string, number> };

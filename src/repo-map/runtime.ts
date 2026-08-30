@@ -955,6 +955,8 @@ export class RepoMapRuntime {
                 capped: false,
                 timedOut: completed.timedOut,
                 cancelled: completed.cancelled,
+                terminalReason: completed.cancelled ? "cancelled" : "source-timeout",
+                terminalStage: completed.cancelled ? "cancelled" : "source",
               }
             : sanitizeLexicalFallbackScan(completed.scan, captured.pendingFiles);
       } catch {
@@ -972,6 +974,8 @@ export class RepoMapRuntime {
           capped: true,
           timedOut: false,
           cancelled: Boolean(options.signal?.aborted),
+          terminalReason: options.signal?.aborted ? "cancelled" : "invalid-scanner-output",
+          terminalStage: options.signal?.aborted ? "cancelled" : "output",
         };
       } finally {
         this.#pendingFallbackControllers.delete(controller);
@@ -984,6 +988,8 @@ export class RepoMapRuntime {
               matchesReturned: 0,
               timedOut: false,
               cancelled: true,
+              terminalReason: "cancelled",
+              terminalStage: "cancelled",
             },
             false,
           ),
@@ -1005,6 +1011,8 @@ export class RepoMapRuntime {
               matchesReturned: 0,
               timedOut: evidenceRetired || scan.cancelled ? false : scan.timedOut,
               cancelled: evidenceRetired || scan.cancelled,
+              terminalReason: evidenceRetired || scan.cancelled ? "cancelled" : scan.terminalReason,
+              terminalStage: evidenceRetired || scan.cancelled ? "cancelled" : scan.terminalStage,
             },
             false,
           ),

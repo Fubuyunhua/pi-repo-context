@@ -17,7 +17,10 @@ waiting for active work; caller Tool cancellation does likewise, and epoch check
 A lexical response is intentionally conservative: lifecycle `warming`, freshness `stale`, generation `0`, unavailable Git
 HEAD/workspace revision, and no pending-file claims. Each result has actual literal query-term support and is paired with
 match-centered source evidence or explicit path-only evidence. No match within the work envelope is reported honestly;
-relevance is never fabricated.
+relevance is never fabricated. In full-repository cold mode only, a safely completed read batch may finish successfully
+before the repository prefix is exhausted when one source candidate contains at least two independent discriminative
+structured query anchors (underscored, dotted, hyphenated, or camel-case identifiers). Generic prose cannot trigger this
+shortcut. Explicit stale-pending candidate scans retain their complete candidate-set behavior.
 
 ## Admission and safety
 
@@ -40,10 +43,15 @@ entry before content is read. Binary, unreadable, disappearing, replaced, and no
 - 512 UTF-8 bytes per match-centered excerpt
 - successful scanner output is revalidated at the caller boundary: at most 20 result/evidence pairs, 4 KiB UTF-8 paths, 512-byte excerpts, eight 256-byte reason fields, and no symbol payload; oversized or malformed output fails closed
 
-The 2,000 ms deadline is independently enforced by the caller wrapper as well as the built-in scanner, so an injected scanner that ignores its signal cannot extend logical return. The logical return deadline and cancellation are hard: filesystem operations and hooks are raced against retirement, and timed-out/cancelled scans publish no evidence. Node/OS operations that cannot be cancelled may continue after logical return; every settlement remains observed, closure of every owned open handle is initiated immediately, and late-opened handles initiate closure when they arrive. Logical return does not claim that OS work or closure has completed. File/path/byte/result limits are hard work limits. Evidence is
+The 2,000 ms deadline is independently enforced by the caller wrapper. The built-in scanner retires at 1,900 ms so its
+normal enumeration/source timeout classification and completed work counters win before that outer fail-safe; an injected
+scanner that ignores its signal still cannot extend logical return. The logical return deadline and cancellation are hard:
+filesystem operations and hooks are raced against retirement, and timed-out/cancelled scans publish no evidence. Node/OS operations that cannot be cancelled may continue after logical return; every settlement remains observed, closure of every owned open handle is initiated immediately, and late-opened handles initiate closure when they arrive. Logical return does not claim that OS work or closure has completed. File/path/byte/result limits are hard work limits. Evidence is
 not guaranteed when a repository has no literal match, a match lies beyond the envelope, or a path/evidence pair cannot fit
 the configured payload minimum. When enumeration reaches a cap, the admitted subset can depend on filesystem directory
-iteration order; ranking within the captured subset remains deterministic.
+iteration order; ranking within the captured subset remains deterministic. Full repository-map construction uses fixed
+eight-file batches and yields to the event loop between batches, retaining enumerated file order, warning order, and snapshot
+semantics while allowing deadline and cancellation tasks to run.
 
 ## Ranking and payload
 
@@ -55,5 +63,6 @@ JSON when needed. It never exceeds `searchMaxBytes`.
 ## Telemetry
 
 Telemetry is aggregate-only. It distinguishes accepted searches, indexed returns, warming-empty returns, fallback attempts,
-used/no-match/capped/timeout/cancelled scans, and aggregate duration/files/bytes/matches. Queries, paths, excerpts, and file
-content are never retained.
+used/no-match/capped/timeout/cancelled scans, aggregate duration/files/bytes/matches, and additive terminal reasons for
+matched, genuine no-match, enumeration/source timeout, enumeration path/byte cap, source byte cap, file count/prefix cap,
+cancellation, and invalid scanner output. Queries, paths, excerpts, and file content are never retained.
