@@ -6,12 +6,41 @@ import { promisify } from "node:util";
 import { expect, it, vi } from "vitest";
 import {
   LEXICAL_FALLBACK_LIMITS,
+  LEXICAL_FALLBACK_OUTPUT_LIMITS,
   type LexicalFallbackFileSystem,
   type LexicalFallbackOperationStage,
+  normalizeLexicalFallbackPath,
+  sanitizeLexicalFallbackScan,
   scanLexicalFallback,
 } from "../src/repo-map/lexical-fallback.js";
 
 const execFileAsync = promisify(execFile);
+
+const successfulScan = {
+  results: [
+    {
+      path: "src/needle.ts",
+      score: 10,
+      kind: "lexical" as const,
+      matchedSymbols: [],
+      matchReasons: ["pending lexical fallback: exact query"],
+      symbols: [],
+      dependencies: [],
+    },
+  ],
+  fallbackEvidence: [{ kind: "source" as const, path: "src/needle.ts", excerpt: "needle" }],
+  conclusivePaths: ["src/needle.ts"],
+  unresolvedPaths: [],
+  durationMs: 1,
+  filesScanned: 1,
+  bytesScanned: 6,
+  enumeratedPaths: 1,
+  enumerationBytes: 14,
+  matchesReturned: 1,
+  capped: false,
+  timedOut: false,
+  cancelled: false,
+};
 
 function deferred<T = void>() {
   let resolvePromise!: (value: T | PromiseLike<T>) => void;
@@ -22,6 +51,56 @@ function deferred<T = void>() {
   });
   return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
+
+it("rejects drive-qualified and escaping lexical paths on every host", () => {
+  expect(normalizeLexicalFallbackPath("src\\safe.ts")).toBe("src/safe.ts");
+  expect(normalizeLexicalFallbackPath("./src/safe.ts")).toBe("src/safe.ts");
+  for (const path of [
+    "C:/secret.ts",
+    "d:\\secret.ts",
+    "C:secret.ts",
+    "/secret.ts",
+    "../secret.ts",
+    "src/../secret.ts",
+  ]) {
+    expect(normalizeLexicalFallbackPath(path)).toBeUndefined();
+  }
+});
+
+it("sanitizes injected scan output and fails closed for hostile arrays and getters", () => {
+  const sanitized = sanitizeLexicalFallbackScan(
+    {
+      ...successfulScan,
+      results: [{ ...successfulScan.results[0], path: ".\\src\\needle.ts", score: Number.MAX_VALUE }],
+      fallbackEvidence: [
+        {
+          ...successfulScan.fallbackEvidence[0],
+          path: "./src/needle.ts",
+          excerpt: "x".repeat(LEXICAL_FALLBACK_OUTPUT_LIMITS.maxExcerptBytes * 4),
+        },
+      ],
+    },
+    ["src/needle.ts"],
+  );
+  expect(sanitized.results).toMatchObject([{ path: "src/needle.ts", score: 1_000_000 }]);
+  expect(Buffer.byteLength(sanitized.fallbackEvidence[0]?.excerpt ?? "", "utf8")).toBeLessThanOrEqual(
+    LEXICAL_FALLBACK_OUTPUT_LIMITS.maxExcerptBytes,
+  );
+
+  const wrongCandidate = sanitizeLexicalFallbackScan(successfulScan, ["src/other.ts"]);
+  expect(wrongCandidate).toMatchObject({ results: [], fallbackEvidence: [], capped: true });
+  const huge = sanitizeLexicalFallbackScan({
+    ...successfulScan,
+    results: new Array(LEXICAL_FALLBACK_OUTPUT_LIMITS.maxResults + 1).fill(successfulScan.results[0]),
+  });
+  expect(huge).toMatchObject({ results: [], fallbackEvidence: [], capped: true });
+  const hostile = Object.defineProperty({ ...successfulScan }, "results", {
+    get() {
+      throw new Error("hostile getter");
+    },
+  });
+  expect(sanitizeLexicalFallbackScan(hostile)).toMatchObject({ results: [], fallbackEvidence: [], capped: true });
+});
 
 it("ranks linked dotted, underscored, and path terms with match-centered bounded excerpts", async () => {
   const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-"));
@@ -274,6 +353,97 @@ it("keeps explicit candidate reads within the configured concurrency", async () 
   });
   expect(result.filesScanned).toBe(6);
   expect(maximum).toBe(2);
+});
+
+it("clamps malformed limit overrides to finite production-safe integers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-limit-table-"));
+  await writeFile(join(root, "candidate.ts"), "limitValidationNeedle\n");
+  const keys = Object.keys(LEXICAL_FALLBACK_LIMITS) as Array<keyof typeof LEXICAL_FALLBACK_LIMITS>;
+  const cases = [
+    ["zero", 0],
+    ["negative", -10],
+    ["NaN", Number.NaN],
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["fractional", 1.5],
+    ["oversized", Number.MAX_SAFE_INTEGER],
+  ] as const;
+
+  for (const [label, value] of cases) {
+    const limits = Object.fromEntries(keys.map((key) => [key, value]));
+    const result = await Promise.race([
+      scanLexicalFallback({
+        projectRoot: root,
+        query: "limitValidationNeedle",
+        candidatePaths: ["candidate.ts"],
+        limits,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`${label} limits did not terminate`)), 1_000),
+      ),
+    ]);
+    for (const count of [
+      result.filesScanned,
+      result.bytesScanned,
+      result.enumeratedPaths,
+      result.enumerationBytes,
+      result.matchesReturned,
+    ]) {
+      expect(Number.isSafeInteger(count), label).toBe(true);
+      expect(count, label).toBeGreaterThanOrEqual(0);
+    }
+    expect(result.filesScanned, label).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxFiles);
+    expect(result.bytesScanned, label).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxSourceBytes);
+    expect(result.enumeratedPaths, label).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxEnumeratedPaths);
+    expect(result.enumerationBytes, label).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxEnumerationBytes);
+    expect(result.matchesReturned, label).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxResults);
+  }
+});
+
+it("treats concurrency zero as one and returns promptly", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-zero-concurrency-"));
+  await writeFile(join(root, "candidate.ts"), "zeroConcurrencyNeedle\n");
+  const result = await Promise.race([
+    scanLexicalFallback({
+      projectRoot: root,
+      query: "zeroConcurrencyNeedle",
+      candidatePaths: ["candidate.ts"],
+      limits: { concurrency: 0 },
+    }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("zero concurrency starved")), 1_000)),
+  ]);
+  expect(result.filesScanned).toBe(1);
+  expect(result.results[0]?.path).toBe("candidate.ts");
+});
+
+it("keeps oversized overrides within production concurrency, result, and excerpt caps", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-production-caps-"));
+  const candidatePaths = Array.from({ length: LEXICAL_FALLBACK_LIMITS.maxResults + 4 }, (_, index) => `${index}.ts`);
+  await Promise.all(
+    candidatePaths.map((path) => writeFile(join(root, path), `productionCapsNeedle ${"x".repeat(1_024)}\n`)),
+  );
+  let active = 0;
+  let maximum = 0;
+  const keys = Object.keys(LEXICAL_FALLBACK_LIMITS) as Array<keyof typeof LEXICAL_FALLBACK_LIMITS>;
+  const result = await scanLexicalFallback({
+    projectRoot: root,
+    query: "productionCapsNeedle",
+    limit: Number.MAX_SAFE_INTEGER,
+    candidatePaths,
+    limits: Object.fromEntries(keys.map((key) => [key, Number.MAX_SAFE_INTEGER])),
+    beforeOpen: async () => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 2));
+      active -= 1;
+    },
+  });
+  expect(maximum).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.concurrency);
+  expect(result.results).toHaveLength(LEXICAL_FALLBACK_LIMITS.maxResults);
+  expect(
+    result.fallbackEvidence.every(
+      (evidence) => Buffer.byteLength(evidence.excerpt, "utf8") <= LEXICAL_FALLBACK_LIMITS.maxExcerptBytes,
+    ),
+  ).toBe(true);
 });
 
 it("rejects deleted, non-regular, binary, and unreadable explicit candidates", async () => {

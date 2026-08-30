@@ -273,6 +273,79 @@ it("shares lazy initialization and returns deterministic warming evidence when t
   expect(controller.query).toHaveBeenCalledOnce();
 });
 
+it("hard-times out a warming scanner that ignores its signal and never settles", async () => {
+  vi.useFakeTimers();
+  try {
+    const target = harness();
+    const start = deferred();
+    const controller = fakeController({ start: vi.fn(() => start.promise) });
+    const lexicalFallbackScanner = vi.fn(() => new Promise<LexicalFallbackScanResult>(() => {}));
+    registerRepoContext(target.pi, {
+      resolveProjectState: async () => projectState,
+      loadConfig: async () => config,
+      runtimeFactory: () => controller,
+      initializationWaiter: async () => "timeout",
+      lexicalFallbackScanner,
+    });
+    await target.events.get("session_start")?.[0]({}, headlessContext);
+    const search = target.tools.get("repo_context_search")?.execute("id", { query: "deadline" }) as Promise<{
+      details: { results: unknown[] };
+    }>;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(lexicalFallbackScanner).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(search).resolves.toMatchObject({ details: { results: [] } });
+    const status = (await target.tools.get("repo_context_status")?.execute()) as {
+      details: { telemetry: Record<string, number> };
+    };
+    expect(status.details.telemetry).toMatchObject({
+      lexicalFallbackAttemptCount: 1,
+      lexicalFallbackTimeoutCount: 1,
+      lexicalFallbackCancelledCount: 0,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("promptly retires a never-settling warming scanner on caller cancellation", async () => {
+  const target = harness();
+  const start = deferred();
+  const controller = fakeController({ start: vi.fn(() => start.promise) });
+  let scanSignal: AbortSignal | undefined;
+  const lexicalFallbackScanner = vi.fn(
+    (options: { signal?: AbortSignal }) =>
+      new Promise<LexicalFallbackScanResult>(() => {
+        scanSignal = options.signal;
+      }),
+  );
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: () => controller,
+    initializationWaiter: async () => "timeout",
+    lexicalFallbackScanner,
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+  const caller = new AbortController();
+  const search = target.tools
+    .get("repo_context_search")
+    ?.execute("id", { query: "cancel" }, caller.signal) as Promise<unknown>;
+  await vi.waitFor(() => expect(lexicalFallbackScanner).toHaveBeenCalledOnce());
+  caller.abort();
+  await expect(search).rejects.toMatchObject({ name: "AbortError" });
+  expect(scanSignal?.aborted).toBe(true);
+  const status = (await target.tools.get("repo_context_status")?.execute()) as {
+    details: { telemetry: Record<string, number> };
+  };
+  expect(status.details.telemetry).toMatchObject({
+    lexicalFallbackAttemptCount: 1,
+    lexicalFallbackCancelledCount: 1,
+    lexicalFallbackTimeoutCount: 0,
+  });
+});
+
 it("returns relevant same-call lexical evidence after the existing warming grace", async () => {
   const target = harness();
   const start = deferred();
@@ -428,6 +501,57 @@ it("sanitizes lexical scanner failures, cleans up, and records one terminal outc
     lexicalFallbackAttemptCount: 1,
     lexicalFallbackNoMatchCount: 1,
     warmingEmptyReturnCount: 1,
+  });
+  start.resolve();
+});
+
+it("fails closed and records one terminal outcome for oversized successful warming output", async () => {
+  const target = harness();
+  const start = deferred();
+  const controller = fakeController({ start: vi.fn(() => start.promise) });
+  const row = {
+    path: "src/oversized.ts",
+    score: 1,
+    kind: "lexical" as const,
+    matchedSymbols: [],
+    matchReasons: ["direct lexical fallback: 1 query term"],
+    symbols: [],
+    dependencies: [],
+  };
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: () => controller,
+    initializationWaiter: async () => "timeout",
+    lexicalFallbackScanner: async () => ({
+      results: new Array(21).fill(row),
+      fallbackEvidence: [{ kind: "source", path: row.path, excerpt: "must-not-return" }],
+      durationMs: 1,
+      filesScanned: 1,
+      bytesScanned: 1,
+      enumeratedPaths: 1,
+      enumerationBytes: 1,
+      matchesReturned: 21,
+      capped: false,
+      timedOut: false,
+      cancelled: false,
+    }),
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+  const result = (await target.tools.get("repo_context_search")?.execute("id", { query: "oversized" })) as {
+    content: Array<{ text: string }>;
+    details: { results: unknown[] };
+  };
+  expect(result.details.results).toEqual([]);
+  expect(result.content[0]?.text).not.toContain("must-not-return");
+  const status = (await target.tools.get("repo_context_status")?.execute()) as {
+    details: { telemetry: Record<string, number> };
+  };
+  expect(status.details.telemetry).toMatchObject({
+    lexicalFallbackAttemptCount: 1,
+    lexicalFallbackCappedCount: 1,
+    lexicalFallbackUsedCount: 0,
+    lexicalFallbackNoMatchCount: 0,
   });
   start.resolve();
 });

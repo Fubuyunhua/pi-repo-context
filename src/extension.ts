@@ -3,8 +3,11 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { Type } from "typebox";
 import type { RepoMapQueryResult } from "./repo-map/index.js";
 import {
+  LEXICAL_FALLBACK_LIMITS,
   type LexicalFallbackOptions,
   type LexicalFallbackScanResult,
+  runBoundedLexicalFallbackScan,
+  sanitizeLexicalFallbackScan,
   scanLexicalFallback,
 } from "./repo-map/lexical-fallback.js";
 import {
@@ -398,40 +401,6 @@ const defaultInitializationWaiter: RepoContextInitializationWaiter = (initializa
     );
   });
 
-const FALLBACK_SCAN_ABORTED = Symbol("fallback-scan-aborted");
-
-function abortFallbackScan(
-  operation: Promise<LexicalFallbackScanResult>,
-  signal: AbortSignal,
-): Promise<LexicalFallbackScanResult | typeof FALLBACK_SCAN_ABORTED> {
-  if (signal.aborted) {
-    void operation.catch(() => undefined);
-    return Promise.resolve(FALLBACK_SCAN_ABORTED);
-  }
-  return new Promise((resolveScan, rejectScan) => {
-    let retired = false;
-    const cleanup = () => signal.removeEventListener("abort", onAbort);
-    const onAbort = () => {
-      retired = true;
-      cleanup();
-      resolveScan(FALLBACK_SCAN_ABORTED);
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    operation.then(
-      (scan) => {
-        if (retired) return;
-        cleanup();
-        resolveScan(scan);
-      },
-      (error) => {
-        if (retired) return;
-        cleanup();
-        rejectScan(error);
-      },
-    );
-  });
-}
-
 export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoContextOptions = {}): void {
   const configLoader = options.loadConfig ?? loadConfig;
   const stateResolver = options.resolveProjectState ?? resolveProjectState;
@@ -615,28 +584,35 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
           target.fallbackControllers.add(controller);
           let scan = emptyFallbackScan();
           try {
-            const scanPromise = lexicalFallbackScanner({
-              projectRoot: target.state.projectRoot,
-              query: params.query,
-              ...(params.limit === undefined ? {} : { limit: params.limit }),
-              exclude: target.config?.excludePatterns ?? [],
-              signal: controller.signal,
-            });
-            const boundedScan = abortFallbackScan(scanPromise, controller.signal);
+            const boundedScan = runBoundedLexicalFallbackScan(
+              (scanSignal) =>
+                lexicalFallbackScanner({
+                  projectRoot: target.state?.projectRoot ?? "",
+                  query: params.query,
+                  ...(params.limit === undefined ? {} : { limit: params.limit }),
+                  exclude: target.config?.excludePatterns ?? [],
+                  signal: scanSignal,
+                }),
+              signal ? [controller.signal, signal] : [controller.signal],
+              LEXICAL_FALLBACK_LIMITS.deadlineMs,
+            );
             const race = readiness
               ? await Promise.race([
-                  boundedScan.then((result) => ({ kind: "scan" as const, scan: result })),
+                  boundedScan.then((result) => ({ kind: "scan" as const, result })),
                   readiness.then(() => ({ kind: "initialized" as const })),
                 ])
-              : { kind: "scan" as const, scan: await boundedScan };
+              : { kind: "scan" as const, result: await boundedScan };
             if (race.kind === "initialized") {
               controller.abort();
               scan = emptyFallbackScan(true);
             } else {
               scan =
-                race.scan === FALLBACK_SCAN_ABORTED
-                  ? emptyFallbackScan(true)
-                  : (race.scan as LexicalFallbackScanResult);
+                race.result.status === "retired"
+                  ? {
+                      ...emptyFallbackScan(race.result.cancelled),
+                      timedOut: race.result.timedOut,
+                    }
+                  : sanitizeLexicalFallbackScan(race.result.scan);
             }
           } catch {
             controller.abort();
@@ -655,6 +631,10 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
               matchesReturned: 0,
               timedOut: scan.cancelled ? false : scan.timedOut,
             };
+          }
+          if (signal?.aborted) {
+            target.telemetry.recordLexicalFallback({ ...scan, timedOut: false, cancelled: true }, false);
+            throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
           }
           if (!isCurrent(target)) {
             target.telemetry.recordLexicalFallback(

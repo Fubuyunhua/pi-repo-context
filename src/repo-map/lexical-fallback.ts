@@ -36,6 +36,17 @@ export const LEXICAL_FALLBACK_LIMITS: Readonly<LexicalFallbackLimits> = Object.f
   maxExcerptBytes: 512,
 });
 
+/** Hard limits applied again at the trust boundary for injected scanner output. */
+export const LEXICAL_FALLBACK_OUTPUT_LIMITS = Object.freeze({
+  maxResults: LEXICAL_FALLBACK_LIMITS.maxResults,
+  maxEvidence: LEXICAL_FALLBACK_LIMITS.maxResults,
+  maxClassificationPaths: LEXICAL_FALLBACK_LIMITS.maxEnumeratedPaths,
+  maxPathBytes: 4 * 1024,
+  maxExcerptBytes: LEXICAL_FALLBACK_LIMITS.maxExcerptBytes,
+  maxReasonFields: 8,
+  maxReasonBytes: 256,
+});
+
 export type LexicalFallbackOperationStage =
   | "directory-open"
   | "directory-read"
@@ -64,6 +75,7 @@ export interface LexicalFallbackOptions {
   limit?: number;
   exclude?: string[];
   signal?: AbortSignal;
+  /** Test-only bounded overrides. Values can only reduce production limits. */
   limits?: Partial<LexicalFallbackLimits>;
   /**
    * An explicit, bounded path set. This mode is used by a live stale query and
@@ -123,6 +135,45 @@ interface CandidateMatch {
   exact: boolean;
   evidenceKind: "source" | "warming";
   excerpt: string;
+}
+
+export type BoundedLexicalFallbackCompletion =
+  | { status: "completed"; scan: unknown }
+  | { status: "retired"; timedOut: boolean; cancelled: boolean };
+
+/**
+ * Give even an injected scanner that ignores its signal a hard logical deadline.
+ * The scanner promise is always observed after retirement; this does not claim
+ * that native work has physically stopped.
+ */
+export async function runBoundedLexicalFallbackScan(
+  start: (signal: AbortSignal) => Promise<unknown>,
+  signals: readonly AbortSignal[] = [],
+  deadlineMs = LEXICAL_FALLBACK_LIMITS.deadlineMs,
+): Promise<BoundedLexicalFallbackCompletion> {
+  const timeoutController = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    timeoutController.abort();
+  }, deadlineMs);
+  timeout.unref();
+  const signal =
+    signals.length > 0 ? AbortSignal.any([...signals, timeoutController.signal]) : timeoutController.signal;
+  const operation = Promise.resolve().then(() => start(signal));
+  try {
+    const completed = await abortRace(operation, signal);
+    if (completed === ABORTED) {
+      return {
+        status: "retired",
+        timedOut: timedOut && !signals.some((candidate) => candidate.aborted),
+        cancelled: signals.some((candidate) => candidate.aborted),
+      };
+    }
+    return { status: "completed", scan: completed };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 const ABORTED = Symbol("lexical-fallback-aborted");
@@ -237,16 +288,255 @@ function stablePathCompare(left: string, right: string): number {
   return left === right ? 0 : left < right ? -1 : 1;
 }
 
-function safeRelativePath(path: string): boolean {
-  return Boolean(path) && !path.startsWith("/") && !path.split("/").some((segment) => segment === "..");
+const WINDOWS_DRIVE_PATH = /^[a-zA-Z]:/u;
+
+/** Platform-neutral lexical containment for scanner candidates and output. */
+export function normalizeLexicalFallbackPath(value: string): string | undefined {
+  if (!value || value.length > LEXICAL_FALLBACK_OUTPUT_LIMITS.maxPathBytes) return undefined;
+  let path = value.replaceAll("\\", "/");
+  while (path.startsWith("./")) path = path.slice(2);
+  if (!path || path.startsWith("/") || WINDOWS_DRIVE_PATH.test(path) || path.includes("\0")) return undefined;
+  const segments = path.split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) return undefined;
+  if (Buffer.byteLength(path, "utf8") > LEXICAL_FALLBACK_OUTPUT_LIMITS.maxPathBytes) return undefined;
+  return segments.join("/");
+}
+
+export function safeRelativePath(path: string): boolean {
+  return normalizeLexicalFallbackPath(path) === path;
 }
 
 function utf8Prefix(value: string, maxBytes: number): string {
-  const bytes = Buffer.from(value, "utf8");
-  if (bytes.byteLength <= maxBytes) return value;
+  // Slice code units before encoding so a hostile huge string cannot force an
+  // equally huge temporary allocation merely to enforce the byte limit.
+  const prefix = value.slice(0, maxBytes);
+  const bytes = Buffer.from(prefix, "utf8");
+  if (bytes.byteLength <= maxBytes) return prefix;
   let end = Math.max(0, maxBytes);
   while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
   return bytes.subarray(0, end).toString("utf8");
+}
+
+function emptySanitizedScan(capped = true): LexicalFallbackScanResult {
+  return {
+    results: [],
+    fallbackEvidence: [],
+    conclusivePaths: [],
+    unresolvedPaths: [],
+    durationMs: 0,
+    filesScanned: 0,
+    bytesScanned: 0,
+    enumeratedPaths: 0,
+    enumerationBytes: 0,
+    matchesReturned: 0,
+    capped,
+    timedOut: false,
+    cancelled: false,
+  };
+}
+
+function boundedStringArray(value: unknown, maxEntries: number): string[] | undefined {
+  if (!Array.isArray(value) || value.length > maxEntries) return undefined;
+  const strings: string[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const entry = value[index];
+    if (typeof entry !== "string") return undefined;
+    strings.push(utf8Prefix(entry, LEXICAL_FALLBACK_OUTPUT_LIMITS.maxReasonBytes));
+  }
+  return strings;
+}
+
+function boundedCounter(value: unknown, maximum: number): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+  return Math.min(maximum, Math.floor(value));
+}
+
+/**
+ * Treat scanner implementations as an untrusted boundary. Malformed accessors,
+ * oversized arrays, escaping paths, and unpaired evidence all fail closed.
+ */
+export function sanitizeLexicalFallbackScan(
+  input: unknown,
+  candidatePaths?: readonly string[],
+): LexicalFallbackScanResult {
+  try {
+    if (typeof input !== "object" || input === null || Array.isArray(input)) return emptySanitizedScan();
+    const scan = input as Record<string, unknown>;
+    const timedOut = scan.timedOut;
+    const cancelled = scan.cancelled;
+    const capped = scan.capped;
+    if (typeof timedOut !== "boolean" || typeof cancelled !== "boolean" || typeof capped !== "boolean") {
+      return emptySanitizedScan();
+    }
+    const durationMs = boundedCounter(scan.durationMs, LEXICAL_FALLBACK_LIMITS.deadlineMs);
+    const filesScanned = boundedCounter(scan.filesScanned, LEXICAL_FALLBACK_LIMITS.maxFiles);
+    const bytesScanned = boundedCounter(scan.bytesScanned, LEXICAL_FALLBACK_LIMITS.maxSourceBytes);
+    const enumeratedPaths = boundedCounter(scan.enumeratedPaths, LEXICAL_FALLBACK_LIMITS.maxEnumeratedPaths);
+    const enumerationBytes = boundedCounter(scan.enumerationBytes, LEXICAL_FALLBACK_LIMITS.maxEnumerationBytes);
+    if (
+      durationMs === undefined ||
+      filesScanned === undefined ||
+      bytesScanned === undefined ||
+      enumeratedPaths === undefined ||
+      enumerationBytes === undefined
+    ) {
+      return emptySanitizedScan();
+    }
+    const failClosed = (): LexicalFallbackScanResult => ({
+      ...emptySanitizedScan(!(timedOut || cancelled)),
+      durationMs,
+      filesScanned,
+      bytesScanned,
+      enumeratedPaths,
+      enumerationBytes,
+      capped: !(timedOut || cancelled),
+      timedOut: cancelled ? false : timedOut,
+      cancelled,
+    });
+    const resultsInput = scan.results;
+    const evidenceInput = scan.fallbackEvidence;
+    const conclusiveInput = scan.conclusivePaths;
+    const unresolvedInput = scan.unresolvedPaths;
+    if (
+      !Array.isArray(resultsInput) ||
+      resultsInput.length > LEXICAL_FALLBACK_OUTPUT_LIMITS.maxResults ||
+      !Array.isArray(evidenceInput) ||
+      evidenceInput.length > LEXICAL_FALLBACK_OUTPUT_LIMITS.maxEvidence ||
+      (conclusiveInput !== undefined &&
+        (!Array.isArray(conclusiveInput) ||
+          conclusiveInput.length > LEXICAL_FALLBACK_OUTPUT_LIMITS.maxClassificationPaths)) ||
+      (unresolvedInput !== undefined &&
+        (!Array.isArray(unresolvedInput) ||
+          unresolvedInput.length > LEXICAL_FALLBACK_OUTPUT_LIMITS.maxClassificationPaths))
+    ) {
+      return failClosed();
+    }
+
+    let candidates: Set<string> | undefined;
+    if (candidatePaths !== undefined) {
+      candidates = new Set<string>();
+      let candidateBytes = 0;
+      for (let index = 0; index < candidatePaths.length; index += 1) {
+        if (index >= LEXICAL_FALLBACK_LIMITS.maxEnumeratedPaths) break;
+        const path = normalizeLexicalFallbackPath(candidatePaths[index] as string);
+        if (!path) continue;
+        const pathBytes = Buffer.byteLength(path, "utf8") + 1;
+        if (candidateBytes + pathBytes > LEXICAL_FALLBACK_LIMITS.maxEnumerationBytes) break;
+        candidateBytes += pathBytes;
+        candidates.add(path);
+      }
+    }
+    const admitPath = (value: unknown): string | undefined => {
+      if (typeof value !== "string") return undefined;
+      const path = normalizeLexicalFallbackPath(value);
+      if (!path || (candidates && !candidates.has(path))) return undefined;
+      return path;
+    };
+
+    const evidenceByPath = new Map<string, RepoMapFallbackEvidence>();
+    for (let index = 0; index < evidenceInput.length; index += 1) {
+      const value = evidenceInput[index];
+      if (typeof value !== "object" || value === null || Array.isArray(value)) return failClosed();
+      const evidence = value as Record<string, unknown>;
+      const path = admitPath(evidence.path);
+      if (
+        !path ||
+        (evidence.kind !== "source" && evidence.kind !== "warming") ||
+        typeof evidence.excerpt !== "string"
+      ) {
+        return failClosed();
+      }
+      evidenceByPath.set(path, {
+        kind: evidence.kind,
+        path,
+        excerpt: utf8Prefix(evidence.excerpt, LEXICAL_FALLBACK_OUTPUT_LIMITS.maxExcerptBytes),
+      });
+    }
+
+    const resultsByPath = new Map<string, RepoMapQueryResult>();
+    for (let index = 0; index < resultsInput.length; index += 1) {
+      const value = resultsInput[index];
+      if (typeof value !== "object" || value === null || Array.isArray(value)) return failClosed();
+      const result = value as Record<string, unknown>;
+      const path = admitPath(result.path);
+      const matchedSymbols = boundedStringArray(result.matchedSymbols, LEXICAL_FALLBACK_OUTPUT_LIMITS.maxReasonFields);
+      const matchReasons =
+        result.matchReasons === undefined
+          ? []
+          : boundedStringArray(result.matchReasons, LEXICAL_FALLBACK_OUTPUT_LIMITS.maxReasonFields);
+      const dependencies = boundedStringArray(result.dependencies, LEXICAL_FALLBACK_OUTPUT_LIMITS.maxReasonFields);
+      if (
+        !path ||
+        !evidenceByPath.has(path) ||
+        typeof result.score !== "number" ||
+        !Number.isFinite(result.score) ||
+        result.kind !== "lexical" ||
+        !matchedSymbols ||
+        !matchReasons ||
+        !dependencies ||
+        !Array.isArray(result.symbols) ||
+        result.symbols.length !== 0
+      ) {
+        return failClosed();
+      }
+      resultsByPath.set(path, {
+        path,
+        score: Math.max(-1_000_000, Math.min(1_000_000, result.score)),
+        kind: "lexical",
+        matchedSymbols,
+        ...(matchReasons.length > 0 ? { matchReasons } : {}),
+        symbols: [],
+        dependencies,
+      });
+    }
+
+    const pairedPaths = [...resultsByPath.keys()].filter((path) => evidenceByPath.has(path));
+    const paired = new Set(pairedPaths);
+    const classification = (value: unknown): string[] | undefined => {
+      if (value === undefined) return [];
+      if (!Array.isArray(value)) return undefined;
+      const paths: string[] = [];
+      let pathBytes = 0;
+      for (let index = 0; index < value.length; index += 1) {
+        const path = admitPath(value[index]);
+        if (!path) return undefined;
+        pathBytes += Buffer.byteLength(path, "utf8") + 1;
+        if (pathBytes > LEXICAL_FALLBACK_LIMITS.maxEnumerationBytes) return undefined;
+        paths.push(path);
+      }
+      return [...new Set(paths)].sort(stablePathCompare);
+    };
+    const conclusivePaths = classification(conclusiveInput);
+    const unresolvedPaths = classification(unresolvedInput);
+    if (!conclusivePaths || !unresolvedPaths) return failClosed();
+
+    const retired = timedOut || cancelled;
+    const results = retired ? [] : pairedPaths.map((path) => resultsByPath.get(path) as RepoMapQueryResult);
+    const fallbackEvidence = retired
+      ? []
+      : pairedPaths.map((path) => evidenceByPath.get(path) as RepoMapFallbackEvidence);
+    return {
+      results,
+      fallbackEvidence,
+      ...(candidatePaths === undefined
+        ? {}
+        : {
+            conclusivePaths: retired ? [] : conclusivePaths,
+            unresolvedPaths: retired ? [...(candidates ?? [])].sort(stablePathCompare) : unresolvedPaths,
+          }),
+      durationMs,
+      filesScanned,
+      bytesScanned,
+      enumeratedPaths,
+      enumerationBytes,
+      matchesReturned: retired ? 0 : paired.size,
+      capped,
+      timedOut: cancelled ? false : timedOut,
+      cancelled,
+    };
+  } catch {
+    return emptySanitizedScan();
+  }
 }
 
 function matchCenteredExcerpt(text: string, matchIndex: number, matchLength: number, maxBytes: number): string {
@@ -889,10 +1179,22 @@ async function readCandidate(
   }
 }
 
+function boundedLexicalFallbackLimits(overrides: Partial<LexicalFallbackLimits> | undefined): LexicalFallbackLimits {
+  const limits = { ...LEXICAL_FALLBACK_LIMITS };
+  if (!overrides) return limits;
+  for (const key of Object.keys(LEXICAL_FALLBACK_LIMITS) as Array<keyof LexicalFallbackLimits>) {
+    const value = overrides[key];
+    if (typeof value !== "number" || !Number.isFinite(value)) continue;
+    const minimum = key === "deadlineMs" || key === "concurrency" ? 1 : 0;
+    limits[key] = Math.min(LEXICAL_FALLBACK_LIMITS[key], Math.max(minimum, Math.floor(value)));
+  }
+  return limits;
+}
+
 /** A read-only, bounded scanner used only while the coherent repository index is warming. */
 export async function scanLexicalFallback(options: LexicalFallbackOptions): Promise<LexicalFallbackScanResult> {
   const started = Date.now();
-  const limits = { ...LEXICAL_FALLBACK_LIMITS, ...options.limits };
+  const limits = boundedLexicalFallbackLimits(options.limits);
   const fileSystem: LexicalFallbackFileSystem = { ...DEFAULT_FILE_SYSTEM, ...options.fileSystem };
   const timeoutController = new AbortController();
   let timedOut = false;

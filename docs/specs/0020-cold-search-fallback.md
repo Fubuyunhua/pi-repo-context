@@ -12,7 +12,7 @@ the same Tool call runs a direct, read-only lexical repository scan while full i
 
 If initialization finishes during the scan, the scan is aborted and discarded and the coherent indexed query wins. A
 settled startup failure remains a sanitized hard unavailable error. Session replacement and shutdown abort scans before
-waiting for active work; epoch checks prevent evidence from a retired project from being returned.
+waiting for active work; caller Tool cancellation does likewise, and epoch checks prevent evidence from a retired project from being returned.
 
 A lexical response is intentionally conservative: lifecycle `warming`, freshness `stale`, generation `0`, unavailable Git
 HEAD/workspace revision, and no pending-file claims. Each result has actual literal query-term support and is paired with
@@ -38,8 +38,9 @@ entry before content is read. Binary, unreadable, disappearing, replaced, and no
 - 512 KiB per file, four concurrent reads
 - at most `min(requested limit, 20)` results
 - 512 UTF-8 bytes per match-centered excerpt
+- successful scanner output is revalidated at the caller boundary: at most 20 result/evidence pairs, 4 KiB UTF-8 paths, 512-byte excerpts, eight 256-byte reason fields, and no symbol payload; oversized or malformed output fails closed
 
-The logical return deadline and cancellation are hard: filesystem operations and hooks are raced against retirement, and timed-out/cancelled scans publish no evidence. Node/OS operations that cannot be cancelled may continue after logical return; every settlement remains observed, closure of every owned open handle is initiated immediately, and late-opened handles initiate closure when they arrive. Logical return does not claim that OS work or closure has completed. File/path/byte/result limits are hard work limits. Evidence is
+The 2,000 ms deadline is independently enforced by the caller wrapper as well as the built-in scanner, so an injected scanner that ignores its signal cannot extend logical return. The logical return deadline and cancellation are hard: filesystem operations and hooks are raced against retirement, and timed-out/cancelled scans publish no evidence. Node/OS operations that cannot be cancelled may continue after logical return; every settlement remains observed, closure of every owned open handle is initiated immediately, and late-opened handles initiate closure when they arrive. Logical return does not claim that OS work or closure has completed. File/path/byte/result limits are hard work limits. Evidence is
 not guaranteed when a repository has no literal match, a match lies beyond the envelope, or a path/evidence pair cannot fit
 the configured payload minimum. When enumeration reaches a cap, the admitted subset can depend on filesystem directory
 iteration order; ranking within the captured subset remains deterministic.
