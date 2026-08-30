@@ -3,8 +3,11 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { Type } from "typebox";
 import type { RepoMapQueryResult } from "./repo-map/index.js";
 import {
+  LEXICAL_FALLBACK_LIMITS,
   type LexicalFallbackOptions,
   type LexicalFallbackScanResult,
+  runBoundedLexicalFallbackScan,
+  sanitizeLexicalFallbackScan,
   scanLexicalFallback,
 } from "./repo-map/lexical-fallback.js";
 import {
@@ -581,24 +584,35 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
           target.fallbackControllers.add(controller);
           let scan = emptyFallbackScan();
           try {
-            const scanPromise = lexicalFallbackScanner({
-              projectRoot: target.state.projectRoot,
-              query: params.query,
-              ...(params.limit === undefined ? {} : { limit: params.limit }),
-              exclude: target.config?.excludePatterns ?? [],
-              signal: controller.signal,
-            });
+            const boundedScan = runBoundedLexicalFallbackScan(
+              (scanSignal) =>
+                lexicalFallbackScanner({
+                  projectRoot: target.state?.projectRoot ?? "",
+                  query: params.query,
+                  ...(params.limit === undefined ? {} : { limit: params.limit }),
+                  exclude: target.config?.excludePatterns ?? [],
+                  signal: scanSignal,
+                }),
+              signal ? [controller.signal, signal] : [controller.signal],
+              LEXICAL_FALLBACK_LIMITS.deadlineMs,
+            );
             const race = readiness
               ? await Promise.race([
-                  scanPromise.then((result) => ({ kind: "scan" as const, scan: result })),
+                  boundedScan.then((result) => ({ kind: "scan" as const, result })),
                   readiness.then(() => ({ kind: "initialized" as const })),
                 ])
-              : { kind: "scan" as const, scan: await scanPromise };
+              : { kind: "scan" as const, result: await boundedScan };
             if (race.kind === "initialized") {
               controller.abort();
-              scan = await scanPromise.catch(() => emptyFallbackScan(true));
+              scan = emptyFallbackScan(true);
             } else {
-              scan = race.scan;
+              scan =
+                race.result.status === "retired"
+                  ? {
+                      ...emptyFallbackScan(race.result.cancelled),
+                      timedOut: race.result.timedOut,
+                    }
+                  : sanitizeLexicalFallbackScan(race.result.scan);
             }
           } catch {
             controller.abort();
@@ -609,8 +623,24 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
           } finally {
             target.fallbackControllers.delete(controller);
           }
+          if (scan.cancelled || scan.timedOut) {
+            scan = {
+              ...scan,
+              results: [],
+              fallbackEvidence: [],
+              matchesReturned: 0,
+              timedOut: scan.cancelled ? false : scan.timedOut,
+            };
+          }
+          if (signal?.aborted) {
+            target.telemetry.recordLexicalFallback({ ...scan, timedOut: false, cancelled: true }, false);
+            throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+          }
           if (!isCurrent(target)) {
-            target.telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false);
+            target.telemetry.recordLexicalFallback(
+              { ...scan, matchesReturned: 0, timedOut: false, cancelled: true },
+              false,
+            );
             throw new Error(PUBLIC_ERRORS.unavailable);
           }
           const lifecycleAfterScan = target.lifecycle as RepoContextLifecycle;

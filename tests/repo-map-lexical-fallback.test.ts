@@ -1,12 +1,106 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rename, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, type open, type opendir, realpath, rename, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { expect, it } from "vitest";
-import { LEXICAL_FALLBACK_LIMITS, scanLexicalFallback } from "../src/repo-map/lexical-fallback.js";
+import { expect, it, vi } from "vitest";
+import {
+  LEXICAL_FALLBACK_LIMITS,
+  LEXICAL_FALLBACK_OUTPUT_LIMITS,
+  type LexicalFallbackFileSystem,
+  type LexicalFallbackOperationStage,
+  normalizeLexicalFallbackPath,
+  sanitizeLexicalFallbackScan,
+  scanLexicalFallback,
+} from "../src/repo-map/lexical-fallback.js";
 
 const execFileAsync = promisify(execFile);
+
+const successfulScan = {
+  results: [
+    {
+      path: "src/needle.ts",
+      score: 10,
+      kind: "lexical" as const,
+      matchedSymbols: [],
+      matchReasons: ["pending lexical fallback: exact query"],
+      symbols: [],
+      dependencies: [],
+    },
+  ],
+  fallbackEvidence: [{ kind: "source" as const, path: "src/needle.ts", excerpt: "needle" }],
+  conclusivePaths: ["src/needle.ts"],
+  unresolvedPaths: [],
+  durationMs: 1,
+  filesScanned: 1,
+  bytesScanned: 6,
+  enumeratedPaths: 1,
+  enumerationBytes: 14,
+  matchesReturned: 1,
+  capped: false,
+  timedOut: false,
+  cancelled: false,
+};
+
+function deferred<T = void>() {
+  let resolvePromise!: (value: T | PromiseLike<T>) => void;
+  let rejectPromise!: (error: unknown) => void;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
+}
+
+it("rejects drive-qualified and escaping lexical paths on every host", () => {
+  expect(normalizeLexicalFallbackPath("src\\safe.ts")).toBe("src/safe.ts");
+  expect(normalizeLexicalFallbackPath("./src/safe.ts")).toBe("src/safe.ts");
+  for (const path of [
+    "C:/secret.ts",
+    "d:\\secret.ts",
+    "C:secret.ts",
+    "/secret.ts",
+    "../secret.ts",
+    "src/../secret.ts",
+  ]) {
+    expect(normalizeLexicalFallbackPath(path)).toBeUndefined();
+  }
+});
+
+it("sanitizes injected scan output and fails closed for hostile arrays and getters", () => {
+  const sanitized = sanitizeLexicalFallbackScan(
+    {
+      ...successfulScan,
+      results: [{ ...successfulScan.results[0], path: ".\\src\\needle.ts", score: Number.MAX_VALUE }],
+      fallbackEvidence: [
+        {
+          ...successfulScan.fallbackEvidence[0],
+          path: "./src/needle.ts",
+          excerpt: "x".repeat(LEXICAL_FALLBACK_OUTPUT_LIMITS.maxExcerptBytes * 4),
+        },
+      ],
+    },
+    ["src/needle.ts"],
+  );
+  expect(sanitized.results).toMatchObject([{ path: "src/needle.ts", score: 1_000_000 }]);
+  expect(Buffer.byteLength(sanitized.fallbackEvidence[0]?.excerpt ?? "", "utf8")).toBeLessThanOrEqual(
+    LEXICAL_FALLBACK_OUTPUT_LIMITS.maxExcerptBytes,
+  );
+
+  const wrongCandidate = sanitizeLexicalFallbackScan(successfulScan, ["src/other.ts"]);
+  expect(wrongCandidate).toMatchObject({ results: [], fallbackEvidence: [], capped: true });
+  const huge = sanitizeLexicalFallbackScan({
+    ...successfulScan,
+    results: new Array(LEXICAL_FALLBACK_OUTPUT_LIMITS.maxResults + 1).fill(successfulScan.results[0]),
+  });
+  expect(huge).toMatchObject({ results: [], fallbackEvidence: [], capped: true });
+  const hostile = Object.defineProperty({ ...successfulScan }, "results", {
+    get() {
+      throw new Error("hostile getter");
+    },
+  });
+  expect(sanitizeLexicalFallbackScan(hostile)).toMatchObject({ results: [], fallbackEvidence: [], capped: true });
+});
 
 it("ranks linked dotted, underscored, and path terms with match-centered bounded excerpts", async () => {
   const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-"));
@@ -198,12 +292,14 @@ it("fails closed on ambiguous Git candidate-admission errors", async () => {
   await writeFile(join(root, ".git", "config"), "this is not valid git config\n");
   await writeFile(join(root, "secret.ts"), "ambiguousGitSecret\n");
 
-  const result = await scanLexicalFallback({
+  const candidate = await scanLexicalFallback({
     projectRoot: root,
     query: "ambiguousGitSecret",
     candidatePaths: ["secret.ts"],
   });
-  expect(result).toMatchObject({ capped: true, results: [], fallbackEvidence: [] });
+  expect(candidate).toMatchObject({ capped: true, results: [], fallbackEvidence: [] });
+  const full = await scanLexicalFallback({ projectRoot: root, query: "ambiguousGitSecret" });
+  expect(full).toMatchObject({ capped: true, results: [], fallbackEvidence: [] });
 });
 
 it("uses only explicit candidates with hardened non-Git ignore and work bounds", async () => {
@@ -257,6 +353,97 @@ it("keeps explicit candidate reads within the configured concurrency", async () 
   });
   expect(result.filesScanned).toBe(6);
   expect(maximum).toBe(2);
+});
+
+it("clamps malformed limit overrides to finite production-safe integers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-limit-table-"));
+  await writeFile(join(root, "candidate.ts"), "limitValidationNeedle\n");
+  const keys = Object.keys(LEXICAL_FALLBACK_LIMITS) as Array<keyof typeof LEXICAL_FALLBACK_LIMITS>;
+  const cases = [
+    ["zero", 0],
+    ["negative", -10],
+    ["NaN", Number.NaN],
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["fractional", 1.5],
+    ["oversized", Number.MAX_SAFE_INTEGER],
+  ] as const;
+
+  for (const [label, value] of cases) {
+    const limits = Object.fromEntries(keys.map((key) => [key, value]));
+    const result = await Promise.race([
+      scanLexicalFallback({
+        projectRoot: root,
+        query: "limitValidationNeedle",
+        candidatePaths: ["candidate.ts"],
+        limits,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`${label} limits did not terminate`)), 1_000),
+      ),
+    ]);
+    for (const count of [
+      result.filesScanned,
+      result.bytesScanned,
+      result.enumeratedPaths,
+      result.enumerationBytes,
+      result.matchesReturned,
+    ]) {
+      expect(Number.isSafeInteger(count), label).toBe(true);
+      expect(count, label).toBeGreaterThanOrEqual(0);
+    }
+    expect(result.filesScanned, label).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxFiles);
+    expect(result.bytesScanned, label).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxSourceBytes);
+    expect(result.enumeratedPaths, label).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxEnumeratedPaths);
+    expect(result.enumerationBytes, label).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxEnumerationBytes);
+    expect(result.matchesReturned, label).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxResults);
+  }
+});
+
+it("treats concurrency zero as one and returns promptly", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-zero-concurrency-"));
+  await writeFile(join(root, "candidate.ts"), "zeroConcurrencyNeedle\n");
+  const result = await Promise.race([
+    scanLexicalFallback({
+      projectRoot: root,
+      query: "zeroConcurrencyNeedle",
+      candidatePaths: ["candidate.ts"],
+      limits: { concurrency: 0 },
+    }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("zero concurrency starved")), 1_000)),
+  ]);
+  expect(result.filesScanned).toBe(1);
+  expect(result.results[0]?.path).toBe("candidate.ts");
+});
+
+it("keeps oversized overrides within production concurrency, result, and excerpt caps", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-production-caps-"));
+  const candidatePaths = Array.from({ length: LEXICAL_FALLBACK_LIMITS.maxResults + 4 }, (_, index) => `${index}.ts`);
+  await Promise.all(
+    candidatePaths.map((path) => writeFile(join(root, path), `productionCapsNeedle ${"x".repeat(1_024)}\n`)),
+  );
+  let active = 0;
+  let maximum = 0;
+  const keys = Object.keys(LEXICAL_FALLBACK_LIMITS) as Array<keyof typeof LEXICAL_FALLBACK_LIMITS>;
+  const result = await scanLexicalFallback({
+    projectRoot: root,
+    query: "productionCapsNeedle",
+    limit: Number.MAX_SAFE_INTEGER,
+    candidatePaths,
+    limits: Object.fromEntries(keys.map((key) => [key, Number.MAX_SAFE_INTEGER])),
+    beforeOpen: async () => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 2));
+      active -= 1;
+    },
+  });
+  expect(maximum).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.concurrency);
+  expect(result.results).toHaveLength(LEXICAL_FALLBACK_LIMITS.maxResults);
+  expect(
+    result.fallbackEvidence.every(
+      (evidence) => Buffer.byteLength(evidence.excerpt, "utf8") <= LEXICAL_FALLBACK_LIMITS.maxExcerptBytes,
+    ),
+  ).toBe(true);
 });
 
 it("rejects deleted, non-regular, binary, and unreadable explicit candidates", async () => {
@@ -345,4 +532,337 @@ it("enforces source/file/result bounds and cancellation without leaking partial 
   expect(timedOut.timedOut).toBe(true);
   expect(timedOut.filesScanned).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxFiles);
   expect(timedOut.bytesScanned).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxSourceBytes);
+});
+
+it("hard-bounds and drains every candidate file-operation stage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-hard-file-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await writeFile(join(root, "pending.ts"), "hardBoundPendingNeedle\n");
+  await execFileAsync("git", ["add", "pending.ts"], { cwd: root });
+  const stages: LexicalFallbackOperationStage[] = ["lstat", "realpath", "open", "stat", "read", "close"];
+
+  for (const stage of stages) {
+    const controller = new AbortController();
+    const entered = deferred();
+    const gate = deferred();
+    let gated = false;
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "hardBoundPendingNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      operationHook: async (current, path) => {
+        if (gated || current !== stage || !path.endsWith("pending.ts")) return;
+        gated = true;
+        entered.resolve();
+        await gate.promise;
+      },
+    });
+    await entered.promise;
+    controller.abort(new Error(`cancel-${stage}`));
+    await expect(scanning).resolves.toMatchObject({
+      results: [],
+      fallbackEvidence: [],
+      timedOut: false,
+      cancelled: true,
+    });
+    // Reject after logical retirement: the late hook settlement must remain
+    // observed and cannot become an unhandled rejection or mutate the result.
+    gate.reject(new Error(`late-${stage}`));
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+});
+
+it("hard-bounds before-open, before-read, and the enclosing batch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-hard-hooks-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await writeFile(join(root, "pending.ts"), "hookBoundPendingNeedle\n");
+  await execFileAsync("git", ["add", "pending.ts"], { cwd: root });
+
+  for (const hook of ["beforeOpen", "beforeRead"] as const) {
+    const controller = new AbortController();
+    const entered = deferred();
+    const gate = deferred();
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "hookBoundPendingNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      [hook]: async () => {
+        entered.resolve();
+        await gate.promise;
+      },
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    gate.resolve();
+  }
+});
+
+it("hard-bounds non-Git directory open, iteration, and close", async () => {
+  const stages: LexicalFallbackOperationStage[] = ["directory-open", "directory-read", "directory-close"];
+  for (const stage of stages) {
+    const root = await mkdtemp(join(tmpdir(), `repo-context-lexical-hard-${stage}-`));
+    await writeFile(join(root, "pending.ts"), "directoryBoundPendingNeedle\n");
+    const controller = new AbortController();
+    const entered = deferred();
+    const gate = deferred();
+    let gated = false;
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "directoryBoundPendingNeedle",
+      signal: controller.signal,
+      operationHook: async (current) => {
+        if (gated || current !== stage) return;
+        gated = true;
+        entered.resolve();
+        await gate.promise;
+      },
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    gate.resolve();
+  }
+});
+
+it("hard-bounds actual lstat and realpath operations and observes late rejection", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-actual-path-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await writeFile(join(root, "pending.ts"), "actualPathNeedle\n");
+  await execFileAsync("git", ["add", "pending.ts"], { cwd: root });
+
+  for (const stage of ["lstat", "realpath"] as const) {
+    const controller = new AbortController();
+    const entered = deferred();
+    const operation = deferred<never>();
+    const fileSystem: Partial<LexicalFallbackFileSystem> =
+      stage === "lstat"
+        ? {
+            lstat: ((path: string, options?: object) => {
+              if (path.endsWith("pending.ts")) {
+                entered.resolve();
+                return operation.promise;
+              }
+              return lstat(path, options as never);
+            }) as LexicalFallbackFileSystem["lstat"],
+          }
+        : {
+            realpath: ((path: string) => {
+              if (path.endsWith("pending.ts")) {
+                entered.resolve();
+                return operation.promise;
+              }
+              return realpath(path);
+            }) as LexicalFallbackFileSystem["realpath"],
+          };
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualPathNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      fileSystem,
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    operation.reject(new Error(`late actual ${stage} rejection`));
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+});
+
+it("initiates owned file closure immediately for stalled stat/read and closes late opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-actual-file-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  const target = join(root, "pending.ts");
+  await writeFile(target, "actualFileNeedle\n");
+  await execFileAsync("git", ["add", "pending.ts"], { cwd: root });
+  const info = await lstat(target, { bigint: true });
+
+  // A handle that arrives only after retirement is still closed.
+  {
+    const controller = new AbortController();
+    const entered = deferred();
+    const opening = deferred<Awaited<ReturnType<typeof open>>>();
+    const close = vi.fn(async () => undefined);
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualFileNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      fileSystem: {
+        open: (() => {
+          entered.resolve();
+          return opening.promise;
+        }) as LexicalFallbackFileSystem["open"],
+      },
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [] });
+    opening.resolve({ close } as unknown as Awaited<ReturnType<typeof open>>);
+    await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+  }
+
+  for (const stage of ["stat", "read"] as const) {
+    const controller = new AbortController();
+    const entered = deferred();
+    const stalled = deferred<never>();
+    const close = vi.fn(async () => undefined);
+    const handle = {
+      stat: vi.fn(async () => {
+        if (stage === "stat") {
+          entered.resolve();
+          return stalled.promise;
+        }
+        return info;
+      }),
+      read: vi.fn(async (buffer: Buffer) => {
+        if (stage === "read") {
+          entered.resolve();
+          return stalled.promise;
+        }
+        return { bytesRead: 0, buffer };
+      }),
+      close,
+    } as unknown as Awaited<ReturnType<typeof open>>;
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualFileNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      fileSystem: { open: (async () => handle) as LexicalFallbackFileSystem["open"] },
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    expect(close).toHaveBeenCalledOnce();
+    stalled.reject(new Error(`late actual ${stage} rejection`));
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  // A never-settling close is initiated once but cannot hold logical return.
+  {
+    const controller = new AbortController();
+    const closeEntered = deferred();
+    const close = vi.fn(() => {
+      closeEntered.resolve();
+      return new Promise<void>(() => undefined);
+    });
+    const content = Buffer.from("actualFileNeedle\n");
+    const handle = {
+      stat: vi.fn(async () => info),
+      read: vi.fn(async (buffer: Buffer) => {
+        content.copy(buffer);
+        return { bytesRead: content.byteLength, buffer };
+      }),
+      close,
+    } as unknown as Awaited<ReturnType<typeof open>>;
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualFileNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      fileSystem: { open: (async () => handle) as LexicalFallbackFileSystem["open"] },
+    });
+    await closeEntered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    expect(close).toHaveBeenCalledOnce();
+  }
+});
+
+it("initiates owned directory closure for stalled iteration and observes late operations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-actual-dir-"));
+  await writeFile(join(root, "pending.ts"), "actualDirectoryNeedle\n");
+
+  // A directory arriving after cancellation is closed.
+  {
+    const controller = new AbortController();
+    const entered = deferred();
+    const opening = deferred<Awaited<ReturnType<typeof opendir>>>();
+    const close = vi.fn(async () => undefined);
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualDirectoryNeedle",
+      signal: controller.signal,
+      fileSystem: {
+        opendir: (() => {
+          entered.resolve();
+          return opening.promise;
+        }) as LexicalFallbackFileSystem["opendir"],
+      },
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [] });
+    opening.resolve({ close } as unknown as Awaited<ReturnType<typeof opendir>>);
+    await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+  }
+
+  // A never-settling read triggers immediate owned closure; late rejection is observed.
+  {
+    const controller = new AbortController();
+    const readEntered = deferred();
+    const reading = deferred<never>();
+    const close = vi.fn(async () => undefined);
+    const directory = {
+      read: vi.fn(() => {
+        readEntered.resolve();
+        return reading.promise;
+      }),
+      close,
+    } as unknown as Awaited<ReturnType<typeof opendir>>;
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "actualDirectoryNeedle",
+      signal: controller.signal,
+      fileSystem: { opendir: (async () => directory) as LexicalFallbackFileSystem["opendir"] },
+    });
+    await readEntered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    expect(close).toHaveBeenCalledOnce();
+    reading.reject(new Error("late actual directory read rejection"));
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+});
+
+it("returns at the logical deadline while a read hook remains stalled", async () => {
+  vi.useFakeTimers();
+  try {
+    const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-hard-deadline-"));
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await writeFile(join(root, "pending.ts"), "deadlineBoundPendingNeedle\n");
+    await execFileAsync("git", ["add", "pending.ts"], { cwd: root });
+    const entered = deferred();
+    const gate = deferred();
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "deadlineBoundPendingNeedle",
+      candidatePaths: ["pending.ts"],
+      limits: { deadlineMs: 25 },
+      beforeRead: async () => {
+        entered.resolve();
+        await gate.promise;
+      },
+    });
+    await entered.promise;
+    await vi.advanceTimersByTimeAsync(25);
+    await expect(scanning).resolves.toMatchObject({
+      results: [],
+      fallbackEvidence: [],
+      capped: false,
+      timedOut: true,
+      cancelled: false,
+    });
+    gate.resolve();
+  } finally {
+    vi.useRealTimers();
+  }
 });

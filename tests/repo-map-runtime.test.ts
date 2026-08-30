@@ -1,6 +1,18 @@
 import { execFile } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -8,6 +20,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildRepoMap, type RepoMapFileSystem } from "../src/repo-map/index.js";
 import {
   isWatcherIgnoredPath,
+  LIVE_STALE_EVIDENCE_LIMITS,
   loadActiveRepoMapGeneration,
   type RepoMapChangeEvent,
   RepoMapRuntime,
@@ -1992,6 +2005,188 @@ describe("incremental repository map runtime", () => {
     await runtime.close();
   });
 
+  it("falls back to coherent indexed evidence when a stale source becomes an external symlink", async () => {
+    const indexedMarker = "coherentIndexedSwapNeedle";
+    const externalMarker = "EXTERNAL_FILE_SWAP_MARKER";
+    const { root, stateRoot } = await fixture({ "src/live.ts": `export const ${indexedMarker} = true;` });
+    const outside = await realpath(await mkdtemp(join(tmpdir(), "repo-context-runtime-live-outside-")));
+    roots.push(outside);
+    const outsideFile = join(outside, "external.ts");
+    await writeFile(outsideFile, `export const ${externalMarker} = true;`);
+    let failActivation = false;
+    let swapped = false;
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      beforeStateWrite: async (path) => {
+        if (failActivation && path.endsWith("active.json")) throw new Error("simulated stale activation");
+      },
+      beforeLiveSourceOpen: async (path) => {
+        if (swapped || path !== join(root, "src/live.ts")) return;
+        swapped = true;
+        await rm(path);
+        await symlink(outsideFile, path);
+      },
+    });
+    await runtime.start();
+    failActivation = true;
+    await writeFile(join(root, "src/live.ts"), `export const ${indexedMarker} = false;`);
+    runtime.notify("change", "src/live.ts");
+    await runtime.flush();
+
+    const result = await runtime.query(indexedMarker);
+    const excerpts = result.fallbackEvidence.map((evidence) => evidence.excerpt).join("\n");
+    expect(result.freshness).toBe("stale");
+    expect(swapped).toBe(true);
+    expect(excerpts).toContain(indexedMarker.toLowerCase());
+    expect(excerpts).not.toContain(externalMarker);
+    await runtime.close();
+  });
+
+  it("falls back to coherent indexed evidence when a stale source parent becomes an external symlink", async () => {
+    const indexedMarker = "coherentIndexedParentNeedle";
+    const externalMarker = "EXTERNAL_PARENT_SWAP_MARKER";
+    const { root, stateRoot } = await fixture({ "src/live.ts": `export const ${indexedMarker} = true;` });
+    const outside = await realpath(await mkdtemp(join(tmpdir(), "repo-context-runtime-parent-outside-")));
+    roots.push(outside);
+    await writeFile(join(outside, "live.ts"), `export const ${externalMarker} = true;`);
+    let failActivation = false;
+    let swapped = false;
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      beforeStateWrite: async (path) => {
+        if (failActivation && path.endsWith("active.json")) throw new Error("simulated stale activation");
+      },
+      beforeLiveSourceOpen: async (path) => {
+        if (swapped || path !== join(root, "src/live.ts")) return;
+        swapped = true;
+        await rename(join(root, "src"), join(root, "src-indexed"));
+        await symlink(outside, join(root, "src"), "dir");
+      },
+    });
+    await runtime.start();
+    failActivation = true;
+    await writeFile(join(root, "src/live.ts"), `export const ${indexedMarker} = false;`);
+    runtime.notify("change", "src/live.ts");
+    await runtime.flush();
+
+    const result = await runtime.query(indexedMarker);
+    const excerpts = result.fallbackEvidence.map((evidence) => evidence.excerpt).join("\n");
+    expect(result.freshness).toBe("stale");
+    expect(swapped).toBe(true);
+    expect(excerpts).toContain(indexedMarker.toLowerCase());
+    expect(excerpts).not.toContain(externalMarker);
+    await runtime.close();
+  });
+
+  it("falls back to coherent indexed evidence when the project root is replaced by an external symlink", async () => {
+    const indexedMarker = "coherentIndexedRootNeedle";
+    const externalMarker = "EXTERNAL_ROOT_SWAP_MARKER";
+    const { root, stateRoot } = await fixture({ "src/live.ts": `export const ${indexedMarker} = true;` }, false);
+    const outside = await realpath(await mkdtemp(join(tmpdir(), "repo-context-runtime-root-outside-")));
+    const preservedRoot = `${root}-preserved`;
+    roots.push(outside, preservedRoot);
+    await mkdir(join(outside, "src"));
+    await writeFile(join(outside, "src/live.ts"), `export const ${externalMarker} = true;`);
+    let failActivation = false;
+    let swapped = false;
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      beforeStateWrite: async (path) => {
+        if (failActivation && path.endsWith("active.json")) throw new Error("simulated stale activation");
+      },
+      beforeLiveSourceResolve: async () => {
+        if (swapped) return;
+        swapped = true;
+        await rename(root, preservedRoot);
+        await symlink(outside, root, "dir");
+      },
+    });
+    await runtime.start();
+    failActivation = true;
+    await writeFile(join(root, "src/live.ts"), `export const ${indexedMarker} = false;`);
+    runtime.notify("change", "src/live.ts");
+    await runtime.flush();
+
+    const result = await runtime.query(indexedMarker);
+    const excerpts = result.fallbackEvidence.map((evidence) => evidence.excerpt).join("\n");
+    expect(result.freshness).toBe("stale");
+    expect(swapped).toBe(true);
+    expect(excerpts).toContain(indexedMarker.toLowerCase());
+    expect(excerpts).not.toContain(externalMarker);
+    await runtime.close();
+  });
+
+  it("hard-bounds live stale source and Git evidence operations that never settle", async () => {
+    for (const stalled of ["source", "git-diff"] as const) {
+      const { root, stateRoot } = await fixture({ "src/live.ts": "export const beforeLiveBound = true;" }, false);
+      let failActivation = false;
+      let stallSource = false;
+      const runtime = new RepoMapRuntime({
+        projectRoot: root,
+        stateRoot,
+        watch: false,
+        indexFileSystem: {
+          lstat,
+          async readFile(path) {
+            if (stallSource) return new Promise<Buffer>(() => {});
+            return readFile(path);
+          },
+        },
+        gitRunner: async (_projectRoot, args, encoding) => {
+          if (args[0] === "diff" && stalled === "git-diff") return new Promise(() => {});
+          if (args[0] === "rev-parse") return { stdout: "bounded-head\n" };
+          return { stdout: encoding === "buffer" ? Buffer.alloc(0) : "" };
+        },
+        beforeStateWrite: async (path) => {
+          if (failActivation && path.endsWith("active.json")) throw new Error("simulated stale activation");
+        },
+      });
+      await runtime.start();
+      await writeFile(join(root, "src/live.ts"), "export const afterLiveBound = true;");
+      failActivation = true;
+      runtime.notify("change", "src/live.ts");
+      await runtime.flush();
+      stallSource = stalled === "source";
+
+      const started = Date.now();
+      const result = await runtime.query(stalled === "source" ? "afterLiveBound" : "noIndexedTerm");
+      expect(Date.now() - started).toBeLessThan(1_500);
+      expect(result.freshness).toBe("stale");
+      expect(
+        result.fallbackEvidence.every(
+          (evidence) => Buffer.byteLength(evidence.excerpt) <= LIVE_STALE_EVIDENCE_LIMITS.maxGitDiffBytes,
+        ),
+      ).toBe(true);
+      await runtime.close();
+    }
+  });
+
+  it("rejects drive-qualified watcher notifications independently of the host OS", async () => {
+    const { root, stateRoot } = await fixture({ "src/safe.ts": "export const safe = true;" }, false);
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+    });
+    await runtime.start();
+    const before = runtime.status();
+    runtime.notify("change", "D:\\outside\\secret.ts");
+    runtime.notify("change", "C:/outside/secret.ts");
+    expect(runtime.status()).toMatchObject({
+      freshness: before.freshness,
+      generation: before.generation,
+      pendingFiles: before.pendingFiles,
+    });
+    await runtime.close();
+  });
+
   it("substitutes current pending metadata for a same-path component-only indexed hit", async () => {
     const { root, stateRoot } = await fixture({ "src/same.ts": "export const staleComponentValue = true;" }, false);
     const failures = controlledReadFailures();
@@ -2139,6 +2334,239 @@ describe("incremental repository map runtime", () => {
     });
     failures.recover(join(root, "src/race.ts"));
     await runtime.close();
+  });
+
+  it("discards malicious timed-out and cancelled pending scanner evidence", async () => {
+    for (const outcome of ["timedOut", "cancelled"] as const) {
+      const { root, stateRoot } = await fixture(
+        { "src/malicious.ts": "export const staleMaliciousValue = true;" },
+        false,
+      );
+      const failures = controlledReadFailures();
+      const telemetry = new Telemetry();
+      const runtime = new RepoMapRuntime({
+        projectRoot: root,
+        stateRoot,
+        watch: false,
+        scheduler: new ManualScheduler(),
+        indexFileSystem: failures.fileSystem,
+        telemetry,
+        pendingScanner: async () => ({
+          results: [
+            {
+              path: "private/late.ts",
+              score: 999,
+              kind: "lexical",
+              matchedSymbols: [],
+              matchReasons: ["pending lexical fallback: exact query"],
+              symbols: [],
+              dependencies: [],
+            },
+          ],
+          fallbackEvidence: [{ kind: "source", path: "private/late.ts", excerpt: "privateLateEvidence" }],
+          conclusivePaths: ["src/malicious.ts"],
+          unresolvedPaths: [],
+          durationMs: 1,
+          filesScanned: 1,
+          bytesScanned: 16,
+          enumeratedPaths: 1,
+          enumerationBytes: 16,
+          matchesReturned: 1,
+          capped: true,
+          timedOut: outcome === "timedOut",
+          cancelled: outcome === "cancelled",
+        }),
+      });
+      await runtime.start();
+      await writeFile(join(root, "src/malicious.ts"), "export const currentMaliciousValue = true;");
+      failures.fail(join(root, "src/malicious.ts"));
+      runtime.notify("change", "src/malicious.ts");
+
+      const result = await runtime.query("currentMaliciousValue");
+      expect(result.results.some((row) => row.path === "private/late.ts")).toBe(false);
+      expect(result.fallbackEvidence.some((row) => row.excerpt === "privateLateEvidence")).toBe(false);
+      expect(telemetry.snapshot()).toMatchObject({
+        lexicalFallbackUsedCount: 0,
+        lexicalFallbackNoMatchCount: 0,
+        lexicalFallbackCappedCount: 0,
+        lexicalFallbackTimeoutCount: outcome === "timedOut" ? 1 : 0,
+        lexicalFallbackCancelledCount: outcome === "cancelled" ? 1 : 0,
+        lexicalFallbackMatchesReturned: 0,
+      });
+      failures.recover(join(root, "src/malicious.ts"));
+      await runtime.close();
+    }
+  });
+
+  it("hard-times out a never-settling injected pending scanner", async () => {
+    const { root, stateRoot } = await fixture({ "src/deadline.ts": "export const oldDeadline = true;" }, false);
+    const failures = controlledReadFailures();
+    const telemetry = new Telemetry();
+    const pendingScanner = vi.fn(() => new Promise<never>(() => {}));
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+      indexFileSystem: failures.fileSystem,
+      telemetry,
+      pendingScanner,
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/deadline.ts"), "export const newDeadline = true;");
+    failures.fail(join(root, "src/deadline.ts"));
+    runtime.notify("change", "src/deadline.ts");
+
+    vi.useFakeTimers();
+    try {
+      const query = runtime.query("newDeadline");
+      await vi.waitFor(() => expect(pendingScanner).toHaveBeenCalledOnce());
+      await vi.advanceTimersByTimeAsync(2_000);
+      const result = await query;
+      expect(result.results).toEqual([]);
+      expect(telemetry.snapshot()).toMatchObject({
+        lexicalFallbackAttemptCount: 1,
+        lexicalFallbackTimeoutCount: 1,
+        lexicalFallbackCancelledCount: 0,
+        lexicalFallbackMatchesReturned: 0,
+      });
+    } finally {
+      vi.useRealTimers();
+      failures.recover(join(root, "src/deadline.ts"));
+      await runtime.close();
+    }
+  });
+
+  it("retires a pending scanner on same-content activation without advancing generation", async () => {
+    const { root, stateRoot } = await fixture({ "src/activate.ts": "export const oldActivate = true;" }, false);
+    const failures = controlledReadFailures();
+    const scanStarted = deferred();
+    let scanSignal: AbortSignal | undefined;
+    const telemetry = new Telemetry();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+      indexFileSystem: failures.fileSystem,
+      telemetry,
+      pendingScanner: async (options) => {
+        scanSignal = options.signal;
+        scanStarted.resolve();
+        return new Promise<never>(() => {});
+      },
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/activate.ts"), "export const newActivate = true;");
+    failures.fail(join(root, "src/activate.ts"));
+    runtime.notify("change", "src/activate.ts");
+    const query = runtime.query("newActivate");
+    await scanStarted.promise;
+    const staleGeneration = runtime.status().generation;
+
+    await runtime.rebuild();
+    expect(runtime.status().generation).toBe(staleGeneration);
+    expect(scanSignal?.aborted).toBe(true);
+    await expect(query).resolves.toMatchObject({ freshness: "stale", results: [] });
+    expect(telemetry.snapshot()).toMatchObject({
+      lexicalFallbackCancelledCount: 1,
+      lexicalFallbackMatchesReturned: 0,
+    });
+    failures.recover(join(root, "src/activate.ts"));
+    await runtime.close();
+  });
+
+  it("fails closed and records one terminal outcome for malformed successful pending output", async () => {
+    for (const malformed of ["foreign-path", "getter"] as const) {
+      const { root, stateRoot } = await fixture({ "src/sanitize.ts": "export const oldSanitize = true;" }, false);
+      const failures = controlledReadFailures();
+      const telemetry = new Telemetry();
+      const base = {
+        results: [],
+        fallbackEvidence: [],
+        conclusivePaths: [],
+        unresolvedPaths: [],
+        durationMs: 1,
+        filesScanned: 0,
+        bytesScanned: 0,
+        enumeratedPaths: 1,
+        enumerationBytes: 16,
+        matchesReturned: 0,
+        capped: false,
+        timedOut: false,
+        cancelled: false,
+      };
+      const output =
+        malformed === "foreign-path"
+          ? { ...base, conclusivePaths: ["D:/outside.ts"] }
+          : Object.defineProperty({ ...base }, "results", {
+              get() {
+                throw new Error("hostile results getter");
+              },
+            });
+      const runtime = new RepoMapRuntime({
+        projectRoot: root,
+        stateRoot,
+        watch: false,
+        scheduler: new ManualScheduler(),
+        indexFileSystem: failures.fileSystem,
+        telemetry,
+        pendingScanner: async () => output,
+      });
+      await runtime.start();
+      await writeFile(join(root, "src/sanitize.ts"), "export const newSanitize = true;");
+      failures.fail(join(root, "src/sanitize.ts"));
+      runtime.notify("change", "src/sanitize.ts");
+
+      const result = await runtime.query("newSanitize");
+      expect(result.results).toEqual([]);
+      expect(telemetry.snapshot()).toMatchObject({
+        lexicalFallbackAttemptCount: 1,
+        lexicalFallbackCappedCount: 1,
+        lexicalFallbackUsedCount: 0,
+        lexicalFallbackNoMatchCount: 0,
+      });
+      failures.recover(join(root, "src/sanitize.ts"));
+      await runtime.close();
+    }
+  });
+
+  it("runtime close promptly retires and drains an injected pending scanner", async () => {
+    const { root, stateRoot } = await fixture({ "src/close.ts": "export const staleCloseValue = true;" }, false);
+    const failures = controlledReadFailures();
+    const scanStarted = deferred();
+    const releaseScan = deferred();
+    const telemetry = new Telemetry();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+      indexFileSystem: failures.fileSystem,
+      telemetry,
+      pendingScanner: async () => {
+        scanStarted.resolve();
+        await releaseScan.promise;
+        throw new Error("late scanner rejection");
+      },
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/close.ts"), "export const currentCloseValue = true;");
+    failures.fail(join(root, "src/close.ts"));
+    runtime.notify("change", "src/close.ts");
+
+    const querying = runtime.query("currentCloseValue");
+    await scanStarted.promise;
+    const closing = runtime.close();
+    const result = await querying;
+    expect(result.fallbackEvidence.some((row) => row.excerpt.includes("currentCloseValue"))).toBe(false);
+    expect(telemetry.snapshot()).toMatchObject({
+      lexicalFallbackCancelledCount: 1,
+      lexicalFallbackMatchesReturned: 0,
+    });
+    releaseScan.resolve();
+    await closing;
+    await Promise.resolve();
   });
 
   it("telemetry: disabled and throwing recorders leave model-visible query output identical", async () => {

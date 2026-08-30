@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, readdir, readFile, realpath } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { constants } from "node:fs";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import { promisify } from "node:util";
 import chokidar, { type FSWatcher } from "chokidar";
 import { withFileLock } from "../state/atomic.js";
@@ -32,7 +33,14 @@ import {
   type RepoMapWarning,
   repoMapBuildCompatibilityKey,
 } from "./index.js";
-import { type LexicalFallbackScanResult, scanLexicalFallback } from "./lexical-fallback.js";
+import {
+  LEXICAL_FALLBACK_LIMITS,
+  type LexicalFallbackScanResult,
+  normalizeLexicalFallbackPath,
+  runBoundedLexicalFallbackScan,
+  sanitizeLexicalFallbackScan,
+  scanLexicalFallback,
+} from "./lexical-fallback.js";
 import {
   RepositoryCheckpointStore,
   type RepositorySnapshotHandle,
@@ -48,6 +56,13 @@ const MAX_FLUSH_PASSES = 8;
 const MAX_WATCHER_UPDATES_PER_PASS = 64;
 const MAX_FLUSH_DURATION_MS = 1_000;
 const CHECKPOINT_PUBLICATION_ERROR = "repository snapshot checkpoint publication failed";
+/** One shared envelope for live stale source excerpts and Git diff evidence. */
+export const LIVE_STALE_EVIDENCE_LIMITS = Object.freeze({
+  deadlineMs: 250,
+  maxSourceBytes: 4 * 1024,
+  maxSourceRows: 3,
+  maxGitDiffBytes: 16 * 1024,
+});
 
 export type RepoMapFreshness = "fresh" | "dirty" | "stale" | "unsupported";
 export type RepoMapChangeEvent = "add" | "change" | "unlink";
@@ -108,6 +123,7 @@ export type RepoMapGitRunner = (
   args: readonly string[],
   encoding: "utf8" | "buffer",
   maxBuffer?: number,
+  signal?: AbortSignal,
 ) => Promise<{ stdout: string | Buffer }>;
 
 export interface RepoMapRuntimeOptions {
@@ -132,6 +148,10 @@ export interface RepoMapRuntimeOptions {
   snapshotBuilder?: typeof buildRepoMap;
   /** Test-only injection for live stale-pending lexical scans. */
   pendingScanner?: typeof scanLexicalFallback;
+  /** Test-only hook before canonical root/source resolution. */
+  beforeLiveSourceResolve?: (path: string) => Promise<void>;
+  /** Test-only hook after canonical identity capture and before open. */
+  beforeLiveSourceOpen?: (path: string) => Promise<void>;
   now?: () => Date;
   /** Injectable monotonic clock used for deterministic telemetry tests. */
   monotonicNow?: () => number;
@@ -149,8 +169,49 @@ const defaultScheduler: RepoMapScheduler = {
   },
 };
 
+const LOGICAL_OPERATION_ABORTED = Symbol("logical-operation-aborted");
+
+/** Race a live-evidence operation while observing any late settlement. */
+function abortableOperation<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+  onLateValue?: (value: T) => void | Promise<void>,
+): Promise<T | typeof LOGICAL_OPERATION_ABORTED> {
+  if (signal.aborted) {
+    void operation.then(onLateValue, () => undefined).catch(() => undefined);
+    return Promise.resolve(LOGICAL_OPERATION_ABORTED);
+  }
+  return new Promise((resolveOperation, rejectOperation) => {
+    let retired = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      retired = true;
+      cleanup();
+      resolveOperation(LOGICAL_OPERATION_ABORTED);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        if (retired) {
+          void Promise.resolve()
+            .then(() => onLateValue?.(value))
+            .catch(() => undefined);
+          return;
+        }
+        cleanup();
+        resolveOperation(value);
+      },
+      (error) => {
+        if (retired) return;
+        cleanup();
+        rejectOperation(error);
+      },
+    );
+  });
+}
+
 function slash(path: string): string {
-  return path.split(sep).join("/");
+  return path.replaceAll("\\", "/").split(sep).join("/");
 }
 
 function hash(value: string): string {
@@ -194,11 +255,12 @@ function watcher(root: string): RepoMapWatcher {
   };
 }
 
-const defaultGitRunner: RepoMapGitRunner = async (projectRoot, args, encoding, maxBuffer) => {
+const defaultGitRunner: RepoMapGitRunner = async (projectRoot, args, encoding, maxBuffer, signal) => {
   const result = await execFileAsync("git", [...args], {
     cwd: projectRoot,
     encoding,
     ...(maxBuffer === undefined ? {} : { maxBuffer }),
+    ...(signal === undefined ? {} : { signal }),
   });
   return { stdout: result.stdout };
 };
@@ -243,16 +305,32 @@ async function gitHead(
   }
 }
 
+function boundedUtf8(value: string | Buffer, maxBytes: number): string {
+  const bounded = Buffer.isBuffer(value)
+    ? value.subarray(0, maxBytes)
+    : Buffer.from(value.slice(0, maxBytes), "utf8").subarray(0, maxBytes);
+  let text = bounded.toString("utf8");
+  while (text && Buffer.byteLength(text, "utf8") > maxBytes) text = text.slice(0, -1);
+  return text;
+}
+
 async function gitDiff(
   projectRoot: string,
   runner: RepoMapGitRunner,
+  signal?: AbortSignal,
   telemetry?: Telemetry,
   now = performance.now.bind(performance),
 ): Promise<string> {
   const startedAt = monotonicReading(now);
   try {
-    const { stdout } = await runner(projectRoot, ["diff", "--no-ext-diff", "--unified=1", "--"], "utf8", 1024 * 1024);
-    return stdout.toString().slice(0, 16 * 1024);
+    const { stdout } = await runner(
+      projectRoot,
+      ["diff", "--no-ext-diff", "--unified=1", "--"],
+      "buffer",
+      LIVE_STALE_EVIDENCE_LIMITS.maxGitDiffBytes,
+      signal,
+    );
+    return boundedUtf8(stdout, LIVE_STALE_EVIDENCE_LIMITS.maxGitDiffBytes);
   } catch {
     return "";
   } finally {
@@ -567,6 +645,7 @@ export class RepoMapRuntime {
   #mutationEpoch = 0;
   #started = false;
   #flushChain: Promise<void> = Promise.resolve();
+  #pendingFallbackControllers = new Set<AbortController>();
   #baseBuildFailed = false;
   #checkpointPublicationFailed = false;
   #stateBoundary?: RepoStateBoundary;
@@ -625,6 +704,10 @@ export class RepoMapRuntime {
     await this.flush();
   }
 
+  #retirePendingFallbacks(): void {
+    for (const controller of this.#pendingFallbackControllers) controller.abort();
+  }
+
   notify(event: RepoMapChangeEvent, changedPath: string): void {
     try {
       this.#assertStateBoundarySync();
@@ -632,12 +715,25 @@ export class RepoMapRuntime {
       this.#degrade(error);
       return;
     }
-    const path = slash(isAbsolute(changedPath) ? relative(this.#projectRoot, changedPath) : changedPath);
-    if (!path || path.startsWith("../") || isRepoMapPathExcluded(path, this.#options.exclude)) return;
+    const supplied = slash(changedPath);
+    const driveQualified = /^[a-zA-Z]:/u.test(supplied);
+    if (driveQualified) {
+      // Watchers may supply same-drive absolute paths on Windows. A drive path
+      // on another host, or a cross-drive path on Windows, is never relative.
+      if (process.platform !== "win32") return;
+      const rootDrive = win32.parse(this.#projectRoot).root.toLowerCase();
+      const suppliedDrive = win32.parse(changedPath).root.toLowerCase();
+      if (!rootDrive || rootDrive !== suppliedDrive) return;
+    }
+    const relativePath =
+      isAbsolute(changedPath) || driveQualified ? relative(this.#projectRoot, changedPath) : changedPath;
+    const path = normalizeLexicalFallbackPath(relativePath);
+    if (!path || isRepoMapPathExcluded(path, this.#options.exclude)) return;
     this.#pending.add(path);
     this.#freshness = "stale";
     this.#watcherUpdates.push({ event, path });
     this.#mutationEpoch += 1;
+    this.#retirePendingFallbacks();
     // Derive watcher-visible state from the last immutable checkpoint. Mutable
     // rebuild fields may currently be between awaited reconciliation steps.
     if (!this.#checkpoints.publishWatcherPath(path)) {
@@ -792,20 +888,46 @@ export class RepoMapRuntime {
       }
 
       recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordLexicalFallbackAttempt());
+      const controller = new AbortController();
+      this.#pendingFallbackControllers.add(controller);
       let scan: LexicalFallbackScanResult;
       try {
-        scan = await this.#pendingScanner({
-          projectRoot: this.#projectRoot,
-          query,
-          limit: 20,
-          exclude: this.#options.exclude ?? [],
-          candidatePaths: captured.pendingFiles,
-          ...(options.signal ? { signal: options.signal } : {}),
-        });
+        const completed = await runBoundedLexicalFallbackScan(
+          (scanSignal) =>
+            this.#pendingScanner({
+              projectRoot: this.#projectRoot,
+              query,
+              limit: LEXICAL_FALLBACK_LIMITS.maxResults,
+              exclude: this.#options.exclude ?? [],
+              candidatePaths: captured.pendingFiles,
+              signal: scanSignal,
+            }),
+          options.signal ? [controller.signal, options.signal] : [controller.signal],
+        );
+        scan =
+          completed.status === "retired"
+            ? {
+                results: [],
+                fallbackEvidence: [],
+                conclusivePaths: [],
+                unresolvedPaths: [...captured.pendingFiles],
+                durationMs: 0,
+                filesScanned: 0,
+                bytesScanned: 0,
+                enumeratedPaths: 0,
+                enumerationBytes: 0,
+                matchesReturned: 0,
+                capped: false,
+                timedOut: completed.timedOut,
+                cancelled: completed.cancelled,
+              }
+            : sanitizeLexicalFallbackScan(completed.scan, captured.pendingFiles);
       } catch {
         scan = {
           results: [],
           fallbackEvidence: [],
+          conclusivePaths: [],
+          unresolvedPaths: [...captured.pendingFiles],
           durationMs: 0,
           filesScanned: 0,
           bytesScanned: 0,
@@ -816,24 +938,39 @@ export class RepoMapRuntime {
           timedOut: false,
           cancelled: Boolean(options.signal?.aborted),
         };
+      } finally {
+        this.#pendingFallbackControllers.delete(controller);
       }
       if (options.signal?.aborted) {
         recordTelemetry(this.#telemetry, (telemetry) =>
-          telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false),
+          telemetry.recordLexicalFallback(
+            {
+              ...scan,
+              matchesReturned: 0,
+              timedOut: false,
+              cancelled: true,
+            },
+            false,
+          ),
         );
         throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
       }
-      // A notification, activation, close, or concurrent flush retires the
-      // captured pending set. Never pair its transient source bytes with a
-      // different indexed capture.
-      if (
+      const retired =
         !this.#started ||
         scanEpoch !== this.#mutationEpoch ||
         scanContentVersion !== this.#effectiveContentVersion ||
-        scanGeneration !== this.#generation
-      ) {
+        scanGeneration !== this.#generation;
+      if (retired || scan.cancelled || scan.timedOut) {
         recordTelemetry(this.#telemetry, (telemetry) =>
-          telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false),
+          telemetry.recordLexicalFallback(
+            {
+              ...scan,
+              matchesReturned: 0,
+              timedOut: retired || scan.cancelled ? false : scan.timedOut,
+              cancelled: retired || scan.cancelled,
+            },
+            false,
+          ),
         );
         return captured;
       }
@@ -903,6 +1040,79 @@ export class RepoMapRuntime {
     }
   }
 
+  async #readLiveSourceExcerpt(path: string, signal: AbortSignal): Promise<string | typeof LOGICAL_OPERATION_ABORTED> {
+    const normalized = normalizeLexicalFallbackPath(path);
+    if (normalized !== path || signal.aborted) return LOGICAL_OPERATION_ABORTED;
+    const absolute = resolve(this.#projectRoot, normalized);
+    if (this.#options.indexFileSystem) {
+      const operation = Promise.resolve().then(() =>
+        (this.#options.indexFileSystem as RepoMapFileSystem).readFile(absolute),
+      );
+      const completed = await abortableOperation(operation, signal);
+      return completed === LOGICAL_OPERATION_ABORTED
+        ? completed
+        : boundedUtf8(completed, LIVE_STALE_EVIDENCE_LIMITS.maxSourceBytes);
+    }
+
+    if (this.#options.beforeLiveSourceResolve) {
+      const hook = await abortableOperation(
+        Promise.resolve().then(() => this.#options.beforeLiveSourceResolve?.(absolute)),
+        signal,
+      );
+      if (hook === LOGICAL_OPERATION_ABORTED) return hook;
+    }
+    const canonicalRoot = await abortableOperation(realpath(this.#projectRoot), signal);
+    if (canonicalRoot === LOGICAL_OPERATION_ABORTED) return canonicalRoot;
+    // #projectRoot is captured canonically during start(). Do not let a later
+    // rename/symlink replacement rebase containment onto a different tree.
+    if (canonicalRoot !== this.#projectRoot) throw new Error("canonical project root changed after startup");
+    const initial = await abortableOperation(lstat(absolute, { bigint: true }), signal);
+    if (initial === LOGICAL_OPERATION_ABORTED) return initial;
+    if (!initial.isFile()) throw new Error("live source is not a regular file");
+    const canonical = await abortableOperation(realpath(absolute), signal);
+    if (canonical === LOGICAL_OPERATION_ABORTED) return canonical;
+    const canonicalRelative = relative(canonicalRoot, canonical);
+    if (
+      !canonicalRelative ||
+      canonicalRelative === ".." ||
+      canonicalRelative.startsWith(`..${sep}`) ||
+      isAbsolute(canonicalRelative)
+    ) {
+      throw new Error("live source escapes the canonical project root");
+    }
+    if (this.#options.beforeLiveSourceOpen) {
+      const hook = await abortableOperation(
+        Promise.resolve().then(() => this.#options.beforeLiveSourceOpen?.(absolute)),
+        signal,
+      );
+      if (hook === LOGICAL_OPERATION_ABORTED) return hook;
+    }
+
+    const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
+    const opened = await abortableOperation(open(absolute, flags), signal, (lateHandle) => lateHandle.close());
+    if (opened === LOGICAL_OPERATION_ABORTED) return opened;
+    let closePromise: Promise<void> | undefined;
+    const close = () => {
+      closePromise ??= opened.close();
+      void closePromise.catch(() => undefined);
+      return closePromise;
+    };
+    try {
+      const current = await abortableOperation(opened.stat({ bigint: true }), signal);
+      if (current === LOGICAL_OPERATION_ABORTED) return current;
+      if (!current.isFile() || current.dev !== initial.dev || current.ino !== initial.ino) {
+        throw new Error("live source identity changed before read");
+      }
+      const buffer = Buffer.alloc(LIVE_STALE_EVIDENCE_LIMITS.maxSourceBytes);
+      const readResult = await abortableOperation(opened.read(buffer, 0, buffer.byteLength, 0), signal);
+      if (readResult === LOGICAL_OPERATION_ABORTED) return readResult;
+      return boundedUtf8(buffer.subarray(0, readResult.bytesRead), LIVE_STALE_EVIDENCE_LIMITS.maxSourceBytes);
+    } finally {
+      // Initiate owned-handle closure exactly once even after logical retirement.
+      await abortableOperation(close(), signal);
+    }
+  }
+
   async #queryCurrentUninstrumented(
     query: string,
     options: RepoMapQueryOptions,
@@ -939,24 +1149,52 @@ export class RepoMapRuntime {
       const terms = query.toLowerCase().match(/[\p{L}\p{N}_$-]{2,}/gu) ?? [];
       for (const file of files) {
         if (terms.some((term) => file.lexicalTerms.includes(term))) {
-          let excerpt = file.lexicalTerms.slice(0, 40).join(" ");
-          if (liveFallback) {
-            try {
-              const content = this.#options.indexFileSystem
-                ? await this.#options.indexFileSystem.readFile(join(this.#projectRoot, file.path))
-                : await readFile(join(this.#projectRoot, file.path));
-              excerpt = content.toString("utf8").slice(0, 4 * 1024);
-            } catch {
-              // Indexed terms remain useful when a live source read fails.
-            }
-          }
-          fallbackEvidence.push({ kind: "source", path: file.path, excerpt });
-          if (fallbackEvidence.length >= 3) break;
+          fallbackEvidence.push({ kind: "source", path: file.path, excerpt: file.lexicalTerms.slice(0, 40).join(" ") });
+          if (fallbackEvidence.length >= LIVE_STALE_EVIDENCE_LIMITS.maxSourceRows) break;
         }
       }
       if (liveFallback) {
-        const diff = await gitDiff(this.#projectRoot, this.#gitRunner, this.#telemetry, this.#monotonicNow);
-        if (diff) fallbackEvidence.push({ kind: "git-diff", excerpt: diff });
+        const timeoutController = new AbortController();
+        const timeout = setTimeout(() => timeoutController.abort(), LIVE_STALE_EVIDENCE_LIMITS.deadlineMs);
+        timeout.unref();
+        const liveSignal = options.signal
+          ? AbortSignal.any([options.signal, timeoutController.signal])
+          : timeoutController.signal;
+        const liveEvidence: RepoMapFallbackEvidence[] = [];
+        let completedEnvelope = true;
+        try {
+          for (const evidence of fallbackEvidence) {
+            if (!evidence.path) continue;
+            try {
+              const excerpt = await this.#readLiveSourceExcerpt(evidence.path, liveSignal);
+              if (excerpt === LOGICAL_OPERATION_ABORTED) {
+                completedEnvelope = false;
+                break;
+              }
+              liveEvidence.push({ kind: "source", path: evidence.path, excerpt });
+            } catch {
+              // Retain the coherent indexed excerpt when a bounded live read fails.
+              liveEvidence.push(evidence);
+            }
+          }
+          if (completedEnvelope && !liveSignal.aborted) {
+            const diffOperation = gitDiff(
+              this.#projectRoot,
+              this.#gitRunner,
+              liveSignal,
+              this.#telemetry,
+              this.#monotonicNow,
+            );
+            const diff = await abortableOperation(diffOperation, liveSignal);
+            if (diff === LOGICAL_OPERATION_ABORTED) completedEnvelope = false;
+            else if (diff) liveEvidence.push({ kind: "git-diff", excerpt: diff });
+          }
+          // Publish the live batch atomically; retirement never leaks partial live evidence.
+          if (completedEnvelope && !liveSignal.aborted)
+            fallbackEvidence.splice(0, fallbackEvidence.length, ...liveEvidence);
+        } finally {
+          clearTimeout(timeout);
+        }
       }
       // Preserve queryCurrent's coherent-snapshot fallback contract. Live
       // queries do not fabricate an unrelated first-file source row before a
@@ -1033,6 +1271,7 @@ export class RepoMapRuntime {
 
   async close(): Promise<void> {
     this.#started = false;
+    this.#retirePendingFallbacks();
     if (this.#scheduled !== undefined) this.#scheduler.cancel(this.#scheduled);
     this.#scheduled = undefined;
     await this.#watcher?.close();
@@ -1129,13 +1368,19 @@ export class RepoMapRuntime {
   #mutateEffective(mutation: () => void): void {
     const before = searchableContent(this.#effective);
     mutation();
-    if (searchableContent(this.#effective) !== before) this.#effectiveContentVersion += 1;
+    if (searchableContent(this.#effective) !== before) {
+      this.#effectiveContentVersion += 1;
+      this.#retirePendingFallbacks();
+    }
   }
 
   #replaceEffective(snapshot: RepoMapSnapshot): void {
     const before = searchableContent(this.#effective);
     this.#effective = snapshot;
-    if (searchableContent(snapshot) !== before) this.#effectiveContentVersion += 1;
+    if (searchableContent(snapshot) !== before) {
+      this.#effectiveContentVersion += 1;
+      this.#retirePendingFallbacks();
+    }
   }
 
   async #fileFingerprint(path: string): Promise<FileFingerprint | undefined> {
@@ -1463,6 +1708,9 @@ export class RepoMapRuntime {
   }
 
   async #activate(): Promise<void> {
+    // Activation itself is a retirement boundary, including semantic no-op
+    // activation where the searchable content and generation stay unchanged.
+    this.#retirePendingFallbacks();
     if (!this.#effective) throw new Error("repository map is unavailable");
     await this.#assertStateBoundary();
     await withFileLock(

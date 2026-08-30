@@ -16,7 +16,9 @@ Every supplied candidate consumes the path-count and UTF-8 path-byte envelope be
 
 Git admission uses one bounded `git ls-files --cached --others --exclude-standard` operation and intersects its output with the candidates. This preserves tracked files that are now ignored and rejects ignored untracked files. Only an explicit `not a git repository` result under the C locale permits the hardened root-`.gitignore` non-Git path; every ambiguous Git failure fails closed.
 
-Candidate reads reuse Spec 0020's identity checks, no-follow/canonical containment, binary detection, file/source/count/concurrency/deadline/result/excerpt bounds, and cancellation. Deadlines remain cooperative for an active filesystem operation; all count and byte limits are hard.
+Candidate reads reuse Spec 0020's identity checks, no-follow/canonical containment, binary detection, file/source/count/concurrency/deadline/result/excerpt bounds, and cancellation. Before that scan, live indexed-source and Git-diff evidence share a 250 ms logical envelope, with at most three 4 KiB source reads and a 16 KiB Git diff; the native source path reads only the bounded prefix and Git receives both an abort signal and a 16 KiB subprocess buffer cap. The batch is published atomically, so retirement retains only coherent indexed evidence rather than partial live evidence.
+
+The scanner's 2,000 ms deadline is independently enforced by its runtime wrapper. Successful scanner output is revalidated using Spec 0020's output limits; every result/evidence/classification path must normalize to a contained captured candidate, result/evidence must be paired, and malformed or oversized output fails closed. The logical deadline and cancellation return are hard: directory enumeration, hooks, file operations, and batches are raced against retirement. Node/OS operations may continue, but every late settlement stays observed; closure of already-owned handles is initiated immediately and late-opened handles initiate closure when they arrive. Logical return does not claim OS cancellation or closure completion, and timed-out/cancelled scans publish no evidence. Count and byte limits remain hard. Runtime close, session replacement, notification, and every snapshot activation (including semantic no-op activation) abort in-flight pending scans, and timed-out or cancelled scanner output is never merged. Windows drive-qualified relative paths and cross-drive notifications are rejected lexically on every host.
 
 ## Ranking and evidence
 
@@ -24,4 +26,4 @@ Case-insensitive full-query literals in pending source or path rank before index
 
 ## Telemetry
 
-The aggregate lexical fallback counters cover both warming scans and stale-pending scans: attempts, used/no-match, capped, timeout, cancelled, duration, files, bytes, and returned pending matches. Queries, paths, excerpts, and source content are never retained.
+The aggregate lexical fallback counters cover both warming scans and stale-pending scans: attempts, used/no-match, capped, timeout, cancelled, duration, files, bytes, and returned pending matches. Each attempt records exactly one terminal outcome in priority order: cancelled, timeout, capped, used, then no-match. Timed-out or cancelled scans contribute zero returned matches. Queries, paths, excerpts, and source content are never retained.
