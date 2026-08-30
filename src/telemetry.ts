@@ -174,11 +174,12 @@ export class RepoContextTelemetry {
       cancelled: boolean;
     },
     used: boolean,
+    returnedMatches = used ? result.matchesReturned : 0,
   ): void {
     this.#values.pendingFallbackDurationMsTotal += finiteNonnegative(result.durationMs);
     this.#values.pendingFallbackFilesScanned += finiteNonnegative(result.filesScanned);
     this.#values.pendingFallbackBytesScanned += finiteNonnegative(result.bytesScanned);
-    this.#values.pendingFallbackMatchesReturned += finiteNonnegative(used ? result.matchesReturned : 0);
+    this.#values.pendingFallbackMatchesReturned += finiteNonnegative(returnedMatches);
     if (used) this.#values.pendingFallbackUsedCount += 1;
     else if (!result.cancelled && result.matchesReturned === 0) this.#values.pendingFallbackNoMatchCount += 1;
     if (result.capped) this.#values.pendingFallbackCappedCount += 1;

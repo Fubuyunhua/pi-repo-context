@@ -832,7 +832,6 @@ export class RepoMapRuntime {
     } finally {
       this.#pendingFallbackControllers.delete(controller);
     }
-    recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordPendingFallback(result, result.results.length > 0));
     return result;
   }
 
@@ -905,6 +904,11 @@ export class RepoMapRuntime {
           (left, right) => right.score - left.score || (left.path === right.path ? 0 : left.path < right.path ? -1 : 1),
         )
         .slice(0, limit);
+      const pendingPaths = new Set(pending.results.map((result) => result.path));
+      const returnedPending = results.filter((result) => pendingPaths.has(result.path)).length;
+      recordTelemetry(this.#telemetry, (telemetry) =>
+        telemetry.recordPendingFallback(pending, returnedPending > 0, returnedPending),
+      );
       fallbackEvidence.push(...pending.fallbackEvidence.slice(0, 3));
     }
     if (freshness === "stale") {

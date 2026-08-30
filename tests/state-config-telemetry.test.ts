@@ -130,6 +130,7 @@ it("exposes repository-only bounded telemetry", () => {
       cancelled: false,
     },
     true,
+    1,
   );
   telemetry.recordPendingFallback(
     {
@@ -178,7 +179,7 @@ it("exposes repository-only bounded telemetry", () => {
     pendingFallbackDurationMsTotal: 8,
     pendingFallbackFilesScanned: 3,
     pendingFallbackBytesScanned: 96,
-    pendingFallbackMatchesReturned: 2,
+    pendingFallbackMatchesReturned: 1,
     hydrationCount: 1,
     hydrationDurationMsTotal: 1,
     hydratedFastReuseCount: 1,
