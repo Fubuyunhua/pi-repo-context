@@ -337,6 +337,67 @@ it("returns relevant same-call lexical evidence after the existing warming grace
   start.resolve();
 });
 
+it("discards malicious timed-out and cancelled warming scan evidence while the session remains current", async () => {
+  for (const outcome of ["timedOut", "cancelled"] as const) {
+    const target = harness();
+    const start = deferred();
+    const controller = fakeController({ start: vi.fn(() => start.promise) });
+    const malicious: LexicalFallbackScanResult = {
+      results: [
+        {
+          path: "private/late.ts",
+          score: 999,
+          kind: "lexical",
+          matchedSymbols: [],
+          matchReasons: ["must not publish"],
+          symbols: [],
+          dependencies: [],
+        },
+      ],
+      fallbackEvidence: [{ kind: "source", path: "private/late.ts", excerpt: "privateLateWarmingEvidence" }],
+      durationMs: 750,
+      filesScanned: 1,
+      bytesScanned: 64,
+      enumeratedPaths: 1,
+      enumerationBytes: 16,
+      matchesReturned: 1,
+      capped: false,
+      timedOut: outcome === "timedOut",
+      cancelled: outcome === "cancelled",
+    };
+    registerRepoContext(target.pi, {
+      resolveProjectState: async () => projectState,
+      loadConfig: async () => config,
+      runtimeFactory: () => controller,
+      initializationWaiter: async () => "timeout",
+      lexicalFallbackScanner: async () => malicious,
+    });
+    await target.events.get("session_start")?.[0]({}, headlessContext);
+
+    const result = (await target.tools.get("repo_context_search")?.execute("id", { query: outcome })) as {
+      content: Array<{ text: string }>;
+      details: { results: unknown[]; fallbackEvidence: Array<{ excerpt: string }> };
+    };
+    expect(result.details.results).toEqual([]);
+    expect(result.details.fallbackEvidence).toEqual([
+      { kind: "warming", excerpt: "No lexical match found within the bounded warming scan." },
+    ]);
+    expect(result.content[0]?.text).not.toContain("privateLateWarmingEvidence");
+    const status = (await target.tools.get("repo_context_status")?.execute()) as {
+      details: { telemetry: Record<string, number> };
+    };
+    expect(status.details.telemetry).toMatchObject({
+      lexicalFallbackUsedCount: 0,
+      lexicalFallbackNoMatchCount: 0,
+      lexicalFallbackTimeoutCount: outcome === "timedOut" ? 1 : 0,
+      lexicalFallbackCancelledCount: outcome === "cancelled" ? 1 : 0,
+      lexicalFallbackMatchesReturned: 0,
+      warmingEmptyReturnCount: 1,
+    });
+    start.resolve();
+  }
+});
+
 it("sanitizes lexical scanner failures, cleans up, and records one terminal outcome", async () => {
   const target = harness();
   const start = deferred();

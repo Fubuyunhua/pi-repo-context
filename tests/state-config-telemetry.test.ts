@@ -118,6 +118,18 @@ it("exposes repository-only bounded telemetry", () => {
     },
     false,
   );
+  telemetry.recordLexicalFallback(
+    {
+      durationMs: 3,
+      filesScanned: 1,
+      bytesScanned: 8,
+      matchesReturned: 0,
+      capped: false,
+      timedOut: false,
+      cancelled: false,
+    },
+    false,
+  );
   telemetry.recordPendingFallbackAttempt();
   telemetry.recordPendingFallback(
     {
@@ -166,9 +178,9 @@ it("exposes repository-only bounded telemetry", () => {
     lexicalFallbackCappedCount: 1,
     lexicalFallbackTimeoutCount: 1,
     lexicalFallbackCancelledCount: 1,
-    lexicalFallbackDurationMsTotal: 9,
-    lexicalFallbackFilesScanned: 3,
-    lexicalFallbackBytesScanned: 80,
+    lexicalFallbackDurationMsTotal: 12,
+    lexicalFallbackFilesScanned: 4,
+    lexicalFallbackBytesScanned: 88,
     lexicalFallbackMatchesReturned: 1,
     pendingFallbackAttemptCount: 1,
     pendingFallbackUsedCount: 1,

@@ -550,6 +550,9 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     cancelled,
   });
 
+  const withoutCancelledFallbackEvidence = (scan: LexicalFallbackScanResult): LexicalFallbackScanResult =>
+    scan.timedOut || scan.cancelled ? { ...scan, results: [], fallbackEvidence: [], matchesReturned: 0 } : scan;
+
   const warmingResult = (scan?: LexicalFallbackScanResult): RepoMapRuntimeQuery => ({
     results: scan?.results ?? [],
     freshness: "stale",
@@ -609,6 +612,7 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
           } finally {
             target.fallbackControllers.delete(controller);
           }
+          scan = withoutCancelledFallbackEvidence(scan);
           if (!isCurrent(target)) {
             target.telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false);
             throw new Error(PUBLIC_ERRORS.unavailable);

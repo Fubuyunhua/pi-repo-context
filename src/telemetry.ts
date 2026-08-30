@@ -155,7 +155,8 @@ export class RepoContextTelemetry {
     this.#values.lexicalFallbackBytesScanned += finiteNonnegative(result.bytesScanned);
     this.#values.lexicalFallbackMatchesReturned += finiteNonnegative(returnedMatches);
     if (used) this.#values.lexicalFallbackUsedCount += 1;
-    else if (!result.cancelled && result.matchesReturned === 0) this.#values.lexicalFallbackNoMatchCount += 1;
+    else if (!result.cancelled && !result.timedOut && result.matchesReturned === 0)
+      this.#values.lexicalFallbackNoMatchCount += 1;
     if (result.capped) this.#values.lexicalFallbackCappedCount += 1;
     if (result.timedOut) this.#values.lexicalFallbackTimeoutCount += 1;
     if (result.cancelled) this.#values.lexicalFallbackCancelledCount += 1;
