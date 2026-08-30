@@ -1,0 +1,319 @@
+{
+  "generatedAt": "2026-08-30T11:18:17.546Z",
+  "files": 100,
+  "stateBytes": 194574,
+  "coldStatus": {
+    "generation": 1,
+    "freshness": "fresh",
+    "workspaceRevision": "d910fa0a7cdc10b707b8b7d5ae89a3559d77ebddb0dc394d514afc925b4b68d3"
+  },
+  "warmStatus": {
+    "generation": 4,
+    "freshness": "dirty",
+    "workspaceRevision": "30310d32eab349590132d5d53dabedbfb0b8460b1eed1b06f9a14c1f4a391513"
+  },
+  "queries": {
+    "coldTop": "src/file-00099.ts",
+    "warmTop": "src/file-00099.ts",
+    "incrementalOneTop": "src/file-00099.ts",
+    "incrementalHundredTop": "src/file-00099.ts",
+    "incrementalHundredRetryTop": "src/file-00099.ts",
+    "incrementalHundredFallbackEvidence": [],
+    "incrementalHundredResults": [
+      {
+        "path": "src/file-00099.ts",
+        "score": 37.70876677110594,
+        "matchedSymbols": [
+          "syntheticSymbol99",
+          "BATCH_MARKER_99"
+        ],
+        "matchReasons": [
+          "exact symbol: BATCH_MARKER_99",
+          "exact export: BATCH_MARKER_99",
+          "exact identifier: batch_marker_99",
+          "matched terms: 99, batch"
+        ]
+      },
+      {
+        "path": "src/file-00019.ts",
+        "score": 7.530090511951231,
+        "matchedSymbols": [
+          "BATCH_MARKER_19"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00029.ts",
+        "score": 7.530090511951231,
+        "matchedSymbols": [
+          "BATCH_MARKER_29"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00039.ts",
+        "score": 7.530090511951231,
+        "matchedSymbols": [
+          "BATCH_MARKER_39"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00049.ts",
+        "score": 7.530090511951231,
+        "matchedSymbols": [
+          "BATCH_MARKER_49"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00059.ts",
+        "score": 7.530090511951231,
+        "matchedSymbols": [
+          "BATCH_MARKER_59"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00069.ts",
+        "score": 7.530090511951231,
+        "matchedSymbols": [
+          "BATCH_MARKER_69"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00079.ts",
+        "score": 7.530090511951231,
+        "matchedSymbols": [
+          "BATCH_MARKER_79"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00089.ts",
+        "score": 7.530090511951231,
+        "matchedSymbols": [
+          "BATCH_MARKER_89"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00090.ts",
+        "score": 7.530090511951231,
+        "matchedSymbols": [
+          "BATCH_MARKER_90"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      }
+    ]
+  },
+  "statusAfterIncrementalHundred": {
+    "generation": 4,
+    "freshness": "dirty",
+    "pendingFiles": []
+  },
+  "stages": [
+    {
+      "name": "coldStart",
+      "elapsedMs": 303.62,
+      "cpuUserMs": 140,
+      "cpuSystemMs": 109,
+      "rssBefore": 137326592,
+      "rssAfter": 162201600,
+      "rssAfterGc": 162770944,
+      "heapUsedAfterGc": 15844126,
+      "externalAfterGc": 6711392,
+      "arrayBuffersAfterGc": 32992,
+      "maxRssKb": 160160
+    },
+    {
+      "name": "coldQuery",
+      "elapsedMs": 90.27,
+      "cpuUserMs": 32,
+      "cpuSystemMs": 0,
+      "rssBefore": 162787328,
+      "rssAfter": 168939520,
+      "rssAfterGc": 169029632,
+      "heapUsedAfterGc": 17568830,
+      "externalAfterGc": 7120785,
+      "arrayBuffersAfterGc": 16496,
+      "maxRssKb": 165068
+    },
+    {
+      "name": "warmStart",
+      "elapsedMs": 262.58,
+      "cpuUserMs": 110,
+      "cpuSystemMs": 109,
+      "rssBefore": 169066496,
+      "rssAfter": 163762176,
+      "rssAfterGc": 158404608,
+      "heapUsedAfterGc": 20920679,
+      "externalAfterGc": 7646100,
+      "arrayBuffersAfterGc": 32992,
+      "maxRssKb": 167652
+    },
+    {
+      "name": "warmQuery",
+      "elapsedMs": 70.28,
+      "cpuUserMs": 0,
+      "cpuSystemMs": 31,
+      "rssBefore": 158404608,
+      "rssAfter": 161046528,
+      "rssAfterGc": 162328576,
+      "heapUsedAfterGc": 16936213,
+      "externalAfterGc": 7748203,
+      "arrayBuffersAfterGc": 32992,
+      "maxRssKb": 167652
+    },
+    {
+      "name": "incrementalOne",
+      "elapsedMs": 145.97,
+      "cpuUserMs": 157,
+      "cpuSystemMs": 109,
+      "rssBefore": 162656256,
+      "rssAfter": 166117376,
+      "rssAfterGc": 165445632,
+      "heapUsedAfterGc": 19203031,
+      "externalAfterGc": 7911067,
+      "arrayBuffersAfterGc": 16496,
+      "maxRssKb": 167652
+    },
+    {
+      "name": "incrementalHundred",
+      "elapsedMs": 405.01,
+      "cpuUserMs": 235,
+      "cpuSystemMs": 125,
+      "rssBefore": 206495744,
+      "rssAfter": 219303936,
+      "rssAfterGc": 220078080,
+      "heapUsedAfterGc": 24712804,
+      "externalAfterGc": 8430062,
+      "arrayBuffersAfterGc": 16496,
+      "maxRssKb": 214932
+    },
+    {
+      "name": "incrementalHundredRetry",
+      "elapsedMs": 120.73,
+      "cpuUserMs": 47,
+      "cpuSystemMs": 78,
+      "rssBefore": 220082176,
+      "rssAfter": 197832704,
+      "rssAfterGc": 197906432,
+      "heapUsedAfterGc": 22651313,
+      "externalAfterGc": 8509109,
+      "arrayBuffersAfterGc": 16496,
+      "maxRssKb": 214932
+    }
+  ],
+  "telemetry": {
+    "cold": {
+      "initializationAttemptCount": 0,
+      "warmupTimeoutCount": 0,
+      "searchAttemptCount": 0,
+      "indexedResultReturnCount": 0,
+      "warmingEmptyReturnCount": 0,
+      "lexicalFallbackAttemptCount": 0,
+      "lexicalFallbackUsedCount": 0,
+      "lexicalFallbackNoMatchCount": 0,
+      "lexicalFallbackCappedCount": 0,
+      "lexicalFallbackTimeoutCount": 0,
+      "lexicalFallbackCancelledCount": 0,
+      "lexicalFallbackDurationMsTotal": 0,
+      "lexicalFallbackFilesScanned": 0,
+      "lexicalFallbackBytesScanned": 0,
+      "lexicalFallbackMatchesReturned": 0,
+      "hydrationCount": 1,
+      "hydrationDurationMsTotal": 4.934100000000001,
+      "hydratedFastReuseCount": 0,
+      "fullBuildCount": 1,
+      "fullBuildDurationMsTotal": 214.19310000000007,
+      "repoMapQueryCount": 1,
+      "repoMapQueryDurationMsTotal": 90.03150000000005,
+      "ensureFreshCount": 1,
+      "ensureFreshDurationMsTotal": 69.54169999999999,
+      "filesReindexed": 0,
+      "gitHeadCount": 4,
+      "gitHeadDurationMsTotal": 112.61540000000002,
+      "gitDirtyCount": 4,
+      "gitDirtyDurationMsTotal": 106.99759999999992,
+      "gitDiffCount": 0,
+      "gitDiffDurationMsTotal": 0,
+      "searchIndexBuildCount": 1,
+      "searchIndexBuildDurationMsTotal": 11.527899999999931,
+      "generationWriteCount": 1,
+      "generationWriteDurationMsTotal": 22.40300000000002,
+      "generationCreatedCount": 1,
+      "generationBytesWritten": 48421,
+      "repoMapTotalBytes": 48421,
+      "generationPruneCount": 1,
+      "generationPruneDurationMsTotal": 4.103099999999927,
+      "generationPrunedFiles": 0,
+      "generationPrunedBytes": 0,
+      "maintenanceFailureCount": 0
+    },
+    "warm": {
+      "initializationAttemptCount": 0,
+      "warmupTimeoutCount": 0,
+      "searchAttemptCount": 0,
+      "indexedResultReturnCount": 0,
+      "warmingEmptyReturnCount": 0,
+      "lexicalFallbackAttemptCount": 0,
+      "lexicalFallbackUsedCount": 0,
+      "lexicalFallbackNoMatchCount": 0,
+      "lexicalFallbackCappedCount": 0,
+      "lexicalFallbackTimeoutCount": 0,
+      "lexicalFallbackCancelledCount": 0,
+      "lexicalFallbackDurationMsTotal": 0,
+      "lexicalFallbackFilesScanned": 0,
+      "lexicalFallbackBytesScanned": 0,
+      "lexicalFallbackMatchesReturned": 0,
+      "hydrationCount": 1,
+      "hydrationDurationMsTotal": 13.260400000000004,
+      "hydratedFastReuseCount": 0,
+      "fullBuildCount": 1,
+      "fullBuildDurationMsTotal": 152.88030000000003,
+      "repoMapQueryCount": 4,
+      "repoMapQueryDurationMsTotal": 741.6903000000002,
+      "ensureFreshCount": 4,
+      "ensureFreshDurationMsTotal": 707.8841,
+      "filesReindexed": 102,
+      "gitHeadCount": 9,
+      "gitHeadDurationMsTotal": 254.84889999999962,
+      "gitDirtyCount": 8,
+      "gitDirtyDurationMsTotal": 233.0962999999997,
+      "gitDiffCount": 0,
+      "gitDiffDurationMsTotal": 0,
+      "searchIndexBuildCount": 3,
+      "searchIndexBuildDurationMsTotal": 16.637600000000248,
+      "generationWriteCount": 3,
+      "generationWriteDurationMsTotal": 62.971000000000004,
+      "generationCreatedCount": 3,
+      "generationBytesWritten": 194529,
+      "repoMapTotalBytes": 194529,
+      "generationPruneCount": 4,
+      "generationPruneDurationMsTotal": 15.504699999999957,
+      "generationPrunedFiles": 1,
+      "generationPrunedBytes": 48421,
+      "maintenanceFailureCount": 0
+    }
+  }
+}

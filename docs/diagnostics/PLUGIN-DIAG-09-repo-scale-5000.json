@@ -1,0 +1,355 @@
+{
+  "generatedAt": "2026-08-30T11:18:48.765Z",
+  "files": 5000,
+  "stateBytes": 7355014,
+  "coldStatus": {
+    "generation": 1,
+    "freshness": "fresh",
+    "workspaceRevision": "d910fa0a7cdc10b707b8b7d5ae89a3559d77ebddb0dc394d514afc925b4b68d3"
+  },
+  "warmStatus": {
+    "generation": 4,
+    "freshness": "dirty",
+    "workspaceRevision": "7de2a5918fab7f148fbcedb54c0b33cf4c0aa896575c38b9f0d8f6d08bd2b9c0"
+  },
+  "queries": {
+    "coldTop": "src/file-04999.ts",
+    "warmTop": "src/file-04999.ts",
+    "incrementalOneTop": "src/file-04999.ts",
+    "incrementalHundredTop": "src/file-00019.ts",
+    "incrementalHundredRetryTop": "src/file-00099.ts",
+    "incrementalHundredFallbackEvidence": [
+      {
+        "kind": "source",
+        "path": "src/file-00000.ts",
+        "excerpt": "export function syntheticSymbol0() { return 0; }\nexport const BATCH_MARKER_0 = true;\n"
+      }
+    ],
+    "incrementalHundredResults": [
+      {
+        "path": "src/file-00019.ts",
+        "score": 8.630246664257141,
+        "matchedSymbols": [
+          "BATCH_MARKER_19"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00029.ts",
+        "score": 8.630246664257141,
+        "matchedSymbols": [
+          "BATCH_MARKER_29"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00039.ts",
+        "score": 8.630246664257141,
+        "matchedSymbols": [
+          "BATCH_MARKER_39"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00049.ts",
+        "score": 8.630246664257141,
+        "matchedSymbols": [
+          "BATCH_MARKER_49"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00059.ts",
+        "score": 8.630246664257141,
+        "matchedSymbols": [
+          "BATCH_MARKER_59"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00009.ts",
+        "score": 8.630244594528328,
+        "matchedSymbols": [
+          "BATCH_MARKER_9"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00010.ts",
+        "score": 8.616427503921678,
+        "matchedSymbols": [
+          "BATCH_MARKER_10"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00011.ts",
+        "score": 8.616427503921678,
+        "matchedSymbols": [
+          "BATCH_MARKER_11"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00012.ts",
+        "score": 8.616427503921678,
+        "matchedSymbols": [
+          "BATCH_MARKER_12"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      },
+      {
+        "path": "src/file-00013.ts",
+        "score": 8.616427503921678,
+        "matchedSymbols": [
+          "BATCH_MARKER_13"
+        ],
+        "matchReasons": [
+          "matched terms: batch, batch_marker_99"
+        ]
+      }
+    ]
+  },
+  "statusAfterIncrementalHundred": {
+    "generation": 3,
+    "freshness": "stale",
+    "pendingFiles": [
+      "src/file-00067.ts",
+      "src/file-00068.ts",
+      "src/file-00069.ts",
+      "src/file-00070.ts",
+      "src/file-00071.ts",
+      "src/file-00072.ts",
+      "src/file-00073.ts",
+      "src/file-00074.ts",
+      "src/file-00075.ts",
+      "src/file-00076.ts",
+      "src/file-00077.ts",
+      "src/file-00078.ts",
+      "src/file-00079.ts",
+      "src/file-00080.ts",
+      "src/file-00081.ts",
+      "src/file-00082.ts",
+      "src/file-00083.ts",
+      "src/file-00084.ts",
+      "src/file-00085.ts",
+      "src/file-00086.ts",
+      "src/file-00087.ts",
+      "src/file-00088.ts",
+      "src/file-00089.ts",
+      "src/file-00090.ts",
+      "src/file-00091.ts",
+      "src/file-00092.ts",
+      "src/file-00093.ts",
+      "src/file-00094.ts",
+      "src/file-00095.ts",
+      "src/file-00096.ts",
+      "src/file-00097.ts",
+      "src/file-00098.ts",
+      "src/file-00099.ts"
+    ]
+  },
+  "stages": [
+    {
+      "name": "coldStart",
+      "elapsedMs": 1873.58,
+      "cpuUserMs": 2266,
+      "cpuSystemMs": 1938,
+      "rssBefore": 122732544,
+      "rssAfter": 292499456,
+      "rssAfterGc": 292569088,
+      "heapUsedAfterGc": 55319486,
+      "externalAfterGc": 10705112,
+      "arrayBuffersAfterGc": 32992,
+      "maxRssKb": 285792
+    },
+    {
+      "name": "coldQuery",
+      "elapsedMs": 722.98,
+      "cpuUserMs": 906,
+      "cpuSystemMs": 94,
+      "rssBefore": 292589568,
+      "rssAfter": 436736000,
+      "rssAfterGc": 436744192,
+      "heapUsedAfterGc": 94206516,
+      "externalAfterGc": 11356009,
+      "arrayBuffersAfterGc": 16496,
+      "maxRssKb": 426520
+    },
+    {
+      "name": "warmStart",
+      "elapsedMs": 2231.91,
+      "cpuUserMs": 2063,
+      "cpuSystemMs": 2516,
+      "rssBefore": 530980864,
+      "rssAfter": 609734656,
+      "rssAfterGc": 609824768,
+      "heapUsedAfterGc": 242469003,
+      "externalAfterGc": 11232325,
+      "arrayBuffersAfterGc": 32992,
+      "maxRssKb": 595532
+    },
+    {
+      "name": "warmQuery",
+      "elapsedMs": 647.1,
+      "cpuUserMs": 781,
+      "cpuSystemMs": 156,
+      "rssBefore": 609837056,
+      "rssAfter": 452845568,
+      "rssAfterGc": 452943872,
+      "heapUsedAfterGc": 93434806,
+      "externalAfterGc": 11529797,
+      "arrayBuffersAfterGc": 16496,
+      "maxRssKb": 596916
+    },
+    {
+      "name": "incrementalOne",
+      "elapsedMs": 852.46,
+      "cpuUserMs": 703,
+      "cpuSystemMs": 250,
+      "rssBefore": 460058624,
+      "rssAfter": 722149376,
+      "rssAfterGc": 722219008,
+      "heapUsedAfterGc": 301420530,
+      "externalAfterGc": 11105198,
+      "arrayBuffersAfterGc": 16496,
+      "maxRssKb": 705348
+    },
+    {
+      "name": "incrementalHundred",
+      "elapsedMs": 1920.19,
+      "cpuUserMs": 2172,
+      "cpuSystemMs": 515,
+      "rssBefore": 790183936,
+      "rssAfter": 943980544,
+      "rssAfterGc": 944021504,
+      "heapUsedAfterGc": 116229210,
+      "externalAfterGc": 11382084,
+      "arrayBuffersAfterGc": 33389,
+      "maxRssKb": 924796
+    },
+    {
+      "name": "incrementalHundredRetry",
+      "elapsedMs": 3054.62,
+      "cpuUserMs": 3015,
+      "cpuSystemMs": 625,
+      "rssBefore": 944050176,
+      "rssAfter": 843878400,
+      "rssAfterGc": 831332352,
+      "heapUsedAfterGc": 362953247,
+      "externalAfterGc": 11454614,
+      "arrayBuffersAfterGc": 16496,
+      "maxRssKb": 924796
+    }
+  ],
+  "telemetry": {
+    "cold": {
+      "initializationAttemptCount": 0,
+      "warmupTimeoutCount": 0,
+      "searchAttemptCount": 0,
+      "indexedResultReturnCount": 0,
+      "warmingEmptyReturnCount": 0,
+      "lexicalFallbackAttemptCount": 0,
+      "lexicalFallbackUsedCount": 0,
+      "lexicalFallbackNoMatchCount": 0,
+      "lexicalFallbackCappedCount": 0,
+      "lexicalFallbackTimeoutCount": 0,
+      "lexicalFallbackCancelledCount": 0,
+      "lexicalFallbackDurationMsTotal": 0,
+      "lexicalFallbackFilesScanned": 0,
+      "lexicalFallbackBytesScanned": 0,
+      "lexicalFallbackMatchesReturned": 0,
+      "hydrationCount": 1,
+      "hydrationDurationMsTotal": 5.5715000000000146,
+      "hydratedFastReuseCount": 0,
+      "fullBuildCount": 1,
+      "fullBuildDurationMsTotal": 1382.6188000000002,
+      "repoMapQueryCount": 1,
+      "repoMapQueryDurationMsTotal": 722.6886999999997,
+      "ensureFreshCount": 1,
+      "ensureFreshDurationMsTotal": 439.1169,
+      "filesReindexed": 0,
+      "gitHeadCount": 4,
+      "gitHeadDurationMsTotal": 122.59030000000166,
+      "gitDirtyCount": 4,
+      "gitDirtyDurationMsTotal": 120.2456000000002,
+      "gitDiffCount": 0,
+      "gitDiffDurationMsTotal": 0,
+      "searchIndexBuildCount": 1,
+      "searchIndexBuildDurationMsTotal": 253.02749999999924,
+      "generationWriteCount": 1,
+      "generationWriteDurationMsTotal": 28.656599999999344,
+      "generationCreatedCount": 1,
+      "generationBytesWritten": 2435122,
+      "repoMapTotalBytes": 2435122,
+      "generationPruneCount": 1,
+      "generationPruneDurationMsTotal": 3.233100000000377,
+      "generationPrunedFiles": 0,
+      "generationPrunedBytes": 0,
+      "maintenanceFailureCount": 0
+    },
+    "warm": {
+      "initializationAttemptCount": 0,
+      "warmupTimeoutCount": 0,
+      "searchAttemptCount": 0,
+      "indexedResultReturnCount": 0,
+      "warmingEmptyReturnCount": 0,
+      "lexicalFallbackAttemptCount": 0,
+      "lexicalFallbackUsedCount": 0,
+      "lexicalFallbackNoMatchCount": 0,
+      "lexicalFallbackCappedCount": 0,
+      "lexicalFallbackTimeoutCount": 0,
+      "lexicalFallbackCancelledCount": 0,
+      "lexicalFallbackDurationMsTotal": 0,
+      "lexicalFallbackFilesScanned": 0,
+      "lexicalFallbackBytesScanned": 0,
+      "lexicalFallbackMatchesReturned": 0,
+      "hydrationCount": 1,
+      "hydrationDurationMsTotal": 369.8811999999998,
+      "hydratedFastReuseCount": 0,
+      "fullBuildCount": 1,
+      "fullBuildDurationMsTotal": 1336.5106999999998,
+      "repoMapQueryCount": 4,
+      "repoMapQueryDurationMsTotal": 6473.925699999996,
+      "ensureFreshCount": 4,
+      "ensureFreshDurationMsTotal": 5360.328400000002,
+      "filesReindexed": 101,
+      "gitHeadCount": 9,
+      "gitHeadDurationMsTotal": 280.36439999999857,
+      "gitDirtyCount": 8,
+      "gitDirtyDurationMsTotal": 223.7902000000031,
+      "gitDiffCount": 1,
+      "gitDiffDurationMsTotal": 43.85139999999956,
+      "searchIndexBuildCount": 4,
+      "searchIndexBuildDurationMsTotal": 1002.6152999999995,
+      "generationWriteCount": 3,
+      "generationWriteDurationMsTotal": 82.02929999999651,
+      "generationCreatedCount": 3,
+      "generationBytesWritten": 7354969,
+      "repoMapTotalBytes": 7354969,
+      "generationPruneCount": 4,
+      "generationPruneDurationMsTotal": 24.31680000000597,
+      "generationPrunedFiles": 1,
+      "generationPrunedBytes": 2435122,
+      "maintenanceFailureCount": 0
+    }
+  }
+}
