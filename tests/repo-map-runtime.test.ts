@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildRepoMap, type RepoMapFileSystem } from "../src/repo-map/index.js";
+import { scanLexicalFallback } from "../src/repo-map/lexical-fallback.js";
 import {
   isWatcherIgnoredPath,
   LIVE_STALE_EVIDENCE_LIMITS,
@@ -2187,6 +2188,280 @@ describe("incremental repository map runtime", () => {
     await runtime.close();
   });
 
+  it("defers a due scheduled flush across live evidence and resumes it once after query release", async () => {
+    const files = Object.fromEntries(
+      Array.from({ length: 65 }, (_, index) => [
+        `src/deferred-${index.toString().padStart(2, "0")}.ts`,
+        index === 64 ? 'export const scheduledLeaseNeedle = "old";' : `export const deferredValue${index} = ${index};`,
+      ]),
+    );
+    const { root, stateRoot } = await fixture(files, false);
+    const scheduler = new ManualScheduler();
+    const liveReadStarted = deferred();
+    const releaseLiveRead = deferred();
+    const target = join(root, "src/deferred-64.ts");
+    let armed = false;
+    let incrementalReads = 0;
+    let deadlineExpired = false;
+    let scannerGeneration = -1;
+    const pendingScanner = vi.fn(async () => {
+      scannerGeneration = runtime.status().generation;
+      return {
+        results: [
+          {
+            path: "src/deferred-64.ts",
+            score: 1,
+            kind: "lexical" as const,
+            matchedSymbols: [],
+            matchReasons: ["pending lexical fallback: exact query"],
+            symbols: [],
+            dependencies: [],
+          },
+        ],
+        fallbackEvidence: [{ kind: "source" as const, path: "src/deferred-64.ts", excerpt: "scheduledLeaseNeedle" }],
+        conclusivePaths: ["src/deferred-64.ts"],
+        unresolvedPaths: [],
+        durationMs: 1,
+        filesScanned: 1,
+        bytesScanned: 20,
+        enumeratedPaths: 1,
+        enumerationBytes: 18,
+        matchesReturned: 1,
+        capped: false,
+        timedOut: false,
+        cancelled: false,
+      };
+    });
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler,
+      monotonicNow: () => (deadlineExpired ? 1_001 : 0),
+      indexFileSystem: {
+        lstat,
+        async readFile(path) {
+          if (armed && path.replaceAll("\\", "/").includes("/src/deferred-") && ++incrementalReads === 64) {
+            deadlineExpired = true;
+          }
+          if (deadlineExpired && path === target) {
+            liveReadStarted.resolve();
+            await releaseLiveRead.promise;
+          }
+          return readFile(path);
+        },
+      },
+      pendingScanner,
+    });
+    await runtime.start();
+
+    armed = true;
+    for (let index = 0; index < 65; index += 1) {
+      const path = `src/deferred-${index.toString().padStart(2, "0")}.ts`;
+      await writeFile(
+        join(root, path),
+        index === 64
+          ? 'export const scheduledLeaseNeedle = "new";'
+          : `export const deferredChanged${index} = ${index};`,
+      );
+      runtime.notify("change", path);
+    }
+
+    const querying = runtime.query("scheduledLeaseNeedle");
+    await liveReadStarted.promise;
+    const capturedGeneration = runtime.status().generation;
+    expect(scheduler.tasks.size).toBe(1);
+    scheduler.run();
+    expect(scheduler.tasks.size).toBe(0);
+    expect(runtime.status().generation).toBe(capturedGeneration);
+
+    releaseLiveRead.resolve();
+    const result = await querying;
+    expect(pendingScanner).toHaveBeenCalledOnce();
+    expect(scannerGeneration).toBe(capturedGeneration);
+    expect(result.results[0]).toMatchObject({
+      path: "src/deferred-64.ts",
+      matchReasons: ["pending lexical fallback: exact query"],
+    });
+    expect(runtime.status().generation).toBe(capturedGeneration);
+    expect(scheduler.tasks.size).toBe(1);
+
+    scheduler.run();
+    await vi.waitFor(() => expect(runtime.status().pendingFiles).toEqual([]));
+    expect(scheduler.tasks.size).toBe(0);
+    await runtime.close();
+  });
+
+  it("holds a deferred scheduled flush until the final overlapping live query releases", async () => {
+    const { root, stateRoot } = await fixture({ "src/overlap.ts": "export const overlapNeedle = true;" }, false);
+    const failures = controlledReadFailures();
+    const scheduler = new ManualScheduler();
+    const diffGates: Array<ReturnType<typeof deferred>> = [];
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler,
+      indexFileSystem: failures.fileSystem,
+      gitRunner: async (_projectRoot, args, encoding) => {
+        if (args[0] === "diff") {
+          const gate = deferred();
+          diffGates.push(gate);
+          await gate.promise;
+          return { stdout: Buffer.alloc(0) };
+        }
+        throw new Error(`no git ${encoding}`);
+      },
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/overlap.ts"), "export const overlapNeedle = false;");
+    failures.fail(join(root, "src/overlap.ts"));
+    runtime.notify("change", "src/overlap.ts");
+
+    const first = runtime.query("overlapNeedle");
+    await vi.waitFor(() => expect(diffGates).toHaveLength(1));
+    const second = runtime.query("overlapNeedle");
+    await vi.waitFor(() => expect(diffGates).toHaveLength(2));
+    runtime.notify("change", "src/overlap.ts");
+    scheduler.run();
+    expect(scheduler.tasks.size).toBe(0);
+
+    diffGates[0].resolve();
+    await first;
+    expect(scheduler.tasks.size).toBe(0);
+    diffGates[1].resolve();
+    await second;
+    expect(scheduler.tasks.size).toBe(1);
+
+    failures.recover(join(root, "src/overlap.ts"));
+    scheduler.run();
+    await vi.waitFor(() => expect(runtime.status().pendingFiles).toEqual([]));
+    await runtime.close();
+  });
+
+  it("keeps public flush as an immediate pending-scanner retirement boundary", async () => {
+    const { root, stateRoot } = await fixture({ "src/public-flush.ts": "export const oldPublicFlush = true;" }, false);
+    const failures = controlledReadFailures();
+    const scanStarted = deferred();
+    let scanSignal: AbortSignal | undefined;
+    const telemetry = new Telemetry();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+      indexFileSystem: failures.fileSystem,
+      telemetry,
+      pendingScanner: async (options) => {
+        scanSignal = options.signal;
+        scanStarted.resolve();
+        return new Promise<never>(() => {});
+      },
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/public-flush.ts"), "export const newPublicFlush = true;");
+    failures.fail(join(root, "src/public-flush.ts"));
+    runtime.notify("change", "src/public-flush.ts");
+
+    const querying = runtime.query("newPublicFlush");
+    await scanStarted.promise;
+    failures.recover(join(root, "src/public-flush.ts"));
+    await runtime.flush();
+    expect(scanSignal?.aborted).toBe(true);
+    await expect(querying).resolves.toMatchObject({
+      freshness: "dirty",
+      results: [expect.objectContaining({ path: "src/public-flush.ts" })],
+    });
+    expect(telemetry.snapshot()).toMatchObject({
+      lexicalFallbackCancelledCount: 1,
+      lexicalFallbackMatchesReturned: 0,
+    });
+    await runtime.close();
+  });
+
+  it("releases the live-query lease after caller abort", async () => {
+    const { root, stateRoot } = await fixture({ "src/abort-lease.ts": "export const oldAbortLease = true;" }, false);
+    const failures = controlledReadFailures();
+    const scheduler = new ManualScheduler();
+    const pendingScanner = vi.fn(() => new Promise<never>(() => {}));
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler,
+      indexFileSystem: failures.fileSystem,
+      pendingScanner,
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/abort-lease.ts"), "export const newAbortLease = true;");
+    failures.fail(join(root, "src/abort-lease.ts"));
+    runtime.notify("change", "src/abort-lease.ts");
+
+    const controller = new AbortController();
+    const querying = runtime.query("newAbortLease", { signal: controller.signal });
+    await vi.waitFor(() => expect(pendingScanner).toHaveBeenCalledOnce());
+    controller.abort(new DOMException("test abort", "AbortError"));
+    await expect(querying).rejects.toMatchObject({ name: "AbortError" });
+
+    failures.recover(join(root, "src/abort-lease.ts"));
+    runtime.notify("change", "src/abort-lease.ts");
+    scheduler.run();
+    await vi.waitFor(() => expect(runtime.status().pendingFiles).toEqual([]));
+    await runtime.close();
+  });
+
+  it("releases the live-query lease after ensureFresh errors", async () => {
+    const { root, stateRoot } = await fixture({ "src/error-lease.ts": "export const errorLease = true;" }, false);
+    const scheduler = new ManualScheduler();
+    const runtime = new RepoMapRuntime({ projectRoot: root, stateRoot, watch: false, scheduler });
+
+    await expect(runtime.query("errorLease")).rejects.toThrow("state boundary is not initialized");
+    await runtime.start();
+    await writeFile(join(root, "src/error-lease.ts"), "export const errorLease = false;");
+    runtime.notify("change", "src/error-lease.ts");
+    scheduler.run();
+    await vi.waitFor(() => expect(runtime.status().pendingFiles).toEqual([]));
+    await runtime.close();
+  });
+
+  it("clears deferred scheduled work on close and never rearms it from query cleanup", async () => {
+    const { root, stateRoot } = await fixture({ "src/close-lease.ts": "export const closeLease = true;" }, false);
+    const failures = controlledReadFailures();
+    const scheduler = new ManualScheduler();
+    const diffStarted = deferred();
+    const releaseDiff = deferred();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler,
+      indexFileSystem: failures.fileSystem,
+      gitRunner: async (_projectRoot, args) => {
+        if (args[0] === "diff") {
+          diffStarted.resolve();
+          await releaseDiff.promise;
+          return { stdout: Buffer.alloc(0) };
+        }
+        throw new Error("no git");
+      },
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/close-lease.ts"), "export const closeLease = false;");
+    failures.fail(join(root, "src/close-lease.ts"));
+    runtime.notify("change", "src/close-lease.ts");
+
+    const querying = runtime.query("closeLease");
+    await diffStarted.promise;
+    runtime.notify("change", "src/close-lease.ts");
+    scheduler.run();
+    expect(scheduler.tasks.size).toBe(0);
+    await runtime.close();
+    expect(scheduler.tasks.size).toBe(0);
+    releaseDiff.resolve();
+    await querying;
+    expect(scheduler.tasks.size).toBe(0);
+  });
+
   it("substitutes current pending metadata for a same-path component-only indexed hit", async () => {
     const { root, stateRoot } = await fixture({ "src/same.ts": "export const staleComponentValue = true;" }, false);
     const failures = controlledReadFailures();
@@ -2262,6 +2537,125 @@ describe("incremental repository map runtime", () => {
     expect(result.results.some((row) => row.path === "src/stale.ts")).toBe(false);
     expect(result.fallbackEvidence.some((evidence) => evidence.path === "src/stale.ts")).toBe(false);
     failures.recover(join(root, "src/stale.ts"));
+    await runtime.close();
+  });
+
+  it("discards live source and Git evidence when notification retires it before the pending scanner", async () => {
+    const { root, stateRoot } = await fixture(
+      { "src/gap-notify.ts": 'export const gapNotifyNeedle = "COHERENT_INDEXED_EVIDENCE";' },
+      false,
+    );
+    const failures = controlledReadFailures();
+    const diffStarted = deferred();
+    const releaseDiff = deferred();
+    let gateLiveDiff = false;
+    const pendingScanner = vi.fn(scanLexicalFallback);
+    const telemetry = new Telemetry();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+      indexFileSystem: failures.fileSystem,
+      gitRunner: async (_projectRoot, args) => {
+        if (args[0] === "diff" && gateLiveDiff) {
+          diffStarted.resolve();
+          await releaseDiff.promise;
+          return { stdout: Buffer.from("EXTERNAL_TRANSIENT_EVIDENCE") };
+        }
+        throw new Error("simulated non-Git workspace");
+      },
+      pendingScanner,
+      telemetry,
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/gap-notify.ts"), 'export const gapNotifyNeedle = "CURRENT_TRANSIENT_EVIDENCE";');
+    failures.fail(join(root, "src/gap-notify.ts"));
+    runtime.notify("change", "src/gap-notify.ts");
+    gateLiveDiff = true;
+
+    const querying = runtime.query("gapNotifyNeedle");
+    await diffStarted.promise;
+    runtime.notify("change", "src/gap-notify.ts");
+    releaseDiff.resolve();
+
+    const result = await querying;
+    expect(pendingScanner).not.toHaveBeenCalled();
+    expect(result.fallbackEvidence).toEqual([
+      expect.objectContaining({
+        path: "src/gap-notify.ts",
+        excerpt: expect.stringContaining("coherent_indexed_evidence"),
+      }),
+    ]);
+    expect(result.fallbackEvidence.some((evidence) => evidence.excerpt.includes("CURRENT_TRANSIENT_EVIDENCE"))).toBe(
+      false,
+    );
+    expect(result.fallbackEvidence.some((evidence) => evidence.excerpt.includes("EXTERNAL_TRANSIENT_EVIDENCE"))).toBe(
+      false,
+    );
+    expect(telemetry.snapshot().lexicalFallbackAttemptCount).toBe(0);
+    failures.recover(join(root, "src/gap-notify.ts"));
+    await runtime.close();
+  });
+
+  it("discards live source and Git evidence across a semantic no-op explicit rebuild before scanning", async () => {
+    const { root, stateRoot } = await fixture(
+      { "src/gap-rebuild.ts": 'export const gapRebuildNeedle = "COHERENT_INDEXED_EVIDENCE";' },
+      false,
+    );
+    const failures = controlledReadFailures();
+    const diffStarted = deferred();
+    const releaseDiff = deferred();
+    let gateLiveDiff = false;
+    const pendingScanner = vi.fn(scanLexicalFallback);
+    const telemetry = new Telemetry();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+      indexFileSystem: failures.fileSystem,
+      gitRunner: async (_projectRoot, args) => {
+        if (args[0] === "diff" && gateLiveDiff) {
+          diffStarted.resolve();
+          await releaseDiff.promise;
+          return { stdout: Buffer.from("EXTERNAL_TRANSIENT_EVIDENCE") };
+        }
+        throw new Error("simulated non-Git workspace");
+      },
+      pendingScanner,
+      telemetry,
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/gap-rebuild.ts"), 'export const gapRebuildNeedle = "CURRENT_TRANSIENT_EVIDENCE";');
+    failures.fail(join(root, "src/gap-rebuild.ts"));
+    runtime.notify("change", "src/gap-rebuild.ts");
+    gateLiveDiff = true;
+
+    const querying = runtime.query("gapRebuildNeedle");
+    await diffStarted.promise;
+    const staleGeneration = runtime.status().generation;
+    await runtime.rebuild();
+    expect(runtime.status().generation).toBe(staleGeneration);
+    releaseDiff.resolve();
+
+    const result = await querying;
+    expect(pendingScanner).not.toHaveBeenCalled();
+    expect(result.generation).toBe(staleGeneration);
+    expect(result.fallbackEvidence).toEqual([
+      expect.objectContaining({
+        path: "src/gap-rebuild.ts",
+        excerpt: expect.stringContaining("coherent_indexed_evidence"),
+      }),
+    ]);
+    expect(result.fallbackEvidence.some((evidence) => evidence.excerpt.includes("CURRENT_TRANSIENT_EVIDENCE"))).toBe(
+      false,
+    );
+    expect(result.fallbackEvidence.some((evidence) => evidence.excerpt.includes("EXTERNAL_TRANSIENT_EVIDENCE"))).toBe(
+      false,
+    );
+    expect(telemetry.snapshot().lexicalFallbackAttemptCount).toBe(0);
+    failures.recover(join(root, "src/gap-rebuild.ts"));
     await runtime.close();
   });
 

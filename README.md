@@ -48,7 +48,8 @@ Pi Tool errors. Fulfilled warming/stale/degraded searches remain successful Tool
 metadata. The warming and stale-pending scanners follow Git/non-Git admission and exclusions, do not follow symlinks, and hard-bound
 the logical return across enumeration, hooks, reads, batches, cancellation, results, excerpts, duration, and the final UTF-8 payload. Uncancellable OS work may continue with observed settlements; owned closure is initiated immediately (or when a late open arrives) without claiming completion, and timed-out/cancelled scans publish no evidence. Stale-pending evidence is used
 only by live search; coherent `queryCurrent()` snapshots never read pending source, and direct reads do not advance the
-reported generation or workspace revision. A compatible hydrated clean
+reported generation or workspace revision. Due background timer flushes wait for overlapping live searches to finish,
+while notifications and explicit flush, rebuild, and close operations remain immediate retirement boundaries. A compatible hydrated clean
 generation can take an unchanged warm path after Git HEAD/status and watcher safety checks; legacy generations without the
 compatibility key rebuild once.
 

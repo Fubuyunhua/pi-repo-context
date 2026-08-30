@@ -641,8 +641,12 @@ export class RepoMapRuntime {
   #maintenance?: RepoMapMaintenanceResult | { error: string };
   #watcher?: RepoMapWatcher;
   #scheduled?: unknown;
+  #deferredScheduledFlush = false;
+  #liveQueryLeaseCount = 0;
   #watcherUpdates: PendingWatcherUpdate[] = [];
   #mutationEpoch = 0;
+  /** Unified retirement boundary for live source/Git and pending-scanner evidence. */
+  #directEvidenceRetirementEpoch = 0;
   #started = false;
   #flushChain: Promise<void> = Promise.resolve();
   #pendingFallbackControllers = new Set<AbortController>();
@@ -705,6 +709,7 @@ export class RepoMapRuntime {
   }
 
   #retirePendingFallbacks(): void {
+    this.#directEvidenceRetirementEpoch += 1;
     for (const controller of this.#pendingFallbackControllers) controller.abort();
   }
 
@@ -743,12 +748,29 @@ export class RepoMapRuntime {
     if (this.#started) this.#scheduleFlush();
   }
 
-  #scheduleFlush(): void {
+  #scheduleFlush(delayMs = this.#options.mapDebounceMs): void {
     if (this.#scheduled !== undefined) this.#scheduler.cancel(this.#scheduled);
-    this.#scheduled = this.#scheduler.schedule(this.#options.mapDebounceMs, () => {
+    this.#scheduled = this.#scheduler.schedule(delayMs, () => {
       this.#scheduled = undefined;
-      void this.flush();
+      if (this.#liveQueryLeaseCount > 0) {
+        this.#deferredScheduledFlush = true;
+        return;
+      }
+      // Scheduled maintenance is best-effort; explicit callers still observe
+      // flush failures through the returned promise.
+      void this.flush().catch(() => undefined);
     });
+  }
+
+  #acquireLiveQueryLease(): void {
+    this.#liveQueryLeaseCount += 1;
+  }
+
+  #releaseLiveQueryLease(): void {
+    this.#liveQueryLeaseCount -= 1;
+    if (this.#liveQueryLeaseCount !== 0 || !this.#deferredScheduledFlush) return;
+    this.#deferredScheduledFlush = false;
+    if (this.#started) this.#scheduleFlush(0);
   }
 
   async flush(): Promise<void> {
@@ -784,6 +806,9 @@ export class RepoMapRuntime {
   }
 
   async #flush(): Promise<void> {
+    // Any flush that reaches the serialized mutation boundary supersedes a
+    // timer callback previously deferred by a live query.
+    this.#deferredScheduledFlush = false;
     await this.#assertStateBoundary();
     if (this.#scheduled !== undefined) {
       this.#scheduler.cancel(this.#scheduled);
@@ -869,15 +894,25 @@ export class RepoMapRuntime {
   /** Live query path used by the explicit tool: reconcile Git and watcher work first. */
   async query(query: string, options: RepoMapQueryOptions = {}): Promise<RepoMapRuntimeQuery> {
     const startedAt = monotonicReading(this.#monotonicNow);
+    this.#acquireLiveQueryLease();
     try {
       await this.ensureFresh();
       const scanEpoch = this.#mutationEpoch;
       const scanContentVersion = this.#effectiveContentVersion;
       const scanGeneration = this.#generation;
+      const directEvidenceEpoch = this.#directEvidenceRetirementEpoch;
       const captured = await this.#queryCurrentUninstrumented(query, options, true);
+      const directEvidenceRetired = directEvidenceEpoch !== this.#directEvidenceRetirementEpoch;
+      if (directEvidenceRetired) {
+        if (options.signal?.aborted) {
+          throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+        }
+        return await this.#queryCurrentUninstrumented(query, options, false);
+      }
       if (captured.freshness !== "stale" || captured.pendingFiles.length === 0) return captured;
       // The indexed query can itself perform bounded live source/Git reads.
-      // Do not start a pending scan if its capture was already retired.
+      // Keep the independent state guards and do not start a pending scan if
+      // its capture was already superseded.
       if (
         !this.#started ||
         scanEpoch !== this.#mutationEpoch ||
@@ -955,23 +990,28 @@ export class RepoMapRuntime {
         );
         throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
       }
+      const directEvidenceRetiredAfterScan = directEvidenceEpoch !== this.#directEvidenceRetirementEpoch;
       const retired =
         !this.#started ||
         scanEpoch !== this.#mutationEpoch ||
         scanContentVersion !== this.#effectiveContentVersion ||
         scanGeneration !== this.#generation;
-      if (retired || scan.cancelled || scan.timedOut) {
+      const evidenceRetired = retired || directEvidenceRetiredAfterScan;
+      if (evidenceRetired || scan.cancelled || scan.timedOut) {
         recordTelemetry(this.#telemetry, (telemetry) =>
           telemetry.recordLexicalFallback(
             {
               ...scan,
               matchesReturned: 0,
-              timedOut: retired || scan.cancelled ? false : scan.timedOut,
-              cancelled: retired || scan.cancelled,
+              timedOut: evidenceRetired || scan.cancelled ? false : scan.timedOut,
+              cancelled: evidenceRetired || scan.cancelled,
             },
             false,
           ),
         );
+        if (directEvidenceRetiredAfterScan) {
+          return await this.#queryCurrentUninstrumented(query, options, false);
+        }
         return captured;
       }
 
@@ -1022,6 +1062,7 @@ export class RepoMapRuntime {
       );
       return { ...captured, results, fallbackEvidence };
     } finally {
+      this.#releaseLiveQueryLease();
       recordTelemetry(this.#telemetry, (telemetry) =>
         telemetry.recordRepoMapQuery(monotonicDuration(this.#monotonicNow, startedAt)),
       );
@@ -1274,6 +1315,7 @@ export class RepoMapRuntime {
     this.#retirePendingFallbacks();
     if (this.#scheduled !== undefined) this.#scheduler.cancel(this.#scheduled);
     this.#scheduled = undefined;
+    this.#deferredScheduledFlush = false;
     await this.#watcher?.close();
     this.#watcher = undefined;
     if (!this.#stateBoundary) return;

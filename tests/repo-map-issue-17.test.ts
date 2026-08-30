@@ -1,8 +1,9 @@
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import type { RepoMapFileSystem } from "../src/repo-map/index.js";
+import { scanLexicalFallback } from "../src/repo-map/lexical-fallback.js";
 import { RepoMapRuntime, type RepoMapScheduler } from "../src/repo-map/runtime.js";
 import { Telemetry } from "../src/telemetry.js";
 
@@ -12,18 +13,23 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-class ManualScheduler implements RepoMapScheduler {
-  tasks = new Set<() => void>();
-  schedule(_delayMs: number, task: () => void): unknown {
-    this.tasks.add(task);
-    return task;
-  }
-  cancel(handle: unknown): void {
-    this.tasks.delete(handle as () => void);
-  }
+function isIssueIncrementalRead(path: string): boolean {
+  return path.replaceAll("\\", "/").includes("/src/file-");
 }
 
-it("returns the exact pending match on the first bounded live query in a 5,000-file repository", async () => {
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => {};
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+it("normalizes Windows separators in the issue-17 incremental-read predicate", () => {
+  expect(isIssueIncrementalRead("C:\\repo\\src\\file-00099.ts")).toBe(true);
+});
+
+it("returns the exact pending match when the 300ms production-style scheduler fires during the first live query", async () => {
   const root = await mkdtemp(join(tmpdir(), "repo-context-issue-17-"));
   const stateRoot = await mkdtemp(join(tmpdir(), "repo-context-issue-17-state-"));
   roots.push(root, stateRoot);
@@ -47,19 +53,44 @@ it("returns the exact pending match on the first bounded live query in a 5,000-f
     lstat,
     async readFile(path) {
       const content = await readFile(path);
-      if (armed && path.includes("/src/file-") && ++incrementalReads === 64) deadlineExpired = true;
+      if (armed && isIssueIncrementalRead(path) && ++incrementalReads === 64) deadlineExpired = true;
       return content;
     },
   };
+  const scheduledCallbackFired = deferred();
+  const scheduledDelays: number[] = [];
+  let queryOutstanding = false;
+  let callbackFiredWhileQueryLeased = false;
+  const scheduler: RepoMapScheduler = {
+    schedule(delayMs, task) {
+      scheduledDelays.push(delayMs);
+      return setTimeout(() => {
+        if (queryOutstanding) {
+          callbackFiredWhileQueryLeased = true;
+          scheduledCallbackFired.resolve();
+        }
+        task();
+      }, delayMs);
+    },
+    cancel(handle) {
+      clearTimeout(handle as ReturnType<typeof setTimeout>);
+    },
+  };
   const telemetry = new Telemetry();
+  const pendingScanner = vi.fn(async (options: Parameters<typeof scanLexicalFallback>[0]) => {
+    await scheduledCallbackFired.promise;
+    return scanLexicalFallback(options);
+  });
   const runtime = new RepoMapRuntime({
     projectRoot: root,
     stateRoot,
     watch: false,
-    scheduler: new ManualScheduler(),
+    mapDebounceMs: 300,
+    scheduler,
     indexFileSystem: fileSystem,
     monotonicNow: () => (deadlineExpired ? 1_001 : 0),
     telemetry,
+    pendingScanner,
   });
   await runtime.start();
 
@@ -68,14 +99,12 @@ it("returns the exact pending match on the first bounded live query in a 5,000-f
     await writeFile(filePath(index), `export const BATCH_MARKER_${index} = ${index};\n`);
     runtime.notify("change", `src/file-${index.toString().padStart(5, "0")}.ts`);
   }
-  const coherentOnly = await runtime.queryCurrent("BATCH_MARKER_99");
-  expect(coherentOnly.freshness).toBe("stale");
-  expect(coherentOnly.results.some((row) => row.matchReasons?.some((reason) => reason.startsWith("pending ")))).toBe(
-    false,
-  );
-  expect(coherentOnly.fallbackEvidence.some((evidence) => evidence.excerpt.includes("BATCH_MARKER_99"))).toBe(false);
-
+  queryOutstanding = true;
   const result = await runtime.query("BATCH_MARKER_99", { limit: 20 });
+  queryOutstanding = false;
+  expect(callbackFiredWhileQueryLeased).toBe(true);
+  expect(scheduledDelays).toContain(300);
+  expect(pendingScanner).toHaveBeenCalledOnce();
   expect(result.freshness).toBe("stale");
   expect(result.pendingFiles).toContain("src/file-00099.ts");
   expect(result.results[0]).toMatchObject({

@@ -8,7 +8,9 @@ Accepted for Repo Context 0.1.x. This specification extends Specs 0007 and 0020 
 
 A live `RepoMapRuntime.query()` still performs the bounded reconciliation defined by the runtime. If the captured result remains `stale` and has pending paths, the runtime may perform one private, read-only lexical scan of exactly that captured set. `queryCurrent()` remains snapshot-only and never invokes this scan.
 
-The direct evidence is point-in-time source evidence. It does not advance a generation, consume pending work, update dirty hashes, or alter `workspaceRevision`; the response therefore retains the captured stale freshness, revision, generation, and pending paths. Notification, activation, close, or content-version races retire and discard scanned evidence.
+The direct evidence is point-in-time source evidence. It does not advance a generation, consume pending work, update dirty hashes, or alter `workspaceRevision`; the response therefore retains the captured stale freshness, revision, generation, and pending paths. A unified runtime-local retirement epoch advances on notification, every activation (including semantic no-ops), close, and effective-content mutation. If it advances during live source/Git collection or pending scanning, the query discards all direct evidence and reruns the coherent snapshot-only path.
+
+A live query holds a runtime-local lease from before its bounded freshness reconciliation through final evidence validation. Only a due timer-originated background flush is deferred by this lease; it is requeued once when the final overlapping live query releases. Notifications and public `flush()`, `rebuild()`, and `close()` remain immediate mutation or retirement boundaries. Explicit flush supersedes deferred timer intent, and close clears it without rearming maintenance.
 
 ## Admission and bounds
 

@@ -34,7 +34,7 @@ jobs:
         run: npm run test:pi
 
   cross-platform-smoke:
-    name: ${{ matrix.os }} package + watcher smoke
+    name: ${{ matrix.os }} package + watcher + issue-17 smoke
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -50,3 +50,4 @@ jobs:
       - run: npm run check
       - run: npm run test:package
       - run: npm run test:watcher
+      - run: npm run test:issue-17
