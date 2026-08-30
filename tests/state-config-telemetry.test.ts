@@ -80,6 +80,46 @@ it("exposes repository-only bounded telemetry", () => {
   const telemetry = new RepoContextTelemetry();
   telemetry.recordInitializationAttempt();
   telemetry.recordWarmupTimeout();
+  telemetry.recordSearchAttempt();
+  telemetry.recordLexicalFallbackAttempt();
+  telemetry.recordLexicalFallback(
+    {
+      durationMs: 6,
+      filesScanned: 2,
+      bytesScanned: 64,
+      matchesReturned: 1,
+      capped: true,
+      timedOut: false,
+      cancelled: false,
+    },
+    true,
+  );
+  telemetry.recordLexicalFallback(
+    {
+      durationMs: 2,
+      filesScanned: 1,
+      bytesScanned: 16,
+      matchesReturned: 0,
+      capped: false,
+      timedOut: true,
+      cancelled: false,
+    },
+    false,
+  );
+  telemetry.recordLexicalFallback(
+    {
+      durationMs: 1,
+      filesScanned: 0,
+      bytesScanned: 0,
+      matchesReturned: 0,
+      capped: false,
+      timedOut: false,
+      cancelled: true,
+    },
+    false,
+  );
+  telemetry.recordWarmingEmptyReturn();
+  telemetry.recordIndexedResultReturn();
   telemetry.recordHydration(1);
   telemetry.recordHydratedFastReuse();
   telemetry.recordFullBuild(5);
@@ -91,6 +131,19 @@ it("exposes repository-only bounded telemetry", () => {
   expect(snapshot).toMatchObject({
     initializationAttemptCount: 1,
     warmupTimeoutCount: 1,
+    searchAttemptCount: 1,
+    indexedResultReturnCount: 1,
+    lexicalFallbackAttemptCount: 1,
+    warmingEmptyReturnCount: 1,
+    lexicalFallbackUsedCount: 1,
+    lexicalFallbackNoMatchCount: 1,
+    lexicalFallbackCappedCount: 1,
+    lexicalFallbackTimeoutCount: 1,
+    lexicalFallbackCancelledCount: 1,
+    lexicalFallbackDurationMsTotal: 9,
+    lexicalFallbackFilesScanned: 3,
+    lexicalFallbackBytesScanned: 80,
+    lexicalFallbackMatchesReturned: 1,
     hydrationCount: 1,
     hydrationDurationMsTotal: 1,
     hydratedFastReuseCount: 1,

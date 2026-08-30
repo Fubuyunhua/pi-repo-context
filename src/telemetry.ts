@@ -6,6 +6,19 @@ function finiteNonnegative(value: number): number {
 export interface RepoContextTelemetrySnapshot {
   initializationAttemptCount: number;
   warmupTimeoutCount: number;
+  searchAttemptCount: number;
+  indexedResultReturnCount: number;
+  warmingEmptyReturnCount: number;
+  lexicalFallbackAttemptCount: number;
+  lexicalFallbackUsedCount: number;
+  lexicalFallbackNoMatchCount: number;
+  lexicalFallbackCappedCount: number;
+  lexicalFallbackTimeoutCount: number;
+  lexicalFallbackCancelledCount: number;
+  lexicalFallbackDurationMsTotal: number;
+  lexicalFallbackFilesScanned: number;
+  lexicalFallbackBytesScanned: number;
+  lexicalFallbackMatchesReturned: number;
   hydrationCount: number;
   hydrationDurationMsTotal: number;
   hydratedFastReuseCount: number;
@@ -40,6 +53,19 @@ export class RepoContextTelemetry {
   #values: RepoContextTelemetrySnapshot = {
     initializationAttemptCount: 0,
     warmupTimeoutCount: 0,
+    searchAttemptCount: 0,
+    indexedResultReturnCount: 0,
+    warmingEmptyReturnCount: 0,
+    lexicalFallbackAttemptCount: 0,
+    lexicalFallbackUsedCount: 0,
+    lexicalFallbackNoMatchCount: 0,
+    lexicalFallbackCappedCount: 0,
+    lexicalFallbackTimeoutCount: 0,
+    lexicalFallbackCancelledCount: 0,
+    lexicalFallbackDurationMsTotal: 0,
+    lexicalFallbackFilesScanned: 0,
+    lexicalFallbackBytesScanned: 0,
+    lexicalFallbackMatchesReturned: 0,
     hydrationCount: 0,
     hydrationDurationMsTotal: 0,
     hydratedFastReuseCount: 0,
@@ -78,6 +104,41 @@ export class RepoContextTelemetry {
   }
   recordWarmupTimeout(): void {
     this.#values.warmupTimeoutCount += 1;
+  }
+  recordSearchAttempt(): void {
+    this.#values.searchAttemptCount += 1;
+  }
+  recordIndexedResultReturn(): void {
+    this.#values.indexedResultReturnCount += 1;
+  }
+  recordWarmingEmptyReturn(): void {
+    this.#values.warmingEmptyReturnCount += 1;
+  }
+  recordLexicalFallbackAttempt(): void {
+    this.#values.lexicalFallbackAttemptCount += 1;
+  }
+  recordLexicalFallback(
+    result: {
+      durationMs: number;
+      filesScanned: number;
+      bytesScanned: number;
+      matchesReturned: number;
+      capped: boolean;
+      timedOut: boolean;
+      cancelled: boolean;
+    },
+    used: boolean,
+    returnedMatches = used ? result.matchesReturned : 0,
+  ): void {
+    this.#values.lexicalFallbackDurationMsTotal += finiteNonnegative(result.durationMs);
+    this.#values.lexicalFallbackFilesScanned += finiteNonnegative(result.filesScanned);
+    this.#values.lexicalFallbackBytesScanned += finiteNonnegative(result.bytesScanned);
+    this.#values.lexicalFallbackMatchesReturned += finiteNonnegative(returnedMatches);
+    if (used) this.#values.lexicalFallbackUsedCount += 1;
+    else if (!result.cancelled && result.matchesReturned === 0) this.#values.lexicalFallbackNoMatchCount += 1;
+    if (result.capped) this.#values.lexicalFallbackCappedCount += 1;
+    if (result.timedOut) this.#values.lexicalFallbackTimeoutCount += 1;
+    if (result.cancelled) this.#values.lexicalFallbackCancelledCount += 1;
   }
   recordHydration(durationMs: number): void {
     this.#values.hydrationCount += 1;

@@ -36,15 +36,19 @@ Repo Context `0.1.0` is Tool-first and performs **no automatic repository-contex
   inactive by default, and planned for removal in 0.2.0.
 
 Enabled sessions resolve state/configuration and remain `dormant` until the first search or explicit rebuild. The first
-search lazily starts one shared initialization and waits through a fixed 250 ms logical budget. If the budget expires,
-search returns successful bounded `warming` fallback evidence while initialization continues; a real startup failure
-remains a sanitized hard unavailable Tool error. Status reports lifecycle separately from repository freshness and never
-inspects a controller before startup completes.
+search lazily starts one shared initialization and waits through a fixed 250 ms logical budget. If initialization is still
+warming, that same Tool call performs a bounded, abortable direct lexical scan and returns actual matching source/path
+evidence when found while full initialization continues. These point-in-time reads report lifecycle `warming`, freshness
+`stale`, generation `0`, and unavailable revision fields. If initialization wins, scanned evidence is discarded in favor of
+a coherent indexed query; a real startup failure remains a sanitized hard unavailable Tool error. Status reports lifecycle
+separately from repository freshness and never inspects a controller before startup completes.
 
 Hard search failures (before initialization, disabled/unavailable runtime, settled startup failure, or rejected query) are
-Pi Tool errors. Fulfilled warming/stale/degraded searches that still provide bounded navigation evidence remain successful
-Tool results and carry sanitized degradation metadata. A compatible hydrated clean generation can take an unchanged warm
-path after Git HEAD/status and watcher safety checks; legacy generations without the compatibility key rebuild once.
+Pi Tool errors. Fulfilled warming/stale/degraded searches remain successful Tool results and carry sanitized degradation
+metadata. The warming scanner follows Git/non-Git admission and exclusions, does not follow symlinks, and bounds
+enumeration, reads, concurrency, results, excerpts, duration, and the final UTF-8 payload. A compatible hydrated clean
+generation can take an unchanged warm path after Git HEAD/status and watcher safety checks; legacy generations without the
+compatibility key rebuild once.
 
 Search preserves dotted and underscored identifiers, boosts exact symbols, exports, and qualified paths, and applies
 query-aware de-boosts to vendor, minified, and locale-catalog paths. Those paths remain searchable when requested

@@ -224,7 +224,7 @@ const MAX_MATCH_REASONS = 5;
 const MAX_REASON_VALUE_LENGTH = 64;
 
 /** Keep linked identifiers while also making their components independently searchable. */
-function linkedIdentifierTokens(text: string): string[] {
+export function linkedIdentifierTokens(text: string): string[] {
   const identifiers = text.match(/[$_\p{L}\p{N}]+(?:[.-][$_\p{L}\p{N}]+)*/gu) ?? [];
   const tokens: string[] = [];
   for (const identifier of identifiers) {
@@ -339,7 +339,7 @@ function globExpression(pattern: string): RegExp {
   return new RegExp(`${prefix}${expression}${directory ? "" : "$"}`);
 }
 
-function exclusionMatcher(patterns: string[]): (path: string) => boolean {
+function exclusionMatcher(patterns: readonly string[]): (path: string) => boolean {
   const expressions = patterns.filter((pattern) => pattern.trim() && !pattern.startsWith("!")).map(globExpression);
   return (path) => {
     const parts = path.split("/");
@@ -374,7 +374,7 @@ function gitignoreExpression(pattern: string): RegExp {
   return new RegExp(`^${expression}$`);
 }
 
-function rootGitignoreMatcher(patterns: string[]): (path: string) => boolean {
+export function rootGitignoreMatcher(patterns: string[]): (path: string) => boolean {
   const rules = patterns.flatMap((rawPattern): GitignoreRule[] => {
     const negated = rawPattern.startsWith("!");
     let pattern = negated ? rawPattern.slice(1) : rawPattern;
@@ -413,8 +413,13 @@ function rootGitignoreMatcher(patterns: string[]): (path: string) => boolean {
   };
 }
 
+export function repoMapPathExclusionMatcher(patterns: readonly string[] = []): (path: string) => boolean {
+  const matches = exclusionMatcher(patterns);
+  return (path) => matches(slash(path));
+}
+
 export function isRepoMapPathExcluded(path: string, patterns: string[] = []): boolean {
-  return exclusionMatcher(patterns)(slash(path));
+  return repoMapPathExclusionMatcher(patterns)(path);
 }
 
 async function gitFiles(projectRoot: string): Promise<string[] | undefined> {

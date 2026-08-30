@@ -29,6 +29,8 @@ jobs:
       - if: matrix.node == 24
         run: npm run test:package
       - if: matrix.node == 24
+        run: npm run test:cold-search
+      - if: matrix.node == 24
         run: npm run test:pi
 
   cross-platform-smoke:

@@ -8,7 +8,8 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, it, vi } from "vitest";
-import { type RepoMapController, registerRepoContext } from "../src/extension.js";
+import { type RegisterRepoContextOptions, type RepoMapController, registerRepoContext } from "../src/extension.js";
+import type { LexicalFallbackScanResult } from "../src/repo-map/lexical-fallback.js";
 import type { RepoMapRuntimeQuery } from "../src/repo-map/runtime.js";
 import type { RepoContextConfig } from "../src/state/config.js";
 
@@ -56,7 +57,11 @@ function controller(query: RepoMapController["query"]): RepoMapController {
   };
 }
 
-async function createPinnedPiSession(config: RepoContextConfig, repoMap: RepoMapController) {
+async function createPinnedPiSession(
+  config: RepoContextConfig,
+  repoMap: RepoMapController,
+  registrationOptions: Pick<RegisterRepoContextOptions, "initializationWaiter" | "lexicalFallbackScanner"> = {},
+) {
   const root = await mkdtemp(join(tmpdir(), "repo-context-pi-wrapper-"));
   scratchRoots.push(root);
   const agentDir = join(root, "agent");
@@ -96,6 +101,7 @@ async function createPinnedPiSession(config: RepoContextConfig, repoMap: RepoMap
             }),
             loadConfig: async () => config,
             runtimeFactory: () => repoMap,
+            ...registrationOptions,
           });
         },
       },
@@ -211,6 +217,51 @@ it("exposes deterministic active/all surfaces and canonical prompt metadata thro
       "Use repo_context_search to find relevant repository files and symbols before broad filesystem searches.",
     );
     expect(session.state.systemPrompt).not.toContain("context_vault_repo_map");
+  } finally {
+    session.dispose();
+  }
+});
+
+it("returns warming source evidence as a successful result through pinned Pi", async () => {
+  const never = new Promise<void>(() => {});
+  const scan: LexicalFallbackScanResult = {
+    results: [
+      {
+        path: "src/cold.ts",
+        score: 200,
+        kind: "lexical",
+        matchedSymbols: [],
+        symbols: [],
+        dependencies: [],
+      },
+    ],
+    fallbackEvidence: [{ kind: "source", path: "src/cold.ts", excerpt: "const coldNeedle = true;" }],
+    durationMs: 1,
+    filesScanned: 1,
+    bytesScanned: 24,
+    enumeratedPaths: 1,
+    enumerationBytes: 12,
+    matchesReturned: 1,
+    capped: false,
+    timedOut: false,
+    cancelled: false,
+  };
+  const warmingController = controller(async () => freshQuery);
+  warmingController.start = vi.fn(() => never);
+  const session = await createPinnedPiSession(baseConfig, warmingController, {
+    initializationWaiter: async () => "timeout",
+    lexicalFallbackScanner: async () => scan,
+  });
+  try {
+    const result = await runWrappedTool(session, "repo_context_search", { query: "coldNeedle" });
+    expect(result.isError).toBe(false);
+    expect(result.result.details).toMatchObject({
+      lifecycle: "warming",
+      freshness: "stale",
+      generation: 0,
+      results: [{ path: "src/cold.ts" }],
+      fallbackEvidence: [{ kind: "source", path: "src/cold.ts" }],
+    });
   } finally {
     session.dispose();
   }

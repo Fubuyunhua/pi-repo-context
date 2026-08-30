@@ -3,6 +3,11 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { Type } from "typebox";
 import type { RepoMapQueryResult } from "./repo-map/index.js";
 import {
+  type LexicalFallbackOptions,
+  type LexicalFallbackScanResult,
+  scanLexicalFallback,
+} from "./repo-map/lexical-fallback.js";
+import {
   type RepoMapFallbackEvidence,
   type RepoMapFreshness,
   type RepoMapMaintenanceResult,
@@ -70,6 +75,7 @@ interface RuntimeState {
   rebuildPromise?: Promise<void>;
   closePromise?: Promise<void>;
   activeOperations: Set<Promise<void>>;
+  fallbackControllers: Set<AbortController>;
   available: boolean;
   failures: BoundedFailure[];
   telemetry: RepoContextTelemetry;
@@ -86,6 +92,8 @@ export interface RegisterRepoContextOptions {
   }) => RepoMapController;
   /** Deterministic wait primitive; production uses the fixed 250 ms budget. */
   initializationWaiter?: RepoContextInitializationWaiter;
+  /** Injectable only for deterministic scanner/lifecycle tests. */
+  lexicalFallbackScanner?: (options: LexicalFallbackOptions) => Promise<LexicalFallbackScanResult>;
   stdout?: (text: string) => void;
 }
 
@@ -156,11 +164,11 @@ function markTruncated(payload: BoundedSearchPayload, field: string): void {
   if (!payload.truncatedFields.includes(field)) payload.truncatedFields.push(field);
 }
 
-function renderSearch(payload: BoundedSearchPayload): string {
-  return JSON.stringify(payload, null, 2);
+function renderSearch(payload: BoundedSearchPayload, compact = false): string {
+  return JSON.stringify(payload, null, compact ? undefined : 2);
 }
 
-/** Deterministically removes complete rows/fields until the UTF-8 hard limit is met. */
+/** Deterministically preserves useful source result/evidence pairs whenever they fit. */
 export function boundSearchPayload(
   query: string,
   result: RepoMapRuntimeQuery,
@@ -179,40 +187,76 @@ export function boundSearchPayload(
     gitHead: result.gitHead,
     workspaceRevision: result.workspaceRevision,
     pendingFiles: [...result.pendingFiles],
-    results: [...result.results],
-    fallbackEvidence: result.fallbackEvidence.map((row) => ({ ...row })),
+    results: result.results.map((row) => ({
+      ...row,
+      matchedSymbols: [...row.matchedSymbols],
+      ...(row.matchReasons ? { matchReasons: [...row.matchReasons] } : {}),
+      symbols: [...row.symbols],
+      dependencies: [...row.dependencies],
+    })),
+    fallbackEvidence: result.fallbackEvidence.map((row) => ({
+      ...row,
+      excerpt: utf8Prefix(row.excerpt, 512),
+    })),
     truncatedFields: [],
     ...(result.error ? { error: publicError ?? PUBLIC_ERRORS.searchResult } : {}),
   };
-  const bytes = () => Buffer.byteLength(renderSearch(payload), "utf8");
-  while (bytes() > maxBytes && payload.fallbackEvidence.length > 0 && lifecycle !== "warming") {
-    payload.fallbackEvidence.pop();
-    markTruncated(payload, "fallbackEvidence");
-  }
-  while (bytes() > maxBytes && payload.results.length > 0) {
-    payload.results.pop();
-    markTruncated(payload, "results");
-  }
-  while (bytes() > maxBytes && payload.pendingFiles.length > 0) {
+  const compactBytes = () => Buffer.byteLength(renderSearch(payload, true), "utf8");
+  const prettyBytes = () => Buffer.byteLength(renderSearch(payload), "utf8");
+
+  while (compactBytes() > maxBytes && payload.pendingFiles.length > 0) {
     payload.pendingFiles.pop();
     markTruncated(payload, "pendingFiles");
   }
   for (const field of ["query", "error", "workspaceRevision", "gitHead"] as const) {
-    while (bytes() > maxBytes && Buffer.byteLength(payload[field] ?? "", "utf8") > 8) {
+    while (compactBytes() > maxBytes && Buffer.byteLength(payload[field] ?? "", "utf8") > 8) {
       const current = payload[field] ?? "";
-      payload[field] = utf8Prefix(current, Math.max(8, Buffer.byteLength(current, "utf8") - 16)) as never;
+      payload[field] = utf8Prefix(current, Math.max(8, Buffer.byteLength(current, "utf8") - 32)) as never;
       markTruncated(payload, field);
     }
   }
-  if (bytes() > maxBytes) {
-    // Fixed-shape fallback remains valid at the contract minimum of 512 bytes.
+
+  const removeTailPair = (): boolean => {
+    const resultRow = payload.results.at(-1);
+    if (!resultRow) return false;
+    payload.results.pop();
+    const evidenceIndex = payload.fallbackEvidence.findIndex((row) => row.path === resultRow.path);
+    if (evidenceIndex >= 0) payload.fallbackEvidence.splice(evidenceIndex, 1);
+    markTruncated(payload, "results");
+    if (evidenceIndex >= 0) markTruncated(payload, "fallbackEvidence");
+    return true;
+  };
+  while (compactBytes() > maxBytes && payload.results.length > 1) removeTailPair();
+
+  const topPath = payload.results[0]?.path;
+  const topEvidence = payload.fallbackEvidence.find((row) => row.path === topPath);
+  while (compactBytes() > maxBytes && topEvidence && Buffer.byteLength(topEvidence.excerpt, "utf8") > 32) {
+    topEvidence.excerpt = utf8Prefix(topEvidence.excerpt, Buffer.byteLength(topEvidence.excerpt, "utf8") - 32);
+    markTruncated(payload, "fallbackEvidence.excerpt");
+  }
+
+  while (compactBytes() > maxBytes && payload.fallbackEvidence.length > 0) {
+    const removed = payload.fallbackEvidence.pop();
+    markTruncated(payload, "fallbackEvidence");
+    if (removed?.path) {
+      const resultIndex = payload.results.findIndex((row) => row.path === removed.path);
+      if (resultIndex >= 0) {
+        payload.results.splice(resultIndex, 1);
+        markTruncated(payload, "results");
+      }
+    }
+  }
+  while (compactBytes() > maxBytes && removeTailPair()) {
+    // Remove complete navigable rows rather than returning a result without its source evidence.
+  }
+  if (compactBytes() > maxBytes) {
     payload.query = "";
     payload.gitHead = utf8Prefix(payload.gitHead, 8);
     payload.workspaceRevision = utf8Prefix(payload.workspaceRevision, 8);
     if (payload.error !== undefined) payload.error = utf8Prefix(payload.error, 8);
     for (const field of ["query", "gitHead", "workspaceRevision"] as const) markTruncated(payload, field);
   }
-  const text = renderSearch(payload);
+  const text = prettyBytes() <= maxBytes ? renderSearch(payload) : renderSearch(payload, true);
   if (Buffer.byteLength(text, "utf8") > maxBytes) throw new Error("unable to render bounded repository search result");
   return { payload, text };
 }
@@ -359,6 +403,7 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
   const stateResolver = options.resolveProjectState ?? resolveProjectState;
   const runtimeFactory = options.runtimeFactory ?? createRuntime;
   const initializationWaiter = options.initializationWaiter ?? defaultInitializationWaiter;
+  const lexicalFallbackScanner = options.lexicalFallbackScanner ?? scanLexicalFallback;
   const stdout = options.stdout ?? ((text: string) => console.log(text));
   let epoch = 0;
   const freshRuntime = (runtimeEpoch: number): RuntimeState => ({
@@ -367,6 +412,7 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     lifecycle: "pre-session",
     disposed: false,
     activeOperations: new Set(),
+    fallbackControllers: new Set(),
     available: false,
     failures: [],
     telemetry: new RepoContextTelemetry(),
@@ -413,6 +459,7 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     target.disposed = true;
     target.available = false;
     target.lifecycle = "stopping";
+    for (const controller of target.fallbackControllers) controller.abort();
     await target.rebuildPromise?.catch(() => undefined);
     await target.initializationPromise?.catch(() => undefined);
     await Promise.allSettled([...target.activeOperations]);
@@ -489,19 +536,31 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     if (runtime === next && ctx.hasUI) ctx.ui.setStatus(EXTENSION_ID, undefined);
   });
 
-  const warmingResult = (): RepoMapRuntimeQuery => ({
+  const emptyFallbackScan = (cancelled = false): LexicalFallbackScanResult => ({
     results: [],
+    fallbackEvidence: [],
+    durationMs: 0,
+    filesScanned: 0,
+    bytesScanned: 0,
+    enumeratedPaths: 0,
+    enumerationBytes: 0,
+    matchesReturned: 0,
+    capped: false,
+    timedOut: false,
+    cancelled,
+  });
+
+  const warmingResult = (scan?: LexicalFallbackScanResult): RepoMapRuntimeQuery => ({
+    results: scan?.results ?? [],
     freshness: "stale",
     generation: 0,
     gitHead: "unavailable",
     workspaceRevision: "unavailable",
     pendingFiles: [],
-    fallbackEvidence: [
-      {
-        kind: "warming",
-        excerpt: "Repository index is warming; retry repository search or use direct filesystem search.",
-      },
-    ],
+    fallbackEvidence:
+      scan && scan.fallbackEvidence.length > 0
+        ? scan.fallbackEvidence
+        : [{ kind: "warming", excerpt: "No lexical match found within the bounded warming scan." }],
   });
 
   const executeSearch = (params: { query: string; limit?: number }, deprecated: boolean) => {
@@ -509,26 +568,77 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
     return withActiveOperation(target, async () => {
       if (!target.initialized) throw new Error(PUBLIC_ERRORS.unavailable);
       if (target.config?.enabled === false) throw new Error(PUBLIC_ERRORS.disabled);
+      target.telemetry.recordSearchAttempt();
       if (target.lifecycle === "dormant") beginInitialization(target);
       if (target.lifecycle === "warming") {
         const readiness = target.rebuildPromise ?? target.initializationPromise;
         const outcome = readiness ? await initializationWaiter(readiness, INITIAL_SEARCH_WAIT_MS) : "ready";
         if (!isCurrent(target)) throw new Error(PUBLIC_ERRORS.unavailable);
-        if (outcome === "timeout" && target.lifecycle === "warming") {
+        if (outcome === "timeout" && target.lifecycle === "warming" && target.state) {
           target.telemetry.recordWarmupTimeout();
-          const bounded = boundSearchPayload(
-            params.query,
-            warmingResult(),
-            target.config?.searchMaxBytes ?? 6 * 1024,
-            undefined,
-            "warming",
-          );
-          return {
-            content: [{ type: "text" as const, text: bounded.text }],
-            details: deprecated
-              ? { ...bounded.payload, deprecated: true as const, replacement: "repo_context_search" as const }
-              : bounded.payload,
-          };
+          target.telemetry.recordLexicalFallbackAttempt();
+          const controller = new AbortController();
+          target.fallbackControllers.add(controller);
+          let scan = emptyFallbackScan();
+          try {
+            const scanPromise = lexicalFallbackScanner({
+              projectRoot: target.state.projectRoot,
+              query: params.query,
+              ...(params.limit === undefined ? {} : { limit: params.limit }),
+              exclude: target.config?.excludePatterns ?? [],
+              signal: controller.signal,
+            });
+            const race = readiness
+              ? await Promise.race([
+                  scanPromise.then((result) => ({ kind: "scan" as const, scan: result })),
+                  readiness.then(() => ({ kind: "initialized" as const })),
+                ])
+              : { kind: "scan" as const, scan: await scanPromise };
+            if (race.kind === "initialized") {
+              controller.abort();
+              scan = await scanPromise.catch(() => emptyFallbackScan(true));
+            } else {
+              scan = race.scan;
+            }
+          } catch {
+            controller.abort();
+            // Scanner failures are private implementation details. Report the
+            // bounded no-match warming outcome; retirement below is recorded
+            // separately as cancellation.
+            scan = emptyFallbackScan(false);
+          } finally {
+            target.fallbackControllers.delete(controller);
+          }
+          if (!isCurrent(target)) {
+            target.telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false);
+            throw new Error(PUBLIC_ERRORS.unavailable);
+          }
+          const lifecycleAfterScan = target.lifecycle as RepoContextLifecycle;
+          if (lifecycleAfterScan === "failed") {
+            target.telemetry.recordLexicalFallback(scan, false);
+            throw new Error(PUBLIC_ERRORS.unavailable);
+          }
+          if (lifecycleAfterScan === "warming") {
+            const bounded = boundSearchPayload(
+              params.query,
+              warmingResult(scan),
+              target.config?.searchMaxBytes ?? 6 * 1024,
+              undefined,
+              "warming",
+            );
+            const used = bounded.payload.results.some((result) =>
+              bounded.payload.fallbackEvidence.some((evidence) => evidence.path === result.path),
+            );
+            target.telemetry.recordLexicalFallback(scan, used, bounded.payload.results.length);
+            if (!used) target.telemetry.recordWarmingEmptyReturn();
+            return {
+              content: [{ type: "text" as const, text: bounded.text }],
+              details: deprecated
+                ? { ...bounded.payload, deprecated: true as const, replacement: "repo_context_search" as const }
+                : bounded.payload,
+            };
+          }
+          target.telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false);
         }
       }
       if (target.lifecycle === "failed" || !target.available || !target.repoMap) {
@@ -553,6 +663,7 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
           result.error === undefined ? undefined : PUBLIC_ERRORS.searchResult,
           target.lifecycle,
         );
+        target.telemetry.recordIndexedResultReturn();
         return {
           content: [{ type: "text" as const, text: bounded.text }],
           details: deprecated

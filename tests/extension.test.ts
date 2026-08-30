@@ -9,6 +9,7 @@ import {
   type RepoMapController,
   registerRepoContext,
 } from "../src/extension.js";
+import type { LexicalFallbackScanResult } from "../src/repo-map/lexical-fallback.js";
 import type { RepoMapRuntimeQuery } from "../src/repo-map/runtime.js";
 import type { RepoContextConfig } from "../src/state/config.js";
 import type { RepoContextProjectState } from "../src/state/project-state.js";
@@ -270,6 +271,208 @@ it("shares lazy initialization and returns deterministic warming evidence when t
   };
   expect(ready.details.lifecycle).toBe("ready");
   expect(controller.query).toHaveBeenCalledOnce();
+});
+
+it("returns relevant same-call lexical evidence after the existing warming grace", async () => {
+  const target = harness();
+  const start = deferred();
+  const controller = fakeController({ start: vi.fn(() => start.promise) });
+  const scan: LexicalFallbackScanResult = {
+    results: [
+      {
+        path: "src/needle.ts",
+        score: 260,
+        kind: "lexical",
+        matchedSymbols: [],
+        matchReasons: ["direct lexical fallback: 1 query term"],
+        symbols: [],
+        dependencies: [],
+      },
+    ],
+    fallbackEvidence: [{ kind: "source", path: "src/needle.ts", excerpt: "export const coldNeedle = true;" }],
+    durationMs: 7,
+    filesScanned: 2,
+    bytesScanned: 128,
+    enumeratedPaths: 2,
+    enumerationBytes: 30,
+    matchesReturned: 1,
+    capped: false,
+    timedOut: false,
+    cancelled: false,
+  };
+  const lexicalFallbackScanner = vi.fn(async () => scan);
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: () => controller,
+    initializationWaiter: async () => "timeout",
+    lexicalFallbackScanner,
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+
+  const result = (await target.tools.get("repo_context_search")?.execute("id", { query: "coldNeedle" })) as {
+    details: Record<string, unknown>;
+  };
+  expect(result.details).toMatchObject({
+    lifecycle: "warming",
+    freshness: "stale",
+    generation: 0,
+    gitHead: "unavailable",
+    workspaceRevision: "unavailable",
+    results: [{ path: "src/needle.ts" }],
+    fallbackEvidence: [{ kind: "source", path: "src/needle.ts", excerpt: expect.stringContaining("coldNeedle") }],
+  });
+  const status = (await target.tools.get("repo_context_status")?.execute()) as {
+    details: { telemetry: Record<string, number> };
+  };
+  expect(status.details.telemetry).toMatchObject({
+    searchAttemptCount: 1,
+    lexicalFallbackAttemptCount: 1,
+    lexicalFallbackUsedCount: 1,
+    warmingEmptyReturnCount: 0,
+    lexicalFallbackFilesScanned: 2,
+    lexicalFallbackBytesScanned: 128,
+    lexicalFallbackMatchesReturned: 1,
+  });
+  start.resolve();
+});
+
+it("sanitizes lexical scanner failures, cleans up, and records one terminal outcome", async () => {
+  const target = harness();
+  const start = deferred();
+  const controller = fakeController({ start: vi.fn(() => start.promise) });
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: () => controller,
+    initializationWaiter: async () => "timeout",
+    lexicalFallbackScanner: async () => {
+      throw new Error("/private/project/.gitignore permission denied");
+    },
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+
+  const result = (await target.tools.get("repo_context_search")?.execute("id", { query: "needle" })) as {
+    content: Array<{ text: string }>;
+    details: { results: unknown[]; fallbackEvidence: Array<{ excerpt: string }> };
+  };
+  expect(result.details.results).toEqual([]);
+  expect(result.details.fallbackEvidence[0]?.excerpt).toContain("No lexical match found");
+  expect(result.content[0]?.text).not.toContain("/private/project");
+  const status = (await target.tools.get("repo_context_status")?.execute()) as {
+    details: { telemetry: Record<string, number> };
+  };
+  expect(status.details.telemetry).toMatchObject({
+    lexicalFallbackAttemptCount: 1,
+    lexicalFallbackNoMatchCount: 1,
+    warmingEmptyReturnCount: 1,
+  });
+  start.resolve();
+});
+
+it("discards an aborted fallback when initialization wins and keeps startup failure hard", async () => {
+  for (const failure of [false, true]) {
+    const target = harness();
+    const start = deferred();
+    const controller = fakeController({ start: vi.fn(() => start.promise) });
+    let scanSignal: AbortSignal | undefined;
+    const lexicalFallbackScanner = vi.fn(
+      ({ signal }: { signal?: AbortSignal }) =>
+        new Promise<LexicalFallbackScanResult>((resolveScan) => {
+          scanSignal = signal;
+          signal?.addEventListener("abort", () =>
+            resolveScan({
+              results: [],
+              fallbackEvidence: [],
+              durationMs: 1,
+              filesScanned: 0,
+              bytesScanned: 0,
+              enumeratedPaths: 0,
+              enumerationBytes: 0,
+              matchesReturned: 0,
+              capped: false,
+              timedOut: false,
+              cancelled: true,
+            }),
+          );
+        }),
+    );
+    registerRepoContext(target.pi, {
+      resolveProjectState: async () => projectState,
+      loadConfig: async () => config,
+      runtimeFactory: () => controller,
+      initializationWaiter: async () => "timeout",
+      lexicalFallbackScanner,
+    });
+    await target.events.get("session_start")?.[0]({}, headlessContext);
+    const search = target.tools.get("repo_context_search")?.execute("id", { query: "race" }) as Promise<{
+      details: { lifecycle: string };
+    }>;
+    await vi.waitFor(() => expect(lexicalFallbackScanner).toHaveBeenCalledOnce());
+    if (failure) start.reject(new Error("private startup path"));
+    else start.resolve();
+    if (failure) await expect(search).rejects.toThrow("Repository context is unavailable.");
+    else {
+      await expect(search).resolves.toMatchObject({ details: { lifecycle: "ready" } });
+      expect(controller.query).toHaveBeenCalledOnce();
+    }
+    expect(scanSignal?.aborted).toBe(true);
+  }
+});
+
+it("aborts a warming scan on replacement and cannot return retired evidence", async () => {
+  const target = harness();
+  const start = deferred();
+  const close = vi.fn(async () => undefined);
+  const controller = fakeController({ start: vi.fn(() => start.promise), close });
+  let signal: AbortSignal | undefined;
+  const lexicalFallbackScanner = vi.fn(
+    (options: { signal?: AbortSignal }) =>
+      new Promise<LexicalFallbackScanResult>((resolveScan) => {
+        signal = options.signal;
+        options.signal?.addEventListener("abort", () =>
+          resolveScan({
+            results: [
+              {
+                path: "old/secret.ts",
+                score: 1,
+                kind: "lexical",
+                matchedSymbols: [],
+                symbols: [],
+                dependencies: [],
+              },
+            ],
+            fallbackEvidence: [{ kind: "source", path: "old/secret.ts", excerpt: "retired evidence" }],
+            durationMs: 1,
+            filesScanned: 1,
+            bytesScanned: 16,
+            enumeratedPaths: 1,
+            enumerationBytes: 14,
+            matchesReturned: 1,
+            capped: false,
+            timedOut: false,
+            cancelled: true,
+          }),
+        );
+      }),
+  );
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: () => controller,
+    initializationWaiter: async () => "timeout",
+    lexicalFallbackScanner,
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+  const search = target.tools.get("repo_context_search")?.execute("id", { query: "retired" }) as Promise<unknown>;
+  await vi.waitFor(() => expect(lexicalFallbackScanner).toHaveBeenCalledOnce());
+
+  const replacement = target.events.get("session_start")?.[0]({}, headlessContext) as Promise<void>;
+  await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+  await expect(search).rejects.toThrow("Repository context is unavailable.");
+  start.resolve();
+  await replacement;
+  expect(close).toHaveBeenCalledOnce();
 });
 
 it("serializes shutdown and session replacement behind initialization and closes once", async () => {
@@ -741,6 +944,32 @@ it("preserves explicit warming fallback evidence at the 512-byte minimum", () =>
   expect(Buffer.byteLength(bounded.text, "utf8")).toBeLessThanOrEqual(512);
   expect(bounded.payload.fallbackEvidence).toEqual(warming.fallbackEvidence);
   expect(bounded.payload.truncatedFields).toContain("query");
+});
+
+it("keeps a compact useful warming result/evidence pair at 512 bytes when representable", () => {
+  const warming: RepoMapRuntimeQuery = {
+    results: [
+      {
+        path: "a.ts",
+        score: 1,
+        kind: "lexical",
+        matchedSymbols: [],
+        symbols: [],
+        dependencies: [],
+      },
+    ],
+    freshness: "stale",
+    generation: 0,
+    gitHead: "unavailable",
+    workspaceRevision: "unavailable",
+    pendingFiles: [],
+    fallbackEvidence: [{ kind: "source", path: "a.ts", excerpt: "needle" }],
+  };
+  const bounded = boundSearchPayload("needle", warming, 512, undefined, "warming");
+  expect(Buffer.byteLength(bounded.text, "utf8")).toBeLessThanOrEqual(512);
+  expect(bounded.payload.results).toHaveLength(1);
+  expect(bounded.payload.fallbackEvidence).toEqual([{ kind: "source", path: "a.ts", excerpt: "needle" }]);
+  expect(JSON.parse(bounded.text)).toEqual(bounded.payload);
 });
 
 it("renders deterministic complete-row truncation within the 512-byte minimum", () => {
