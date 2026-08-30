@@ -88,7 +88,19 @@ identical retry:   file-00099.ts
 
 The manual-scheduler test does not cover the production scheduler race. Remaining work is rescheduled after the bounded flush; a concurrent activation can retire the captured generation before the pending lexical scan starts, returning the stale pre-scan result.
 
-Result: #17 reopened. Full Repo CI is not accepted until both the Windows focused test and default-scheduler external reproduction pass.
+### Isolation of the remaining failure
+
+On the same commit, excluding only `tests/repo-map-issue-17.test.ts`:
+
+```text
+typecheck:          pass
+Biome:              pass
+other tests:        334 passed, 1 skipped
+package smoke:      pass
+cold-search replay: 6/6 non-empty, 29–39ms
+```
+
+Result: #17 reopened. The remaining failure is localized; full Repo CI is not accepted until both the Windows focused test and default-scheduler external reproduction pass.
 
 ## Infrastructure
 
