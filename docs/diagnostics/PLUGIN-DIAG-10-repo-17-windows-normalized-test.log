@@ -1,0 +1,9 @@
+
+ RUN  v4.1.10 D:/pi-test/pi-context-vault-experiment/pi-repo-context
+
+
+ Test Files  1 passed (1)
+      Tests  1 passed (1)
+   Start at  01:04:09
+   Duration  16.05s (transform 203ms, setup 0ms, import 448ms, tests 15.44s, environment 0ms)
+
