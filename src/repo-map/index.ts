@@ -150,6 +150,8 @@ export interface BuildRepoMapOptions {
 
 export interface RepoMapQueryOptions {
   limit?: number;
+  /** Cancels live, read-only fallback work; coherent snapshot search is synchronous. */
+  signal?: AbortSignal;
 }
 
 export interface RepoMapFileSystem {

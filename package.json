@@ -49,6 +49,7 @@
     "docs/specs/0016-repository-graph-contract.md",
     "docs/specs/0019-lazy-repo-map-startup.md",
     "docs/specs/0020-cold-search-fallback.md",
+    "docs/specs/0021-stale-pending-search-fallback.md",
     "docs/specs/README.md",
     "README.md",
     "LICENSE"
@@ -64,7 +65,8 @@
     "test:package": "node scripts/package-smoke.mjs",
     "test:pi": "node scripts/pi-rpc-smoke.mjs",
     "test:cold-search": "node scripts/cold-first-search-surrogate.mjs",
-    "ci": "npm run check && npm run test:coverage && npm run test:package && npm run test:cold-search"
+    "test:issue-17": "vitest run tests/repo-map-issue-17.test.ts",
+    "ci": "npm run check && npm run test:coverage && npm run test:package && npm run test:cold-search && npm run test:issue-17"
   },
   "dependencies": {
     "chokidar": "5.0.0",

@@ -165,6 +165,124 @@ it("uses authoritative Git admission, including tracked files later ignored", as
   ).toMatchObject({ results: [] });
 });
 
+it("bounds and authoritatively admits explicit Git candidates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-candidates-git-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await writeFile(join(root, "tracked.log"), "candidateTrackedNeedle\n");
+  await execFileAsync("git", ["add", "tracked.log"], { cwd: root });
+  await writeFile(join(root, ".gitignore"), "*.log\nignored.txt\n");
+  await writeFile(join(root, "ignored.txt"), "candidateIgnoredNeedle\n");
+
+  const tracked = await scanLexicalFallback({
+    projectRoot: root,
+    query: "candidateTrackedNeedle",
+    candidatePaths: ["tracked.log", "tracked.log", "ignored.txt"],
+  });
+  expect(tracked.results[0]).toMatchObject({
+    path: "tracked.log",
+    matchReasons: ["pending lexical fallback: exact query"],
+  });
+  expect(tracked).toMatchObject({ enumeratedPaths: 3, conclusivePaths: ["ignored.txt", "tracked.log"] });
+  expect(
+    await scanLexicalFallback({
+      projectRoot: root,
+      query: "candidateIgnoredNeedle",
+      candidatePaths: ["ignored.txt"],
+    }),
+  ).toMatchObject({ results: [] });
+});
+
+it("fails closed on ambiguous Git candidate-admission errors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-candidates-ambiguous-git-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await writeFile(join(root, ".git", "config"), "this is not valid git config\n");
+  await writeFile(join(root, "secret.ts"), "ambiguousGitSecret\n");
+
+  const result = await scanLexicalFallback({
+    projectRoot: root,
+    query: "ambiguousGitSecret",
+    candidatePaths: ["secret.ts"],
+  });
+  expect(result).toMatchObject({ capped: true, results: [], fallbackEvidence: [] });
+});
+
+it("uses only explicit candidates with hardened non-Git ignore and work bounds", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-candidates-walk-"));
+  await writeFile(join(root, ".gitignore"), "ignored.ts\n");
+  await writeFile(join(root, "kept.ts"), "candidateKeptNeedle\n");
+  await writeFile(join(root, "ignored.ts"), "candidateIgnoredNeedle\n");
+  await writeFile(join(root, "unsupplied.ts"), "candidateUnsuppliedNeedle\n");
+
+  const kept = await scanLexicalFallback({
+    projectRoot: root,
+    query: "candidateKeptNeedle",
+    candidatePaths: ["./kept.ts", "ignored.ts", "../escape.ts", "kept.ts"],
+  });
+  expect(kept.results[0]?.path).toBe("kept.ts");
+  expect(kept.enumeratedPaths).toBe(4);
+  expect(kept.conclusivePaths).toEqual(["ignored.ts", "kept.ts"]);
+  for (const [query, candidatePaths] of [
+    ["candidateIgnoredNeedle", ["ignored.ts"]],
+    ["candidateUnsuppliedNeedle", ["kept.ts"]],
+  ] as const) {
+    expect((await scanLexicalFallback({ projectRoot: root, query, candidatePaths })).results).toEqual([]);
+  }
+
+  const capped = await scanLexicalFallback({
+    projectRoot: root,
+    query: "candidateKeptNeedle",
+    candidatePaths: ["kept.ts", "ignored.ts"],
+    limits: { maxEnumeratedPaths: 1 },
+  });
+  expect(capped).toMatchObject({ capped: true, enumeratedPaths: 1 });
+});
+
+it("keeps explicit candidate reads within the configured concurrency", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-candidate-concurrency-"));
+  const candidatePaths = Array.from({ length: 6 }, (_, index) => `${index}.ts`);
+  await Promise.all(candidatePaths.map((path) => writeFile(join(root, path), `concurrentNeedle${path}\n`)));
+  let active = 0;
+  let maximum = 0;
+  const result = await scanLexicalFallback({
+    projectRoot: root,
+    query: "concurrentNeedle",
+    candidatePaths,
+    limits: { concurrency: 2 },
+    beforeOpen: async () => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+      active -= 1;
+    },
+  });
+  expect(result.filesScanned).toBe(6);
+  expect(maximum).toBe(2);
+});
+
+it("rejects deleted, non-regular, binary, and unreadable explicit candidates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-candidate-outcomes-"));
+  await writeFile(join(root, "binary.bin"), Buffer.from("candidateBinaryNeedle\0tail"));
+  await mkdir(join(root, "directory.ts"));
+  await writeFile(join(root, "unreadable.ts"), "candidateUnreadableNeedle\n");
+
+  for (const query of ["candidateBinaryNeedle", "candidateMissingNeedle", "candidateDirectoryNeedle"]) {
+    const path = query.includes("Binary") ? "binary.bin" : query.includes("Missing") ? "missing.ts" : "directory.ts";
+    expect((await scanLexicalFallback({ projectRoot: root, query, candidatePaths: [path] })).results).toEqual([]);
+  }
+  const unreadable = await scanLexicalFallback({
+    projectRoot: root,
+    query: "candidateUnreadableNeedle",
+    candidatePaths: ["unreadable.ts"],
+    beforeOpen: async (path) => {
+      if (path.endsWith("unreadable.ts")) throw Object.assign(new Error("simulated unreadable"), { code: "EACCES" });
+    },
+  });
+  expect(unreadable.results).toEqual([]);
+  expect(unreadable.fallbackEvidence).toEqual([]);
+  expect(unreadable.conclusivePaths).toEqual([]);
+  expect(unreadable.unresolvedPaths).toEqual(["unreadable.ts"]);
+});
+
 it("honors non-Git root ignore negation and skips symlinks and binary files", async () => {
   const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-walk-"));
   const outside = await mkdtemp(join(tmpdir(), "repo-context-lexical-outside-"));
@@ -213,6 +331,7 @@ it("enforces source/file/result bounds and cancellation without leaking partial 
   const cancelled = await scanLexicalFallback({
     projectRoot: root,
     query: "bounded_needle",
+    candidatePaths: ["0.txt", "1.txt"],
     signal: controller.signal,
   });
   expect(cancelled).toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });

@@ -30,7 +30,7 @@ Repo Context `0.1.0` is Tool-first and performs **no automatic repository-contex
 
 ## Tools
 
-- `repo_context_search` — live freshness reconciliation followed by bounded repository search.
+- `repo_context_search` — live bounded freshness reconciliation followed by repository search; if reconciliation remains stale, a bounded read-only scan of the captured pending paths can supply current paired evidence without changing the reported revision.
 - `repo_context_status` — lifecycle, freshness, state and repository-only telemetry.
 - `context_vault_repo_map` — deprecated 0.1.x alias for `repo_context_search`; registered for compatibility,
   inactive by default, and planned for removal in 0.2.0.
@@ -45,8 +45,10 @@ separately from repository freshness and never inspects a controller before star
 
 Hard search failures (before initialization, disabled/unavailable runtime, settled startup failure, or rejected query) are
 Pi Tool errors. Fulfilled warming/stale/degraded searches remain successful Tool results and carry sanitized degradation
-metadata. The warming scanner follows Git/non-Git admission and exclusions, does not follow symlinks, and bounds
-enumeration, reads, concurrency, results, excerpts, duration, and the final UTF-8 payload. A compatible hydrated clean
+metadata. The warming and stale-pending scanners follow Git/non-Git admission and exclusions, do not follow symlinks, and bound
+enumeration, reads, concurrency, results, excerpts, duration, and the final UTF-8 payload. Stale-pending evidence is used
+only by live search; coherent `queryCurrent()` snapshots never read pending source, and direct reads do not advance the
+reported generation or workspace revision. A compatible hydrated clean
 generation can take an unchanged warm path after Git HEAD/status and watcher safety checks; legacy generations without the
 compatibility key rebuild once.
 

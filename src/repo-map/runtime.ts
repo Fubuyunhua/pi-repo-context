@@ -32,6 +32,7 @@ import {
   type RepoMapWarning,
   repoMapBuildCompatibilityKey,
 } from "./index.js";
+import { type LexicalFallbackScanResult, scanLexicalFallback } from "./lexical-fallback.js";
 import {
   RepositoryCheckpointStore,
   type RepositorySnapshotHandle,
@@ -129,6 +130,8 @@ export interface RepoMapRuntimeOptions {
   searchFactory?: (snapshot: RepoMapSnapshot) => RepoMapSearch;
   /** Injectable full-snapshot builder used by deterministic checkpoint failure tests. */
   snapshotBuilder?: typeof buildRepoMap;
+  /** Test-only injection for live stale-pending lexical scans. */
+  pendingScanner?: typeof scanLexicalFallback;
   now?: () => Date;
   /** Injectable monotonic clock used for deterministic telemetry tests. */
   monotonicNow?: () => number;
@@ -539,6 +542,7 @@ export class RepoMapRuntime {
   readonly #gitRunner: RepoMapGitRunner;
   readonly #searchFactory: (snapshot: RepoMapSnapshot) => RepoMapSearch;
   readonly #snapshotBuilder: typeof buildRepoMap;
+  readonly #pendingScanner: typeof scanLexicalFallback;
   #projectRoot = "";
   #base?: RepoMapSnapshot;
   #effective?: RepoMapSnapshot;
@@ -595,6 +599,7 @@ export class RepoMapRuntime {
     this.#gitRunner = options.gitRunner ?? defaultGitRunner;
     this.#searchFactory = options.searchFactory ?? ((snapshot) => new RepoMapSearch(snapshot));
     this.#snapshotBuilder = options.snapshotBuilder ?? buildRepoMap;
+    this.#pendingScanner = options.pendingScanner ?? scanLexicalFallback;
   }
 
   async start(): Promise<void> {
@@ -688,7 +693,7 @@ export class RepoMapRuntime {
       this.#scheduler.cancel(this.#scheduled);
       this.#scheduled = undefined;
     }
-    const startedAt = performance.now();
+    const startedAt = monotonicReading(this.#monotonicNow);
     for (let pass = 1; ; pass += 1) {
       const epoch = this.#mutationEpoch;
       await this.#drainWatcherUpdates();
@@ -714,7 +719,10 @@ export class RepoMapRuntime {
       // promise resolution. A notification observed during any awaited phase
       // changes the epoch and normally forces another complete pass.
       if (epoch === this.#mutationEpoch && this.#watcherUpdates.length === 0) return;
-      if (pass >= MAX_FLUSH_PASSES || performance.now() - startedAt >= MAX_FLUSH_DURATION_MS) {
+      if (
+        pass >= MAX_FLUSH_PASSES ||
+        (startedAt !== undefined && monotonicDuration(this.#monotonicNow, startedAt) >= MAX_FLUSH_DURATION_MS)
+      ) {
         this.#deferRemainingFlushWork();
         return;
       }
@@ -767,7 +775,115 @@ export class RepoMapRuntime {
     const startedAt = monotonicReading(this.#monotonicNow);
     try {
       await this.ensureFresh();
-      return await this.#queryCurrentUninstrumented(query, options, true);
+      const scanEpoch = this.#mutationEpoch;
+      const scanContentVersion = this.#effectiveContentVersion;
+      const scanGeneration = this.#generation;
+      const captured = await this.#queryCurrentUninstrumented(query, options, true);
+      if (captured.freshness !== "stale" || captured.pendingFiles.length === 0) return captured;
+      // The indexed query can itself perform bounded live source/Git reads.
+      // Do not start a pending scan if its capture was already retired.
+      if (
+        !this.#started ||
+        scanEpoch !== this.#mutationEpoch ||
+        scanContentVersion !== this.#effectiveContentVersion ||
+        scanGeneration !== this.#generation
+      ) {
+        return captured;
+      }
+
+      recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordLexicalFallbackAttempt());
+      let scan: LexicalFallbackScanResult;
+      try {
+        scan = await this.#pendingScanner({
+          projectRoot: this.#projectRoot,
+          query,
+          limit: 20,
+          exclude: this.#options.exclude ?? [],
+          candidatePaths: captured.pendingFiles,
+          ...(options.signal ? { signal: options.signal } : {}),
+        });
+      } catch {
+        scan = {
+          results: [],
+          fallbackEvidence: [],
+          durationMs: 0,
+          filesScanned: 0,
+          bytesScanned: 0,
+          enumeratedPaths: 0,
+          enumerationBytes: 0,
+          matchesReturned: 0,
+          capped: true,
+          timedOut: false,
+          cancelled: Boolean(options.signal?.aborted),
+        };
+      }
+      if (options.signal?.aborted) {
+        recordTelemetry(this.#telemetry, (telemetry) =>
+          telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false),
+        );
+        throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+      }
+      // A notification, activation, close, or concurrent flush retires the
+      // captured pending set. Never pair its transient source bytes with a
+      // different indexed capture.
+      if (
+        !this.#started ||
+        scanEpoch !== this.#mutationEpoch ||
+        scanContentVersion !== this.#effectiveContentVersion ||
+        scanGeneration !== this.#generation
+      ) {
+        recordTelemetry(this.#telemetry, (telemetry) =>
+          telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false),
+        );
+        return captured;
+      }
+
+      const pendingEvidence = new Map(
+        scan.fallbackEvidence
+          .filter((evidence): evidence is RepoMapFallbackEvidence & { path: string } => Boolean(evidence.path))
+          .map((evidence) => [evidence.path, evidence]),
+      );
+      const pairedPending = scan.results.filter((result) => pendingEvidence.has(result.path));
+      const exact = pairedPending.filter((result) =>
+        result.matchReasons?.includes("pending lexical fallback: exact query"),
+      );
+      const component = pairedPending.filter(
+        (result) => !result.matchReasons?.includes("pending lexical fallback: exact query"),
+      );
+      const conclusivePaths = new Set(scan.conclusivePaths ?? []);
+      const currentPendingMatches = new Set(pairedPending.map((result) => result.path));
+      const indexed = captured.results.filter(
+        (result) => !conclusivePaths.has(result.path) || currentPendingMatches.has(result.path),
+      );
+      const componentByPath = new Map(component.map((result) => [result.path, result]));
+      // Preserve the indexed rank position for component-only matches while
+      // substituting current pending metadata/evidence for the same path.
+      const indexedWithCurrentPending = indexed.map((result) => componentByPath.get(result.path) ?? result);
+      const merged: RepoMapQueryResult[] = [];
+      const seen = new Set<string>();
+      for (const result of [...exact, ...indexedWithCurrentPending, ...component]) {
+        if (seen.has(result.path)) continue;
+        seen.add(result.path);
+        merged.push(result);
+      }
+      const requestedLimit = Math.max(1, options.limit ?? 10);
+      const results = merged.slice(0, requestedLimit);
+      const resultPaths = new Set(results.map((result) => result.path));
+      const fallbackEvidence: RepoMapFallbackEvidence[] = [];
+      for (const result of results) {
+        const pending = pendingEvidence.get(result.path);
+        const indexed = captured.fallbackEvidence.find((evidence) => evidence.path === result.path);
+        if (pending) fallbackEvidence.push(pending);
+        else if (indexed) fallbackEvidence.push(indexed);
+      }
+      for (const evidence of captured.fallbackEvidence) {
+        if (evidence.path === undefined) fallbackEvidence.push(evidence);
+      }
+      const usedMatches = pairedPending.filter((result) => resultPaths.has(result.path)).length;
+      recordTelemetry(this.#telemetry, (telemetry) =>
+        telemetry.recordLexicalFallback({ ...scan, matchesReturned: usedMatches }, usedMatches > 0, usedMatches),
+      );
+      return { ...captured, results, fallbackEvidence };
     } finally {
       recordTelemetry(this.#telemetry, (telemetry) =>
         telemetry.recordRepoMapQuery(monotonicDuration(this.#monotonicNow, startedAt)),
@@ -842,21 +958,17 @@ export class RepoMapRuntime {
         const diff = await gitDiff(this.#projectRoot, this.#gitRunner, this.#telemetry, this.#monotonicNow);
         if (diff) fallbackEvidence.push({ kind: "git-diff", excerpt: diff });
       }
-      if (fallbackEvidence.length === 0) {
+      // Preserve queryCurrent's coherent-snapshot fallback contract. Live
+      // queries do not fabricate an unrelated first-file source row before a
+      // pending scan.
+      if (fallbackEvidence.length === 0 && !liveFallback) {
         const firstFile = files[0];
         if (firstFile) {
-          let excerpt = firstFile.lexicalTerms.slice(0, 40).join(" ");
-          if (liveFallback) {
-            try {
-              const content = this.#options.indexFileSystem
-                ? await this.#options.indexFileSystem.readFile(join(this.#projectRoot, firstFile.path))
-                : await readFile(join(this.#projectRoot, firstFile.path));
-              excerpt = content.toString("utf8").slice(0, 4 * 1024);
-            } catch {
-              // Indexed terms remain useful when a live source read fails.
-            }
-          }
-          fallbackEvidence.push({ kind: "source", path: firstFile.path, excerpt });
+          fallbackEvidence.push({
+            kind: "source",
+            path: firstFile.path,
+            excerpt: firstFile.lexicalTerms.slice(0, 40).join(" "),
+          });
         } else {
           fallbackEvidence.push({
             kind: "source",

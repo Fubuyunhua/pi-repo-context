@@ -8,7 +8,8 @@ checkpoint. Package identity and persisted generator provenance are `pi-repo-con
   this product; Repo Context `0.1.x` is explicit Tool/command only.
 - 0016 is the active Snapshot Foundation, Repository Graph v1, and Resolver v1 contract.
 - 0019 defines lazy single-flight startup and conservative compatible clean-generation reuse.
-- 0020 defines the same-call bounded lexical fallback used only while cold initialization remains warming.
+- 0020 defines the same-call bounded lexical fallback used while cold initialization remains warming.
+- 0021 defines the private bounded stale-pending scan used only by live search after bounded reconciliation.
 
 Specification 0018 is retained in the source repository as split-internal decision history and is deliberately excluded
 from the `v0.1.0` packed artifact. Current user-facing ownership and transition guidance is in

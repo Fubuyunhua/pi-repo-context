@@ -56,7 +56,7 @@ export interface RepoMapController {
   start(): Promise<void>;
   close(): Promise<void>;
   rebuild(): Promise<void>;
-  query(query: string, options?: { limit?: number }): Promise<RepoMapRuntimeQuery>;
+  query(query: string, options?: { limit?: number; signal?: AbortSignal }): Promise<RepoMapRuntimeQuery>;
   status(): Omit<RepoMapRuntimeQuery, "results" | "fallbackEvidence"> & {
     dirtyFiles: string[];
     maintenance?: RepoMapMaintenanceResult | { error: string };
@@ -563,7 +563,7 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
         : [{ kind: "warming", excerpt: "No lexical match found within the bounded warming scan." }],
   });
 
-  const executeSearch = (params: { query: string; limit?: number }, deprecated: boolean) => {
+  const executeSearch = (params: { query: string; limit?: number }, deprecated: boolean, signal?: AbortSignal) => {
     const target = runtime;
     return withActiveOperation(target, async () => {
       if (!target.initialized) throw new Error(PUBLIC_ERRORS.unavailable);
@@ -647,7 +647,10 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
 
       let result: RepoMapRuntimeQuery;
       try {
-        result = await target.repoMap.query(params.query, { limit: params.limit });
+        result = await target.repoMap.query(params.query, {
+          limit: params.limit,
+          ...(signal ? { signal } : {}),
+        });
       } catch (error) {
         if (!isCurrent(target)) throw new Error(PUBLIC_ERRORS.unavailable);
         addFailure(target, "query", error);
@@ -693,14 +696,14 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
       "Use repo_context_search to find relevant repository files and symbols before broad filesystem searches.",
     ],
     parameters: searchParameters,
-    execute: async (_toolCallId, params) => executeSearch(params, false),
+    execute: async (_toolCallId, params, signal) => executeSearch(params, false, signal),
   });
   pi.registerTool({
     name: LEGACY_SEARCH_TOOL,
     label: "Repository Map (deprecated)",
     description: "Deprecated alias for repo_context_search.",
     parameters: searchParameters,
-    execute: async (_toolCallId, params) => executeSearch(params, true),
+    execute: async (_toolCallId, params, signal) => executeSearch(params, true, signal),
   });
   pi.registerTool({
     name: "repo_context_status",

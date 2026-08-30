@@ -43,6 +43,11 @@ export interface LexicalFallbackOptions {
   exclude?: string[];
   signal?: AbortSignal;
   limits?: Partial<LexicalFallbackLimits>;
+  /**
+   * An explicit, bounded path set. This mode is used by a live stale query and
+   * never expands beyond the supplied paths.
+   */
+  candidatePaths?: readonly string[];
   /** Test-only race hook invoked after identity capture and before open. */
   beforeOpen?: (path: string) => Promise<void>;
 }
@@ -50,6 +55,10 @@ export interface LexicalFallbackOptions {
 export interface LexicalFallbackScanResult {
   results: RepoMapQueryResult[];
   fallbackEvidence: RepoMapFallbackEvidence[];
+  /** Candidate paths conclusively classified by admission or a complete read. */
+  conclusivePaths?: string[];
+  /** Candidate paths whose admission/read could not be concluded safely. */
+  unresolvedPaths?: string[];
   durationMs: number;
   filesScanned: number;
   bytesScanned: number;
@@ -68,12 +77,22 @@ interface EnumerationResult {
   capped: boolean;
   cancelled: boolean;
   git: boolean;
+  conclusiveExcludedPaths?: string[];
+  unresolvedPaths?: string[];
+}
+
+interface CandidateRead {
+  text?: string;
+  bytes: number;
+  capped: boolean;
+  outcome: "text" | "conclusive" | "unresolved";
 }
 
 interface CandidateMatch {
   path: string;
   score: number;
   coverage: number;
+  exact: boolean;
   evidenceKind: "source" | "warming";
   excerpt: string;
 }
@@ -166,6 +185,7 @@ function scoreCandidate(
   return {
     path,
     coverage: matched.length,
+    exact: exactTextIndex >= 0 || exactPath,
     evidenceKind: matchIndex >= 0 ? "source" : "warming",
     score:
       matched.length * 100 +
@@ -175,6 +195,103 @@ function scoreCandidate(
       (basenameExact ? 100 : 0),
     excerpt,
   };
+}
+
+function spawnGitCandidateAdmission(
+  projectRoot: string,
+  signal: AbortSignal,
+  limits: Readonly<LexicalFallbackLimits>,
+  candidatePaths: readonly string[],
+): Promise<EnumerationResult | undefined> {
+  return new Promise((resolveEnumeration) => {
+    const paths: string[] = [];
+    let bytes = 0;
+    let observedOutputPaths = 0;
+    let buffered = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let capped = false;
+    let finished = false;
+    const admitted = new Set(candidatePaths);
+    const child = spawn(
+      "git",
+      ["-c", "core.quotepath=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+      {
+        cwd: projectRoot,
+        env: { ...process.env, LC_ALL: "C" },
+        stdio: ["ignore", "pipe", "pipe"],
+        signal,
+      },
+    );
+    const finish = (result: EnumerationResult | undefined) => {
+      if (finished) return;
+      finished = true;
+      resolveEnumeration(result);
+    };
+    child.on("error", (error) => {
+      if (signal.aborted || error.name === "AbortError") {
+        finish({ paths: [], observedPaths: candidatePaths.length, bytes: 0, capped, cancelled: true, git: true });
+      } else {
+        // A missing/broken Git executable is ambiguous, so candidate admission
+        // fails closed rather than silently using non-Git ignore semantics.
+        finish({
+          paths: [],
+          observedPaths: candidatePaths.length,
+          bytes: 0,
+          capped: true,
+          cancelled: false,
+          git: true,
+        });
+      }
+    });
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (finished) return;
+      buffered = Buffer.concat([buffered, chunk]);
+      if (bytes + buffered.byteLength > limits.maxEnumerationBytes) {
+        capped = true;
+        child.kill();
+        return;
+      }
+      let separator = buffered.indexOf(0);
+      while (separator >= 0) {
+        const raw = buffered.subarray(0, separator);
+        buffered = buffered.subarray(separator + 1);
+        const pathBytes = raw.byteLength + 1;
+        if (observedOutputPaths >= limits.maxEnumeratedPaths || bytes + pathBytes > limits.maxEnumerationBytes) {
+          capped = true;
+          child.kill();
+          break;
+        }
+        observedOutputPaths += 1;
+        bytes += pathBytes;
+        const path = slash(raw.toString("utf8"));
+        if (safeRelativePath(path) && admitted.has(path)) paths.push(path);
+        separator = buffered.indexOf(0);
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.byteLength < 4_096) stderr = Buffer.concat([stderr, chunk]).subarray(0, 4_096);
+    });
+    child.on("close", (code) => {
+      if (signal.aborted) {
+        finish({ paths: [], observedPaths: candidatePaths.length, bytes, capped, cancelled: true, git: true });
+      } else if (code === 0 || capped) {
+        finish({
+          paths: [...new Set(paths)].sort(stablePathCompare),
+          observedPaths: candidatePaths.length,
+          bytes,
+          capped,
+          cancelled: false,
+          git: true,
+        });
+      } else if (stderr.toString("utf8").includes("not a git repository")) {
+        // LC_ALL=C makes this the one unambiguous non-Git result. All other
+        // failures remain fail-closed Git ambiguity.
+        finish(undefined);
+      } else {
+        finish({ paths: [], observedPaths: candidatePaths.length, bytes, capped: true, cancelled: false, git: true });
+      }
+    });
+  });
 }
 
 function spawnGitEnumeration(
@@ -301,12 +418,124 @@ async function fallbackEnumeration(
   return { paths, observedPaths, bytes, capped, cancelled: signal.aborted, git: false };
 }
 
+async function candidateEnumeration(
+  projectRoot: string,
+  signal: AbortSignal,
+  limits: Readonly<LexicalFallbackLimits>,
+  candidatePaths: readonly string[],
+  excluded: (path: string) => boolean,
+  beforeOpen?: (path: string) => Promise<void>,
+): Promise<EnumerationResult> {
+  const normalized: string[] = [];
+  const conclusiveExcludedPaths: string[] = [];
+  let observedPaths = 0;
+  let bytes = 0;
+  let capped = false;
+  // Charge supplied entries before normalization, deduplication, exclusion, or
+  // admission. Stop at the hard envelope without inspecting an uncharged path.
+  for (const supplied of candidatePaths) {
+    const pathBytes = Buffer.byteLength(supplied, "utf8") + 1;
+    if (observedPaths >= limits.maxEnumeratedPaths || bytes + pathBytes > limits.maxEnumerationBytes) {
+      capped = true;
+      break;
+    }
+    observedPaths += 1;
+    bytes += pathBytes;
+    const path = supplied.replaceAll("\\", "/").replace(/^\.\//u, "");
+    if (!safeRelativePath(path)) continue;
+    if (excluded(path)) conclusiveExcludedPaths.push(path);
+    else normalized.push(path);
+  }
+  const ordered = [...new Set(normalized)].sort(stablePathCompare);
+  if (signal.aborted) return { paths: [], observedPaths, bytes, capped, cancelled: true, git: true };
+  const remainingAdmissionLimits = {
+    ...limits,
+    maxEnumeratedPaths: Math.max(0, limits.maxEnumeratedPaths - observedPaths),
+    maxEnumerationBytes: Math.max(0, limits.maxEnumerationBytes - bytes),
+  };
+  if (
+    ordered.length > 0 &&
+    (remainingAdmissionLimits.maxEnumeratedPaths === 0 || remainingAdmissionLimits.maxEnumerationBytes === 0)
+  ) {
+    return {
+      paths: [],
+      observedPaths,
+      bytes,
+      capped: true,
+      cancelled: signal.aborted,
+      git: true,
+      conclusiveExcludedPaths,
+      unresolvedPaths: ordered,
+    };
+  }
+  const git = await spawnGitCandidateAdmission(projectRoot, signal, remainingAdmissionLimits, ordered);
+  if (git) {
+    const admitted = new Set(git.paths);
+    const unresolved = capped || git.capped || git.cancelled;
+    return {
+      ...git,
+      observedPaths,
+      // Candidate charging, rather than Git output, owns this envelope.
+      bytes,
+      capped: capped || git.capped,
+      conclusiveExcludedPaths: unresolved
+        ? conclusiveExcludedPaths
+        : [...conclusiveExcludedPaths, ...ordered.filter((path) => !admitted.has(path))],
+      unresolvedPaths: unresolved ? ordered.filter((path) => !admitted.has(path)) : [],
+    };
+  }
+
+  // The Git operation confirmed this is not a repository. Apply the same
+  // hardened root-ignore admission used by full non-Git enumeration, but never
+  // walk beyond the supplied set.
+  let ignorePatterns: string[] = [];
+  const ignorePath = join(projectRoot, ".gitignore");
+  try {
+    const ignoreInfo = await lstat(ignorePath);
+    if (!ignoreInfo.isFile() || ignoreInfo.isSymbolicLink()) {
+      return { paths: [], observedPaths, bytes, capped: true, cancelled: signal.aborted, git: false };
+    }
+    const ignore = await readCandidate(
+      projectRoot,
+      ".gitignore",
+      limits.maxIgnoreBytes,
+      limits.maxIgnoreBytes,
+      signal,
+      beforeOpen,
+    );
+    if (ignore.text === undefined || ignore.capped) {
+      return { paths: [], observedPaths, bytes, capped: true, cancelled: signal.aborted, git: false };
+    }
+    ignorePatterns = ignore.text
+      .split(/\r?\n/u)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"));
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") {
+      return { paths: [], observedPaths, bytes, capped: true, cancelled: signal.aborted, git: false };
+    }
+  }
+  const ignored = rootGitignoreMatcher(ignorePatterns);
+  const paths = ordered.filter((path) => !ignored(path));
+  return {
+    paths,
+    observedPaths,
+    bytes,
+    capped,
+    cancelled: signal.aborted,
+    git: false,
+    conclusiveExcludedPaths: [...conclusiveExcludedPaths, ...ordered.filter((path) => ignored(path))],
+    unresolvedPaths: signal.aborted || capped ? paths : [],
+  };
+}
+
 async function enumerate(
   projectRoot: string,
   signal: AbortSignal,
   limits: Readonly<LexicalFallbackLimits>,
   exclude: string[],
   beforeOpen?: (path: string) => Promise<void>,
+  candidatePaths?: readonly string[],
 ): Promise<EnumerationResult> {
   if (exclude.length > limits.maxExcludePatterns) {
     return { paths: [], observedPaths: 0, bytes: 0, capped: true, cancelled: signal.aborted, git: false };
@@ -319,6 +548,9 @@ async function enumerate(
     }
   }
   const excluded = repoMapPathExclusionMatcher(exclude);
+  if (candidatePaths !== undefined) {
+    return candidateEnumeration(projectRoot, signal, limits, candidatePaths, excluded, beforeOpen);
+  }
   const git = await spawnGitEnumeration(projectRoot, signal, limits, excluded);
   if (git.git || git.cancelled) return { ...git, paths: [...new Set(git.paths)].sort(stablePathCompare) };
   const fallback = await fallbackEnumeration(projectRoot, signal, limits, excluded, beforeOpen);
@@ -332,17 +564,18 @@ async function readCandidate(
   maxFileBytes: number,
   signal: AbortSignal,
   beforeOpen?: (path: string) => Promise<void>,
-): Promise<{ text?: string; bytes: number; capped: boolean }> {
-  if (budget <= 0 || signal.aborted) return { bytes: 0, capped: budget <= 0 };
+): Promise<CandidateRead> {
+  if (budget <= 0 || signal.aborted) return { bytes: 0, capped: budget <= 0, outcome: "unresolved" };
   const absolute = resolve(projectRoot, path);
   const relativePath = relative(projectRoot, absolute);
-  if (!safeRelativePath(slash(relativePath))) return { bytes: 0, capped: false };
+  if (!safeRelativePath(slash(relativePath))) return { bytes: 0, capped: false, outcome: "conclusive" };
   try {
     const info = await lstat(absolute, { bigint: true });
-    if (!info.isFile() || signal.aborted) return { bytes: 0, capped: false };
+    if (!info.isFile()) return { bytes: 0, capped: false, outcome: "conclusive" };
+    if (signal.aborted) return { bytes: 0, capped: false, outcome: "unresolved" };
     const canonical = await realpath(absolute);
     if (canonical !== absolute || !safeRelativePath(slash(relative(projectRoot, canonical))))
-      return { bytes: 0, capped: false };
+      return { bytes: 0, capped: false, outcome: "unresolved" };
     await beforeOpen?.(absolute);
     const handle = await open(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
@@ -352,19 +585,25 @@ async function readCandidate(
       // content is read so a swapped parent/final entry cannot expose a
       // different file.
       if (!current.isFile() || current.dev !== info.dev || current.ino !== info.ino) {
-        return { bytes: 0, capped: false };
+        return { bytes: 0, capped: false, outcome: "unresolved" };
       }
       const length = Math.min(budget, maxFileBytes);
       const content = Buffer.alloc(length);
       const { bytesRead } = await handle.read(content, 0, length, 0);
       const bounded = content.subarray(0, bytesRead);
-      if (bounded.subarray(0, Math.min(8_192, bounded.length)).includes(0)) return { bytes: bytesRead, capped: false };
-      return { text: bounded.toString("utf8"), bytes: bytesRead, capped: current.size > bytesRead };
+      if (bounded.subarray(0, Math.min(8_192, bounded.length)).includes(0)) {
+        return { bytes: bytesRead, capped: false, outcome: "conclusive" };
+      }
+      return { text: bounded.toString("utf8"), bytes: bytesRead, capped: current.size > bytesRead, outcome: "text" };
     } finally {
       await handle.close();
     }
-  } catch {
-    return { bytes: 0, capped: false };
+  } catch (error) {
+    return {
+      bytes: 0,
+      capped: false,
+      outcome: errorCode(error) === "ENOENT" ? "conclusive" : "unresolved",
+    };
   }
 }
 
@@ -394,9 +633,21 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
   let bytesScanned = 0;
   let capped = false;
   const matches: CandidateMatch[] = [];
+  const conclusivePaths = new Set<string>();
+  const unresolvedPaths = new Set<string>();
+  const processedPaths = new Set<string>();
   try {
-    enumeration = await enumerate(options.projectRoot, signal, limits, options.exclude ?? [], options.beforeOpen);
+    enumeration = await enumerate(
+      options.projectRoot,
+      signal,
+      limits,
+      options.exclude ?? [],
+      options.beforeOpen,
+      options.candidatePaths,
+    );
     capped = enumeration.capped;
+    for (const path of enumeration.conclusiveExcludedPaths ?? []) conclusivePaths.add(path);
+    for (const path of enumeration.unresolvedPaths ?? []) unresolvedPaths.add(path);
     const terms = queryTerms(options.query);
     for (let offset = 0; offset < enumeration.paths.length && !signal.aborted; offset += limits.concurrency) {
       if (filesScanned >= limits.maxFiles || bytesScanned >= limits.maxSourceBytes) {
@@ -428,9 +679,16 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
         const row = rows[index];
         const path = batch[index];
         if (!row || !path) continue;
+        processedPaths.add(path);
         filesScanned += 1;
         bytesScanned += row.bytes;
         capped ||= row.capped;
+        if (row.outcome === "conclusive" || (row.outcome === "text" && !row.capped)) {
+          conclusivePaths.add(path);
+          unresolvedPaths.delete(path);
+        } else {
+          unresolvedPaths.add(path);
+        }
         if (row.text !== undefined) {
           const match = scoreCandidate(path, row.text, terms, options.query, limits.maxExcerptBytes);
           if (match) matches.push(match);
@@ -439,6 +697,9 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
     }
   } finally {
     clearTimeout(timeout);
+  }
+  for (const path of enumeration.paths) {
+    if (!processedPaths.has(path)) unresolvedPaths.add(path);
   }
   const requestedLimit = Math.min(Math.max(1, options.limit ?? 10), limits.maxResults);
   const ranked = matches
@@ -452,7 +713,13 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
     score: match.score,
     kind: "lexical",
     matchedSymbols: [],
-    matchReasons: [`direct lexical fallback: ${match.coverage} query term${match.coverage === 1 ? "" : "s"}`],
+    matchReasons: [
+      options.candidatePaths === undefined
+        ? `direct lexical fallback: ${match.coverage} query term${match.coverage === 1 ? "" : "s"}`
+        : match.exact
+          ? "pending lexical fallback: exact query"
+          : `pending lexical fallback: ${match.coverage} query component${match.coverage === 1 ? "" : "s"}`,
+    ],
     symbols: [],
     dependencies: [],
   }));
@@ -463,6 +730,12 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
       path: match.path,
       excerpt: match.excerpt,
     })),
+    ...(options.candidatePaths === undefined
+      ? {}
+      : {
+          conclusivePaths: [...conclusivePaths].sort(stablePathCompare),
+          unresolvedPaths: [...unresolvedPaths].sort(stablePathCompare),
+        }),
     durationMs: Math.max(0, Date.now() - started),
     filesScanned,
     bytesScanned,

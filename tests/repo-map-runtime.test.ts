@@ -932,11 +932,16 @@ describe("incremental repository map runtime", () => {
     await cold.start();
     const unavailable = await cold.query("unavailableValue");
     expect(unavailable.freshness).toBe("stale");
-    expect(unavailable.results).toEqual([]);
+    expect(unavailable.results[0]).toMatchObject({
+      path: "src/value.ts",
+      matchReasons: ["pending lexical fallback: exact query"],
+    });
     expect(unavailable.pendingFiles).toEqual(["src/value.ts"]);
-    expect(unavailable.fallbackEvidence).toEqual([
-      { kind: "source", excerpt: "No indexed source file is available; use direct filesystem search." },
-    ]);
+    expect(unavailable.fallbackEvidence[0]).toMatchObject({
+      kind: "source",
+      path: "src/value.ts",
+      excerpt: expect.stringContaining("unavailableValue"),
+    });
     failures.recover(join(withPrior.root, "src/value.ts"));
     failures.recover(join(withoutPrior.root, "src/value.ts"));
     await restarted.close();
@@ -1984,6 +1989,155 @@ describe("incremental repository map runtime", () => {
     expect(result.freshness).toBe("stale");
     expect(result.fallbackEvidence.some((evidence) => evidence.kind === "git-diff")).toBe(true);
     expect(telemetry.snapshot()).toMatchObject({ gitDiffCount: 1, gitDiffDurationMsTotal: 0 });
+    await runtime.close();
+  });
+
+  it("substitutes current pending metadata for a same-path component-only indexed hit", async () => {
+    const { root, stateRoot } = await fixture({ "src/same.ts": "export const staleComponentValue = true;" }, false);
+    const failures = controlledReadFailures();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+      indexFileSystem: failures.fileSystem,
+      pendingScanner: async () => ({
+        results: [
+          {
+            path: "src/same.ts",
+            score: 1,
+            kind: "lexical",
+            matchedSymbols: [],
+            matchReasons: ["pending lexical fallback: 1 query term"],
+            symbols: [],
+            dependencies: [],
+          },
+        ],
+        fallbackEvidence: [{ kind: "source", path: "src/same.ts", excerpt: "current component evidence" }],
+        durationMs: 1,
+        filesScanned: 1,
+        bytesScanned: 26,
+        enumeratedPaths: 1,
+        enumerationBytes: 12,
+        matchesReturned: 1,
+        capped: false,
+        timedOut: false,
+        cancelled: false,
+      }),
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/same.ts"), "export const currentComponentValue = true;");
+    failures.fail(join(root, "src/same.ts"));
+    runtime.notify("change", "src/same.ts");
+
+    const result = await runtime.query("ComponentValue");
+    expect(result.freshness).toBe("stale");
+    expect(result.results[0]).toMatchObject({
+      path: "src/same.ts",
+      matchReasons: ["pending lexical fallback: 1 query term"],
+      symbols: [],
+    });
+    expect(result.fallbackEvidence[0]).toMatchObject({
+      kind: "source",
+      path: "src/same.ts",
+      excerpt: "current component evidence",
+    });
+    failures.recover(join(root, "src/same.ts"));
+    await runtime.close();
+  });
+
+  it("suppresses a stale indexed hit only after a conclusive pending nonmatch", async () => {
+    const { root, stateRoot } = await fixture({ "src/stale.ts": "export const obsoletePendingNeedle = true;" }, false);
+    const failures = controlledReadFailures();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+      indexFileSystem: failures.fileSystem,
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/stale.ts"), "export const replacementPendingNeedle = true;");
+    failures.fail(join(root, "src/stale.ts"));
+    runtime.notify("change", "src/stale.ts");
+
+    const result = await runtime.query("obsoletePendingNeedle");
+    expect(result.freshness).toBe("stale");
+    expect(result.pendingFiles).toEqual(["src/stale.ts"]);
+    expect(result.results.some((row) => row.path === "src/stale.ts")).toBe(false);
+    expect(result.fallbackEvidence.some((evidence) => evidence.path === "src/stale.ts")).toBe(false);
+    failures.recover(join(root, "src/stale.ts"));
+    await runtime.close();
+  });
+
+  it("discards racing pending evidence and permits a bounded retry on the next live query", async () => {
+    const { root, stateRoot } = await fixture({ "src/race.ts": "export const oldRaceNeedle = true;" }, false);
+    const failures = controlledReadFailures();
+    const scanStarted = deferred();
+    const releaseScan = deferred();
+    let scans = 0;
+    const telemetry = new Telemetry();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+      indexFileSystem: failures.fileSystem,
+      telemetry,
+      pendingScanner: async () => {
+        scans += 1;
+        if (scans === 1) {
+          scanStarted.resolve();
+          await releaseScan.promise;
+        }
+        return {
+          results: [
+            {
+              path: "src/race.ts",
+              score: 1,
+              kind: "lexical",
+              matchedSymbols: [],
+              matchReasons: ["pending lexical fallback: exact query"],
+              symbols: [],
+              dependencies: [],
+            },
+          ],
+          fallbackEvidence: [{ kind: "source", path: "src/race.ts", excerpt: "newRaceNeedle" }],
+          durationMs: 1,
+          filesScanned: 1,
+          bytesScanned: 13,
+          enumeratedPaths: 1,
+          enumerationBytes: 12,
+          matchesReturned: 1,
+          capped: false,
+          timedOut: false,
+          cancelled: false,
+        };
+      },
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/race.ts"), "export const newRaceNeedle = true;");
+    failures.fail(join(root, "src/race.ts"));
+    runtime.notify("change", "src/race.ts");
+
+    const racing = runtime.query("newRaceNeedle");
+    await scanStarted.promise;
+    runtime.notify("change", "src/race.ts");
+    releaseScan.resolve();
+    const retired = await racing;
+    expect(retired.results).toEqual([]);
+    expect(retired.fallbackEvidence.some((evidence) => evidence.excerpt === "newRaceNeedle")).toBe(false);
+
+    const retry = await runtime.query("newRaceNeedle");
+    expect(retry.results[0]?.path).toBe("src/race.ts");
+    expect(retry.fallbackEvidence[0]).toMatchObject({ path: "src/race.ts", excerpt: "newRaceNeedle" });
+    expect(telemetry.snapshot()).toMatchObject({
+      lexicalFallbackAttemptCount: 2,
+      lexicalFallbackUsedCount: 1,
+      lexicalFallbackCancelledCount: 1,
+      lexicalFallbackMatchesReturned: 1,
+    });
+    failures.recover(join(root, "src/race.ts"));
     await runtime.close();
   });
 

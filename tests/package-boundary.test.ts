@@ -89,6 +89,7 @@ it("has no Vault, S03, bench, report, or automatic-injection production boundary
     "docs/specs/0016-repository-graph-contract.md",
     "docs/specs/0019-lazy-repo-map-startup.md",
     "docs/specs/0020-cold-search-fallback.md",
+    "docs/specs/0021-stale-pending-search-fallback.md",
     "docs/specs/README.md",
     "README.md",
     "LICENSE",
