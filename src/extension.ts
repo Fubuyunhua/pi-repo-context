@@ -398,6 +398,40 @@ const defaultInitializationWaiter: RepoContextInitializationWaiter = (initializa
     );
   });
 
+const FALLBACK_SCAN_ABORTED = Symbol("fallback-scan-aborted");
+
+function abortFallbackScan(
+  operation: Promise<LexicalFallbackScanResult>,
+  signal: AbortSignal,
+): Promise<LexicalFallbackScanResult | typeof FALLBACK_SCAN_ABORTED> {
+  if (signal.aborted) {
+    void operation.catch(() => undefined);
+    return Promise.resolve(FALLBACK_SCAN_ABORTED);
+  }
+  return new Promise((resolveScan, rejectScan) => {
+    let retired = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      retired = true;
+      cleanup();
+      resolveScan(FALLBACK_SCAN_ABORTED);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (scan) => {
+        if (retired) return;
+        cleanup();
+        resolveScan(scan);
+      },
+      (error) => {
+        if (retired) return;
+        cleanup();
+        rejectScan(error);
+      },
+    );
+  });
+}
+
 export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoContextOptions = {}): void {
   const configLoader = options.loadConfig ?? loadConfig;
   const stateResolver = options.resolveProjectState ?? resolveProjectState;
@@ -588,17 +622,21 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
               exclude: target.config?.excludePatterns ?? [],
               signal: controller.signal,
             });
+            const boundedScan = abortFallbackScan(scanPromise, controller.signal);
             const race = readiness
               ? await Promise.race([
-                  scanPromise.then((result) => ({ kind: "scan" as const, scan: result })),
+                  boundedScan.then((result) => ({ kind: "scan" as const, scan: result })),
                   readiness.then(() => ({ kind: "initialized" as const })),
                 ])
-              : { kind: "scan" as const, scan: await scanPromise };
+              : { kind: "scan" as const, scan: await boundedScan };
             if (race.kind === "initialized") {
               controller.abort();
-              scan = await scanPromise.catch(() => emptyFallbackScan(true));
+              scan = emptyFallbackScan(true);
             } else {
-              scan = race.scan;
+              scan =
+                race.scan === FALLBACK_SCAN_ABORTED
+                  ? emptyFallbackScan(true)
+                  : (race.scan as LexicalFallbackScanResult);
             }
           } catch {
             controller.abort();
@@ -609,8 +647,20 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
           } finally {
             target.fallbackControllers.delete(controller);
           }
+          if (scan.cancelled || scan.timedOut) {
+            scan = {
+              ...scan,
+              results: [],
+              fallbackEvidence: [],
+              matchesReturned: 0,
+              timedOut: scan.cancelled ? false : scan.timedOut,
+            };
+          }
           if (!isCurrent(target)) {
-            target.telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false);
+            target.telemetry.recordLexicalFallback(
+              { ...scan, matchesReturned: 0, timedOut: false, cancelled: true },
+              false,
+            );
             throw new Error(PUBLIC_ERRORS.unavailable);
           }
           const lifecycleAfterScan = target.lifecycle as RepoContextLifecycle;

@@ -3,10 +3,24 @@ import { mkdir, mkdtemp, rename, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { expect, it } from "vitest";
-import { LEXICAL_FALLBACK_LIMITS, scanLexicalFallback } from "../src/repo-map/lexical-fallback.js";
+import { expect, it, vi } from "vitest";
+import {
+  LEXICAL_FALLBACK_LIMITS,
+  type LexicalFallbackOperationStage,
+  scanLexicalFallback,
+} from "../src/repo-map/lexical-fallback.js";
 
 const execFileAsync = promisify(execFile);
+
+function deferred<T = void>() {
+  let resolvePromise!: (value: T | PromiseLike<T>) => void;
+  let rejectPromise!: (error: unknown) => void;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
+}
 
 it("ranks linked dotted, underscored, and path terms with match-centered bounded excerpts", async () => {
   const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-"));
@@ -345,4 +359,132 @@ it("enforces source/file/result bounds and cancellation without leaking partial 
   expect(timedOut.timedOut).toBe(true);
   expect(timedOut.filesScanned).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxFiles);
   expect(timedOut.bytesScanned).toBeLessThanOrEqual(LEXICAL_FALLBACK_LIMITS.maxSourceBytes);
+});
+
+it("hard-bounds and drains every candidate file-operation stage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-hard-file-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await writeFile(join(root, "pending.ts"), "hardBoundPendingNeedle\n");
+  await execFileAsync("git", ["add", "pending.ts"], { cwd: root });
+  const stages: LexicalFallbackOperationStage[] = ["lstat", "realpath", "open", "stat", "read", "close"];
+
+  for (const stage of stages) {
+    const controller = new AbortController();
+    const entered = deferred();
+    const gate = deferred();
+    let gated = false;
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "hardBoundPendingNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      operationHook: async (current, path) => {
+        if (gated || current !== stage || !path.endsWith("pending.ts")) return;
+        gated = true;
+        entered.resolve();
+        await gate.promise;
+      },
+    });
+    await entered.promise;
+    controller.abort(new Error(`cancel-${stage}`));
+    await expect(scanning).resolves.toMatchObject({
+      results: [],
+      fallbackEvidence: [],
+      timedOut: false,
+      cancelled: true,
+    });
+    // Reject after logical retirement: the late hook settlement must remain
+    // observed and cannot become an unhandled rejection or mutate the result.
+    gate.reject(new Error(`late-${stage}`));
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+});
+
+it("hard-bounds before-open, before-read, and the enclosing batch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-hard-hooks-"));
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await writeFile(join(root, "pending.ts"), "hookBoundPendingNeedle\n");
+  await execFileAsync("git", ["add", "pending.ts"], { cwd: root });
+
+  for (const hook of ["beforeOpen", "beforeRead"] as const) {
+    const controller = new AbortController();
+    const entered = deferred();
+    const gate = deferred();
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "hookBoundPendingNeedle",
+      candidatePaths: ["pending.ts"],
+      signal: controller.signal,
+      [hook]: async () => {
+        entered.resolve();
+        await gate.promise;
+      },
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    gate.resolve();
+  }
+});
+
+it("hard-bounds non-Git directory open, iteration, and close", async () => {
+  const stages: LexicalFallbackOperationStage[] = ["directory-open", "directory-read", "directory-close"];
+  for (const stage of stages) {
+    const root = await mkdtemp(join(tmpdir(), `repo-context-lexical-hard-${stage}-`));
+    await writeFile(join(root, "pending.ts"), "directoryBoundPendingNeedle\n");
+    const controller = new AbortController();
+    const entered = deferred();
+    const gate = deferred();
+    let gated = false;
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "directoryBoundPendingNeedle",
+      signal: controller.signal,
+      operationHook: async (current) => {
+        if (gated || current !== stage) return;
+        gated = true;
+        entered.resolve();
+        await gate.promise;
+      },
+    });
+    await entered.promise;
+    controller.abort();
+    await expect(scanning).resolves.toMatchObject({ cancelled: true, results: [], fallbackEvidence: [] });
+    gate.resolve();
+  }
+});
+
+it("returns at the logical deadline while a read hook remains stalled", async () => {
+  vi.useFakeTimers();
+  try {
+    const root = await mkdtemp(join(tmpdir(), "repo-context-lexical-hard-deadline-"));
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await writeFile(join(root, "pending.ts"), "deadlineBoundPendingNeedle\n");
+    await execFileAsync("git", ["add", "pending.ts"], { cwd: root });
+    const entered = deferred();
+    const gate = deferred();
+    const scanning = scanLexicalFallback({
+      projectRoot: root,
+      query: "deadlineBoundPendingNeedle",
+      candidatePaths: ["pending.ts"],
+      limits: { deadlineMs: 25 },
+      beforeRead: async () => {
+        entered.resolve();
+        await gate.promise;
+      },
+    });
+    await entered.promise;
+    await vi.advanceTimersByTimeAsync(25);
+    await expect(scanning).resolves.toMatchObject({
+      results: [],
+      fallbackEvidence: [],
+      capped: false,
+      timedOut: true,
+      cancelled: false,
+    });
+    gate.resolve();
+  } finally {
+    vi.useRealTimers();
+  }
 });

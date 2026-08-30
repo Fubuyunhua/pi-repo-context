@@ -135,8 +135,8 @@ it("exposes repository-only bounded telemetry", () => {
     indexedResultReturnCount: 1,
     lexicalFallbackAttemptCount: 1,
     warmingEmptyReturnCount: 1,
-    lexicalFallbackUsedCount: 1,
-    lexicalFallbackNoMatchCount: 1,
+    lexicalFallbackUsedCount: 0,
+    lexicalFallbackNoMatchCount: 0,
     lexicalFallbackCappedCount: 1,
     lexicalFallbackTimeoutCount: 1,
     lexicalFallbackCancelledCount: 1,
@@ -159,4 +159,27 @@ it("exposes repository-only bounded telemetry", () => {
   });
   expect(Object.keys(snapshot).some((key) => /capsule|archive|metadata|reduction/iu.test(key))).toBe(false);
   expect(Object.is(snapshot, telemetry.snapshot())).toBe(false);
+});
+
+it("records one truthful terminal lexical-fallback outcome per attempt", () => {
+  const telemetry = new RepoContextTelemetry();
+  const base = { durationMs: 1, filesScanned: 1, bytesScanned: 1, matchesReturned: 1 };
+  telemetry.recordLexicalFallback({ ...base, capped: false, timedOut: false, cancelled: false }, true, 1);
+  telemetry.recordLexicalFallback(
+    { ...base, matchesReturned: 0, capped: false, timedOut: false, cancelled: false },
+    false,
+    0,
+  );
+  telemetry.recordLexicalFallback({ ...base, capped: true, timedOut: false, cancelled: false }, true, 1);
+  telemetry.recordLexicalFallback({ ...base, capped: true, timedOut: true, cancelled: false }, true, 1);
+  telemetry.recordLexicalFallback({ ...base, capped: true, timedOut: true, cancelled: true }, true, 1);
+
+  expect(telemetry.snapshot()).toMatchObject({
+    lexicalFallbackUsedCount: 1,
+    lexicalFallbackNoMatchCount: 1,
+    lexicalFallbackCappedCount: 1,
+    lexicalFallbackTimeoutCount: 1,
+    lexicalFallbackCancelledCount: 1,
+    lexicalFallbackMatchesReturned: 2,
+  });
 });

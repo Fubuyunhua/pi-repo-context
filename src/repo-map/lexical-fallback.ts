@@ -36,6 +36,19 @@ export const LEXICAL_FALLBACK_LIMITS: Readonly<LexicalFallbackLimits> = Object.f
   maxExcerptBytes: 512,
 });
 
+export type LexicalFallbackOperationStage =
+  | "directory-open"
+  | "directory-read"
+  | "directory-close"
+  | "lstat"
+  | "realpath"
+  | "before-open"
+  | "open"
+  | "stat"
+  | "before-read"
+  | "read"
+  | "close";
+
 export interface LexicalFallbackOptions {
   projectRoot: string;
   query: string;
@@ -50,6 +63,10 @@ export interface LexicalFallbackOptions {
   candidatePaths?: readonly string[];
   /** Test-only race hook invoked after identity capture and before open. */
   beforeOpen?: (path: string) => Promise<void>;
+  /** Test-only race hook invoked after handle identity validation and before read. */
+  beforeRead?: (path: string) => Promise<void>;
+  /** Test-only operation hook used to gate hard-bound cancellation stages. */
+  operationHook?: (stage: LexicalFallbackOperationStage, path: string) => Promise<void>;
 }
 
 export interface LexicalFallbackScanResult {
@@ -95,6 +112,95 @@ interface CandidateMatch {
   exact: boolean;
   evidenceKind: "source" | "warming";
   excerpt: string;
+}
+
+const ABORTED = Symbol("lexical-fallback-aborted");
+type Aborted = typeof ABORTED;
+type OperationHook = LexicalFallbackOptions["operationHook"];
+
+/** Race logical completion against cancellation while observing every late settlement. */
+function abortRace<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+  onLateValue?: (value: T) => void | Promise<void>,
+): Promise<T | Aborted> {
+  if (signal.aborted) {
+    void operation.then(onLateValue, () => undefined).catch(() => undefined);
+    return Promise.resolve(ABORTED);
+  }
+  return new Promise((resolveResult, rejectResult) => {
+    let retired = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      retired = true;
+      cleanup();
+      resolveResult(ABORTED);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        if (retired) {
+          void Promise.resolve()
+            .then(() => onLateValue?.(value))
+            .catch(() => undefined);
+          return;
+        }
+        cleanup();
+        resolveResult(value);
+      },
+      (error) => {
+        if (retired) return;
+        cleanup();
+        rejectResult(error);
+      },
+    );
+  });
+}
+
+async function operationGate(
+  hook: OperationHook,
+  stage: LexicalFallbackOperationStage,
+  path: string,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (!hook) return !signal.aborted;
+  return (
+    (await abortRace(
+      Promise.resolve().then(() => hook(stage, path)),
+      signal,
+    )) !== ABORTED
+  );
+}
+
+/** Start the real operation before a test gate, then hard-race its result. */
+async function stagedOperation<T>(
+  hook: OperationHook,
+  stage: LexicalFallbackOperationStage,
+  path: string,
+  signal: AbortSignal,
+  start: () => Promise<T>,
+  onLateValue?: (value: T) => void | Promise<void>,
+  startWhenAborted = false,
+): Promise<T | Aborted> {
+  if (signal.aborted && !startWhenAborted) return ABORTED;
+  const operation = Promise.resolve().then(start);
+  // Observe rejection immediately even when a test gate retains the result.
+  void operation.catch(() => undefined);
+  try {
+    if (!(await operationGate(hook, stage, path, signal))) {
+      void abortRace(operation, signal, onLateValue);
+      return ABORTED;
+    }
+  } catch (error) {
+    void operation
+      .then(
+        (value) => onLateValue?.(value),
+        () => undefined,
+      )
+      .catch(() => undefined);
+    throw error;
+  }
+  return abortRace(operation, signal, onLateValue);
 }
 
 function slash(path: string): string {
@@ -353,11 +459,16 @@ async function fallbackEnumeration(
   limits: Readonly<LexicalFallbackLimits>,
   excluded: (path: string) => boolean,
   beforeOpen?: (path: string) => Promise<void>,
+  beforeRead?: (path: string) => Promise<void>,
+  operationHook?: OperationHook,
 ): Promise<EnumerationResult> {
   let ignorePatterns: string[] = [];
   const ignorePath = join(projectRoot, ".gitignore");
   try {
-    const ignoreInfo = await lstat(ignorePath);
+    const ignoreInfo = await stagedOperation(operationHook, "lstat", ignorePath, signal, () => lstat(ignorePath));
+    if (ignoreInfo === ABORTED) {
+      return { paths: [], observedPaths: 0, bytes: 0, capped: false, cancelled: true, git: false };
+    }
     if (!ignoreInfo.isFile() || ignoreInfo.isSymbolicLink()) {
       return { paths: [], observedPaths: 0, bytes: 0, capped: true, cancelled: signal.aborted, git: false };
     }
@@ -368,6 +479,8 @@ async function fallbackEnumeration(
       limits.maxIgnoreBytes,
       signal,
       beforeOpen,
+      beforeRead,
+      operationHook,
     );
     if (ignore.text === undefined || ignore.capped) {
       return { paths: [], observedPaths: 0, bytes: 0, capped: true, cancelled: signal.aborted, git: false };
@@ -391,10 +504,33 @@ async function fallbackEnumeration(
     const directory = directories.pop();
     if (!directory) break;
     const childDirectories: string[] = [];
+    let entries: Awaited<ReturnType<typeof opendir>> | undefined;
+    let deferredClose = false;
     try {
-      const entries = await opendir(directory);
-      for await (const entry of entries) {
-        if (signal.aborted) break;
+      const opened = await stagedOperation(
+        operationHook,
+        "directory-open",
+        directory,
+        signal,
+        () => opendir(directory),
+        (lateEntries) => lateEntries.close(),
+      );
+      if (opened === ABORTED) break;
+      entries = opened;
+      while (!signal.aborted) {
+        const entry = await stagedOperation(
+          operationHook,
+          "directory-read",
+          directory,
+          signal,
+          () => (entries as Awaited<ReturnType<typeof opendir>>).read(),
+          () => (entries as Awaited<ReturnType<typeof opendir>>).close(),
+        );
+        if (entry === ABORTED) {
+          deferredClose = true;
+          break;
+        }
+        if (entry === null) break;
         const absolute = join(directory, entry.name);
         const path = slash(relative(projectRoot, absolute));
         const pathBytes = Buffer.byteLength(path, "utf8") + 1;
@@ -409,7 +545,19 @@ async function fallbackEnumeration(
         else if (entry.isFile()) paths.push(path);
       }
     } catch {
-      continue;
+      // An unreadable directory is skipped. Cancellation is represented below.
+    } finally {
+      if (entries && !deferredClose) {
+        await stagedOperation(
+          operationHook,
+          "directory-close",
+          directory,
+          signal,
+          () => (entries as Awaited<ReturnType<typeof opendir>>).close(),
+          undefined,
+          true,
+        );
+      }
     }
     childDirectories.sort(stablePathCompare);
     for (let index = childDirectories.length - 1; index >= 0; index -= 1)
@@ -425,6 +573,8 @@ async function candidateEnumeration(
   candidatePaths: readonly string[],
   excluded: (path: string) => boolean,
   beforeOpen?: (path: string) => Promise<void>,
+  beforeRead?: (path: string) => Promise<void>,
+  operationHook?: OperationHook,
 ): Promise<EnumerationResult> {
   const normalized: string[] = [];
   const conclusiveExcludedPaths: string[] = [];
@@ -491,7 +641,10 @@ async function candidateEnumeration(
   let ignorePatterns: string[] = [];
   const ignorePath = join(projectRoot, ".gitignore");
   try {
-    const ignoreInfo = await lstat(ignorePath);
+    const ignoreInfo = await stagedOperation(operationHook, "lstat", ignorePath, signal, () => lstat(ignorePath));
+    if (ignoreInfo === ABORTED) {
+      return { paths: [], observedPaths, bytes, capped: false, cancelled: true, git: false };
+    }
     if (!ignoreInfo.isFile() || ignoreInfo.isSymbolicLink()) {
       return { paths: [], observedPaths, bytes, capped: true, cancelled: signal.aborted, git: false };
     }
@@ -502,6 +655,8 @@ async function candidateEnumeration(
       limits.maxIgnoreBytes,
       signal,
       beforeOpen,
+      beforeRead,
+      operationHook,
     );
     if (ignore.text === undefined || ignore.capped) {
       return { paths: [], observedPaths, bytes, capped: true, cancelled: signal.aborted, git: false };
@@ -535,6 +690,8 @@ async function enumerate(
   limits: Readonly<LexicalFallbackLimits>,
   exclude: string[],
   beforeOpen?: (path: string) => Promise<void>,
+  beforeRead?: (path: string) => Promise<void>,
+  operationHook?: OperationHook,
   candidatePaths?: readonly string[],
 ): Promise<EnumerationResult> {
   if (exclude.length > limits.maxExcludePatterns) {
@@ -549,11 +706,28 @@ async function enumerate(
   }
   const excluded = repoMapPathExclusionMatcher(exclude);
   if (candidatePaths !== undefined) {
-    return candidateEnumeration(projectRoot, signal, limits, candidatePaths, excluded, beforeOpen);
+    return candidateEnumeration(
+      projectRoot,
+      signal,
+      limits,
+      candidatePaths,
+      excluded,
+      beforeOpen,
+      beforeRead,
+      operationHook,
+    );
   }
   const git = await spawnGitEnumeration(projectRoot, signal, limits, excluded);
   if (git.git || git.cancelled) return { ...git, paths: [...new Set(git.paths)].sort(stablePathCompare) };
-  const fallback = await fallbackEnumeration(projectRoot, signal, limits, excluded, beforeOpen);
+  const fallback = await fallbackEnumeration(
+    projectRoot,
+    signal,
+    limits,
+    excluded,
+    beforeOpen,
+    beforeRead,
+    operationHook,
+  );
   return { ...fallback, paths: [...new Set(fallback.paths)].sort(stablePathCompare) };
 }
 
@@ -564,22 +738,55 @@ async function readCandidate(
   maxFileBytes: number,
   signal: AbortSignal,
   beforeOpen?: (path: string) => Promise<void>,
+  beforeRead?: (path: string) => Promise<void>,
+  operationHook?: OperationHook,
 ): Promise<CandidateRead> {
   if (budget <= 0 || signal.aborted) return { bytes: 0, capped: budget <= 0, outcome: "unresolved" };
   const absolute = resolve(projectRoot, path);
   const relativePath = relative(projectRoot, absolute);
   if (!safeRelativePath(slash(relativePath))) return { bytes: 0, capped: false, outcome: "conclusive" };
   try {
-    const info = await lstat(absolute, { bigint: true });
+    const info = await stagedOperation(operationHook, "lstat", absolute, signal, () =>
+      lstat(absolute, { bigint: true }),
+    );
+    if (info === ABORTED) return { bytes: 0, capped: false, outcome: "unresolved" };
     if (!info.isFile()) return { bytes: 0, capped: false, outcome: "conclusive" };
-    if (signal.aborted) return { bytes: 0, capped: false, outcome: "unresolved" };
-    const canonical = await realpath(absolute);
-    if (canonical !== absolute || !safeRelativePath(slash(relative(projectRoot, canonical))))
+    const canonical = await stagedOperation(operationHook, "realpath", absolute, signal, () => realpath(absolute));
+    if (canonical === ABORTED || canonical !== absolute || !safeRelativePath(slash(relative(projectRoot, canonical)))) {
       return { bytes: 0, capped: false, outcome: "unresolved" };
-    await beforeOpen?.(absolute);
-    const handle = await open(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    }
+    if (beforeOpen) {
+      if (!(await operationGate(operationHook, "before-open", absolute, signal))) {
+        return { bytes: 0, capped: false, outcome: "unresolved" };
+      }
+      if ((await abortRace(beforeOpen(absolute), signal)) === ABORTED) {
+        return { bytes: 0, capped: false, outcome: "unresolved" };
+      }
+    }
+    const opened = await stagedOperation(
+      operationHook,
+      "open",
+      absolute,
+      signal,
+      () => open(absolute, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)),
+      (lateHandle) => lateHandle.close(),
+    );
+    if (opened === ABORTED) return { bytes: 0, capped: false, outcome: "unresolved" };
+    const handle = opened;
+    let deferredClose = false;
     try {
-      const current = await handle.stat({ bigint: true });
+      const current = await stagedOperation(
+        operationHook,
+        "stat",
+        absolute,
+        signal,
+        () => handle.stat({ bigint: true }),
+        () => handle.close(),
+      );
+      if (current === ABORTED) {
+        deferredClose = true;
+        return { bytes: 0, capped: false, outcome: "unresolved" };
+      }
       // Opening by pathname cannot make every parent traversal race-free on
       // every supported platform. Identity-check the opened handle before any
       // content is read so a swapped parent/final entry cannot expose a
@@ -587,16 +794,42 @@ async function readCandidate(
       if (!current.isFile() || current.dev !== info.dev || current.ino !== info.ino) {
         return { bytes: 0, capped: false, outcome: "unresolved" };
       }
+      if (beforeRead) {
+        if (!(await operationGate(operationHook, "before-read", absolute, signal))) {
+          return { bytes: 0, capped: false, outcome: "unresolved" };
+        }
+        if ((await abortRace(beforeRead(absolute), signal)) === ABORTED) {
+          return { bytes: 0, capped: false, outcome: "unresolved" };
+        }
+      }
       const length = Math.min(budget, maxFileBytes);
       const content = Buffer.alloc(length);
-      const { bytesRead } = await handle.read(content, 0, length, 0);
-      const bounded = content.subarray(0, bytesRead);
-      if (bounded.subarray(0, Math.min(8_192, bounded.length)).includes(0)) {
-        return { bytes: bytesRead, capped: false, outcome: "conclusive" };
+      const read = await stagedOperation(
+        operationHook,
+        "read",
+        absolute,
+        signal,
+        () => handle.read(content, 0, length, 0),
+        () => handle.close(),
+      );
+      if (read === ABORTED) {
+        deferredClose = true;
+        return { bytes: 0, capped: false, outcome: "unresolved" };
       }
-      return { text: bounded.toString("utf8"), bytes: bytesRead, capped: current.size > bytesRead, outcome: "text" };
+      const bounded = content.subarray(0, read.bytesRead);
+      if (bounded.subarray(0, Math.min(8_192, bounded.length)).includes(0)) {
+        return { bytes: read.bytesRead, capped: false, outcome: "conclusive" };
+      }
+      return {
+        text: bounded.toString("utf8"),
+        bytes: read.bytesRead,
+        capped: current.size > read.bytesRead,
+        outcome: "text",
+      };
     } finally {
-      await handle.close();
+      if (!deferredClose) {
+        await stagedOperation(operationHook, "close", absolute, signal, () => handle.close(), undefined, true);
+      }
     }
   } catch (error) {
     return {
@@ -637,14 +870,18 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
   const unresolvedPaths = new Set<string>();
   const processedPaths = new Set<string>();
   try {
-    enumeration = await enumerate(
+    const enumerationOperation = enumerate(
       options.projectRoot,
       signal,
       limits,
       options.exclude ?? [],
       options.beforeOpen,
+      options.beforeRead,
+      options.operationHook,
       options.candidatePaths,
     );
+    const completedEnumeration = await abortRace(enumerationOperation, signal);
+    if (completedEnumeration !== ABORTED) enumeration = completedEnumeration;
     capped = enumeration.capped;
     for (const path of enumeration.conclusiveExcludedPaths ?? []) conclusivePaths.add(path);
     for (const path of enumeration.unresolvedPaths ?? []) unresolvedPaths.add(path);
@@ -663,7 +900,7 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
       const allocations = batch.map((_, index) =>
         Math.min(limits.maxFileBytes, Math.floor((remaining + index) / batch.length)),
       );
-      const rows = await Promise.all(
+      const batchOperation = Promise.all(
         batch.map((path, index) =>
           readCandidate(
             options.projectRoot,
@@ -672,9 +909,14 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
             limits.maxFileBytes,
             signal,
             options.beforeOpen,
+            options.beforeRead,
+            options.operationHook,
           ),
         ),
       );
+      const completedBatch = await abortRace(batchOperation, signal);
+      if (completedBatch === ABORTED) break;
+      const rows = completedBatch;
       for (let index = 0; index < batch.length; index += 1) {
         const row = rows[index];
         const path = batch[index];
@@ -701,13 +943,18 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
   for (const path of enumeration.paths) {
     if (!processedPaths.has(path)) unresolvedPaths.add(path);
   }
+  const externallyCancelled = Boolean(options.signal?.aborted);
+  const finalTimedOut = timedOut && !externallyCancelled;
+  const discardEvidence = externallyCancelled || finalTimedOut || signal.aborted;
   const requestedLimit = Math.min(Math.max(1, options.limit ?? 10), limits.maxResults);
-  const ranked = matches
-    .sort(
-      (left, right) =>
-        right.score - left.score || right.coverage - left.coverage || stablePathCompare(left.path, right.path),
-    )
-    .slice(0, requestedLimit);
+  const ranked = discardEvidence
+    ? []
+    : matches
+        .sort(
+          (left, right) =>
+            right.score - left.score || right.coverage - left.coverage || stablePathCompare(left.path, right.path),
+        )
+        .slice(0, requestedLimit);
   const results: RepoMapQueryResult[] = ranked.map((match) => ({
     path: match.path,
     score: match.score,
@@ -733,8 +980,10 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
     ...(options.candidatePaths === undefined
       ? {}
       : {
-          conclusivePaths: [...conclusivePaths].sort(stablePathCompare),
-          unresolvedPaths: [...unresolvedPaths].sort(stablePathCompare),
+          conclusivePaths: discardEvidence ? [] : [...conclusivePaths].sort(stablePathCompare),
+          unresolvedPaths: discardEvidence
+            ? [...new Set(options.candidatePaths)].sort(stablePathCompare)
+            : [...unresolvedPaths].sort(stablePathCompare),
         }),
     durationMs: Math.max(0, Date.now() - started),
     filesScanned,
@@ -742,8 +991,8 @@ export async function scanLexicalFallback(options: LexicalFallbackOptions): Prom
     enumeratedPaths: enumeration.observedPaths,
     enumerationBytes: enumeration.bytes,
     matchesReturned: ranked.length,
-    capped,
-    timedOut,
-    cancelled: Boolean(options.signal?.aborted) || (enumeration.cancelled && !timedOut),
+    capped: discardEvidence ? false : capped,
+    timedOut: finalTimedOut,
+    cancelled: externallyCancelled || (enumeration.cancelled && !finalTimedOut),
   };
 }

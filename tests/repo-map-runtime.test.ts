@@ -2141,6 +2141,106 @@ describe("incremental repository map runtime", () => {
     await runtime.close();
   });
 
+  it("discards malicious timed-out and cancelled pending scanner evidence", async () => {
+    for (const outcome of ["timedOut", "cancelled"] as const) {
+      const { root, stateRoot } = await fixture(
+        { "src/malicious.ts": "export const staleMaliciousValue = true;" },
+        false,
+      );
+      const failures = controlledReadFailures();
+      const telemetry = new Telemetry();
+      const runtime = new RepoMapRuntime({
+        projectRoot: root,
+        stateRoot,
+        watch: false,
+        scheduler: new ManualScheduler(),
+        indexFileSystem: failures.fileSystem,
+        telemetry,
+        pendingScanner: async () => ({
+          results: [
+            {
+              path: "private/late.ts",
+              score: 999,
+              kind: "lexical",
+              matchedSymbols: [],
+              matchReasons: ["pending lexical fallback: exact query"],
+              symbols: [],
+              dependencies: [],
+            },
+          ],
+          fallbackEvidence: [{ kind: "source", path: "private/late.ts", excerpt: "privateLateEvidence" }],
+          conclusivePaths: ["src/malicious.ts"],
+          unresolvedPaths: [],
+          durationMs: 1,
+          filesScanned: 1,
+          bytesScanned: 16,
+          enumeratedPaths: 1,
+          enumerationBytes: 16,
+          matchesReturned: 1,
+          capped: true,
+          timedOut: outcome === "timedOut",
+          cancelled: outcome === "cancelled",
+        }),
+      });
+      await runtime.start();
+      await writeFile(join(root, "src/malicious.ts"), "export const currentMaliciousValue = true;");
+      failures.fail(join(root, "src/malicious.ts"));
+      runtime.notify("change", "src/malicious.ts");
+
+      const result = await runtime.query("currentMaliciousValue");
+      expect(result.results.some((row) => row.path === "private/late.ts")).toBe(false);
+      expect(result.fallbackEvidence.some((row) => row.excerpt === "privateLateEvidence")).toBe(false);
+      expect(telemetry.snapshot()).toMatchObject({
+        lexicalFallbackUsedCount: 0,
+        lexicalFallbackNoMatchCount: 0,
+        lexicalFallbackCappedCount: 0,
+        lexicalFallbackTimeoutCount: outcome === "timedOut" ? 1 : 0,
+        lexicalFallbackCancelledCount: outcome === "cancelled" ? 1 : 0,
+        lexicalFallbackMatchesReturned: 0,
+      });
+      failures.recover(join(root, "src/malicious.ts"));
+      await runtime.close();
+    }
+  });
+
+  it("runtime close promptly retires and drains an injected pending scanner", async () => {
+    const { root, stateRoot } = await fixture({ "src/close.ts": "export const staleCloseValue = true;" }, false);
+    const failures = controlledReadFailures();
+    const scanStarted = deferred();
+    const releaseScan = deferred();
+    const telemetry = new Telemetry();
+    const runtime = new RepoMapRuntime({
+      projectRoot: root,
+      stateRoot,
+      watch: false,
+      scheduler: new ManualScheduler(),
+      indexFileSystem: failures.fileSystem,
+      telemetry,
+      pendingScanner: async () => {
+        scanStarted.resolve();
+        await releaseScan.promise;
+        throw new Error("late scanner rejection");
+      },
+    });
+    await runtime.start();
+    await writeFile(join(root, "src/close.ts"), "export const currentCloseValue = true;");
+    failures.fail(join(root, "src/close.ts"));
+    runtime.notify("change", "src/close.ts");
+
+    const querying = runtime.query("currentCloseValue");
+    await scanStarted.promise;
+    const closing = runtime.close();
+    const result = await querying;
+    expect(result.fallbackEvidence.some((row) => row.excerpt.includes("currentCloseValue"))).toBe(false);
+    expect(telemetry.snapshot()).toMatchObject({
+      lexicalFallbackCancelledCount: 1,
+      lexicalFallbackMatchesReturned: 0,
+    });
+    releaseScan.resolve();
+    await closing;
+    await Promise.resolve();
+  });
+
   it("telemetry: disabled and throwing recorders leave model-visible query output identical", async () => {
     const without = await fixture({ "src/model.ts": "export const modelVisibleValue = true;" }, false);
     const withThrowing = await fixture({ "src/model.ts": "export const modelVisibleValue = true;" }, false);

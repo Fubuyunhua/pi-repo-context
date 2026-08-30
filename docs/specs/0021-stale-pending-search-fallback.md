@@ -16,7 +16,7 @@ Every supplied candidate consumes the path-count and UTF-8 path-byte envelope be
 
 Git admission uses one bounded `git ls-files --cached --others --exclude-standard` operation and intersects its output with the candidates. This preserves tracked files that are now ignored and rejects ignored untracked files. Only an explicit `not a git repository` result under the C locale permits the hardened root-`.gitignore` non-Git path; every ambiguous Git failure fails closed.
 
-Candidate reads reuse Spec 0020's identity checks, no-follow/canonical containment, binary detection, file/source/count/concurrency/deadline/result/excerpt bounds, and cancellation. Deadlines remain cooperative for an active filesystem operation; all count and byte limits are hard.
+Candidate reads reuse Spec 0020's identity checks, no-follow/canonical containment, binary detection, file/source/count/concurrency/deadline/result/excerpt bounds, and cancellation. The logical deadline and cancellation return are hard: directory enumeration, hooks, file operations, and batches are raced against retirement; late settlements are observed and late-opened handles are closed without publishing partial evidence. Count and byte limits remain hard. Runtime close, session replacement, notification, and snapshot activation abort in-flight pending scans, and timed-out or cancelled scanner output is never merged.
 
 ## Ranking and evidence
 
@@ -24,4 +24,4 @@ Case-insensitive full-query literals in pending source or path rank before index
 
 ## Telemetry
 
-The aggregate lexical fallback counters cover both warming scans and stale-pending scans: attempts, used/no-match, capped, timeout, cancelled, duration, files, bytes, and returned pending matches. Queries, paths, excerpts, and source content are never retained.
+The aggregate lexical fallback counters cover both warming scans and stale-pending scans: attempts, used/no-match, capped, timeout, cancelled, duration, files, bytes, and returned pending matches. Each attempt records exactly one terminal outcome in priority order: cancelled, timeout, capped, used, then no-match. Timed-out or cancelled scans contribute zero returned matches. Queries, paths, excerpts, and source content are never retained.

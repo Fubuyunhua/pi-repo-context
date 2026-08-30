@@ -133,12 +133,16 @@ export class RepoContextTelemetry {
     this.#values.lexicalFallbackDurationMsTotal += finiteNonnegative(result.durationMs);
     this.#values.lexicalFallbackFilesScanned += finiteNonnegative(result.filesScanned);
     this.#values.lexicalFallbackBytesScanned += finiteNonnegative(result.bytesScanned);
-    this.#values.lexicalFallbackMatchesReturned += finiteNonnegative(returnedMatches);
-    if (used) this.#values.lexicalFallbackUsedCount += 1;
-    else if (!result.cancelled && result.matchesReturned === 0) this.#values.lexicalFallbackNoMatchCount += 1;
-    if (result.capped) this.#values.lexicalFallbackCappedCount += 1;
-    if (result.timedOut) this.#values.lexicalFallbackTimeoutCount += 1;
+    const safeReturnedMatches = result.cancelled || result.timedOut ? 0 : returnedMatches;
+    this.#values.lexicalFallbackMatchesReturned += finiteNonnegative(safeReturnedMatches);
+    // Terminal outcome counters are mutually exclusive and ordered by the
+    // strongest retirement reason. A timed-out/cancelled scan never counts as
+    // used, no-match, or capped even if an injected scanner reports otherwise.
     if (result.cancelled) this.#values.lexicalFallbackCancelledCount += 1;
+    else if (result.timedOut) this.#values.lexicalFallbackTimeoutCount += 1;
+    else if (result.capped) this.#values.lexicalFallbackCappedCount += 1;
+    else if (used) this.#values.lexicalFallbackUsedCount += 1;
+    else this.#values.lexicalFallbackNoMatchCount += 1;
   }
   recordHydration(durationMs: number): void {
     this.#values.hydrationCount += 1;

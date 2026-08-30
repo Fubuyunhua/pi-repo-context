@@ -149,6 +149,40 @@ const defaultScheduler: RepoMapScheduler = {
   },
 };
 
+const SCAN_ABORTED = Symbol("pending-scan-aborted");
+
+function abortPendingScan(
+  operation: Promise<LexicalFallbackScanResult>,
+  signal: AbortSignal,
+): Promise<LexicalFallbackScanResult | typeof SCAN_ABORTED> {
+  if (signal.aborted) {
+    void operation.catch(() => undefined);
+    return Promise.resolve(SCAN_ABORTED);
+  }
+  return new Promise((resolveScan, rejectScan) => {
+    let retired = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      retired = true;
+      cleanup();
+      resolveScan(SCAN_ABORTED);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (result) => {
+        if (retired) return;
+        cleanup();
+        resolveScan(result);
+      },
+      (error) => {
+        if (retired) return;
+        cleanup();
+        rejectScan(error);
+      },
+    );
+  });
+}
+
 function slash(path: string): string {
   return path.split(sep).join("/");
 }
@@ -567,6 +601,7 @@ export class RepoMapRuntime {
   #mutationEpoch = 0;
   #started = false;
   #flushChain: Promise<void> = Promise.resolve();
+  #pendingFallbackControllers = new Set<AbortController>();
   #baseBuildFailed = false;
   #checkpointPublicationFailed = false;
   #stateBoundary?: RepoStateBoundary;
@@ -625,6 +660,10 @@ export class RepoMapRuntime {
     await this.flush();
   }
 
+  #retirePendingFallbacks(): void {
+    for (const controller of this.#pendingFallbackControllers) controller.abort();
+  }
+
   notify(event: RepoMapChangeEvent, changedPath: string): void {
     try {
       this.#assertStateBoundarySync();
@@ -638,6 +677,7 @@ export class RepoMapRuntime {
     this.#freshness = "stale";
     this.#watcherUpdates.push({ event, path });
     this.#mutationEpoch += 1;
+    this.#retirePendingFallbacks();
     // Derive watcher-visible state from the last immutable checkpoint. Mutable
     // rebuild fields may currently be between awaited reconciliation steps.
     if (!this.#checkpoints.publishWatcherPath(path)) {
@@ -792,20 +832,44 @@ export class RepoMapRuntime {
       }
 
       recordTelemetry(this.#telemetry, (telemetry) => telemetry.recordLexicalFallbackAttempt());
+      const controller = new AbortController();
+      this.#pendingFallbackControllers.add(controller);
+      const scanSignal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
       let scan: LexicalFallbackScanResult;
       try {
-        scan = await this.#pendingScanner({
+        const scanOperation = this.#pendingScanner({
           projectRoot: this.#projectRoot,
           query,
           limit: 20,
           exclude: this.#options.exclude ?? [],
           candidatePaths: captured.pendingFiles,
-          ...(options.signal ? { signal: options.signal } : {}),
+          signal: scanSignal,
         });
+        const completed = await abortPendingScan(scanOperation, scanSignal);
+        scan =
+          completed === SCAN_ABORTED
+            ? {
+                results: [],
+                fallbackEvidence: [],
+                conclusivePaths: [],
+                unresolvedPaths: [...captured.pendingFiles],
+                durationMs: 0,
+                filesScanned: 0,
+                bytesScanned: 0,
+                enumeratedPaths: 0,
+                enumerationBytes: 0,
+                matchesReturned: 0,
+                capped: false,
+                timedOut: false,
+                cancelled: true,
+              }
+            : completed;
       } catch {
         scan = {
           results: [],
           fallbackEvidence: [],
+          conclusivePaths: [],
+          unresolvedPaths: [...captured.pendingFiles],
           durationMs: 0,
           filesScanned: 0,
           bytesScanned: 0,
@@ -816,24 +880,39 @@ export class RepoMapRuntime {
           timedOut: false,
           cancelled: Boolean(options.signal?.aborted),
         };
+      } finally {
+        this.#pendingFallbackControllers.delete(controller);
       }
       if (options.signal?.aborted) {
         recordTelemetry(this.#telemetry, (telemetry) =>
-          telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false),
+          telemetry.recordLexicalFallback(
+            {
+              ...scan,
+              matchesReturned: 0,
+              timedOut: false,
+              cancelled: true,
+            },
+            false,
+          ),
         );
         throw options.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
       }
-      // A notification, activation, close, or concurrent flush retires the
-      // captured pending set. Never pair its transient source bytes with a
-      // different indexed capture.
-      if (
+      const retired =
         !this.#started ||
         scanEpoch !== this.#mutationEpoch ||
         scanContentVersion !== this.#effectiveContentVersion ||
-        scanGeneration !== this.#generation
-      ) {
+        scanGeneration !== this.#generation;
+      if (retired || scan.cancelled || scan.timedOut) {
         recordTelemetry(this.#telemetry, (telemetry) =>
-          telemetry.recordLexicalFallback({ ...scan, cancelled: true }, false),
+          telemetry.recordLexicalFallback(
+            {
+              ...scan,
+              matchesReturned: 0,
+              timedOut: retired || scan.cancelled ? false : scan.timedOut,
+              cancelled: retired || scan.cancelled,
+            },
+            false,
+          ),
         );
         return captured;
       }
@@ -1033,6 +1112,7 @@ export class RepoMapRuntime {
 
   async close(): Promise<void> {
     this.#started = false;
+    this.#retirePendingFallbacks();
     if (this.#scheduled !== undefined) this.#scheduler.cancel(this.#scheduled);
     this.#scheduled = undefined;
     await this.#watcher?.close();
@@ -1129,13 +1209,19 @@ export class RepoMapRuntime {
   #mutateEffective(mutation: () => void): void {
     const before = searchableContent(this.#effective);
     mutation();
-    if (searchableContent(this.#effective) !== before) this.#effectiveContentVersion += 1;
+    if (searchableContent(this.#effective) !== before) {
+      this.#effectiveContentVersion += 1;
+      this.#retirePendingFallbacks();
+    }
   }
 
   #replaceEffective(snapshot: RepoMapSnapshot): void {
     const before = searchableContent(this.#effective);
     this.#effective = snapshot;
-    if (searchableContent(snapshot) !== before) this.#effectiveContentVersion += 1;
+    if (searchableContent(snapshot) !== before) {
+      this.#effectiveContentVersion += 1;
+      this.#retirePendingFallbacks();
+    }
   }
 
   async #fileFingerprint(path: string): Promise<FileFingerprint | undefined> {

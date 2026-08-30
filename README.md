@@ -45,8 +45,8 @@ separately from repository freshness and never inspects a controller before star
 
 Hard search failures (before initialization, disabled/unavailable runtime, settled startup failure, or rejected query) are
 Pi Tool errors. Fulfilled warming/stale/degraded searches remain successful Tool results and carry sanitized degradation
-metadata. The warming and stale-pending scanners follow Git/non-Git admission and exclusions, do not follow symlinks, and bound
-enumeration, reads, concurrency, results, excerpts, duration, and the final UTF-8 payload. Stale-pending evidence is used
+metadata. The warming and stale-pending scanners follow Git/non-Git admission and exclusions, do not follow symlinks, and hard-bound
+the logical return across enumeration, hooks, reads, batches, cancellation, results, excerpts, duration, and the final UTF-8 payload. Late operations are drained, late-opened handles are closed, and timed-out/cancelled scans publish no evidence. Stale-pending evidence is used
 only by live search; coherent `queryCurrent()` snapshots never read pending source, and direct reads do not advance the
 reported generation or workspace revision. A compatible hydrated clean
 generation can take an unchanged warm path after Git HEAD/status and watcher safety checks; legacy generations without the
