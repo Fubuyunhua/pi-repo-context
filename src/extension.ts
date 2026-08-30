@@ -84,7 +84,7 @@ export interface RegisterRepoContextOptions {
     config: RepoContextConfig;
     telemetry: RepoContextTelemetry;
   }) => RepoMapController;
-  /** Deterministic wait primitive; production uses the fixed 250 ms budget. */
+  /** Injectable wait primitive for deterministic timeout-path tests. Production waits for readiness. */
   initializationWaiter?: RepoContextInitializationWaiter;
   stdout?: (text: string) => void;
 }
@@ -335,24 +335,13 @@ function updateUi(ctx: ExtensionContext, runtime: RuntimeState): void {
   ctx.ui.setStatus(EXTENSION_ID, `repo-context v${EXTENSION_VERSION}${suffix}`);
 }
 
-const defaultInitializationWaiter: RepoContextInitializationWaiter = (initialization, budgetMs) =>
-  new Promise((resolveWait) => {
-    let settled = false;
-    const finish = (result: "ready" | "timeout") => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolveWait(result);
-    };
-    const timeout = setTimeout(() => finish("timeout"), budgetMs);
-    timeout.unref();
-    // Initialization failures are reflected by lifecycle; waking the caller is
-    // sufficient and avoids leaking internal rejection details.
-    void initialization.then(
-      () => finish("ready"),
-      () => finish("ready"),
-    );
-  });
+const defaultInitializationWaiter: RepoContextInitializationWaiter = async (initialization) => {
+  // Keep the original Tool call open until the shared cold initialization
+  // settles. Models do not reliably retry a successful warming-empty result.
+  // Failures are reflected by lifecycle and sanitized below.
+  await initialization.catch(() => undefined);
+  return "ready";
+};
 
 export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoContextOptions = {}): void {
   const configLoader = options.loadConfig ?? loadConfig;
@@ -507,6 +496,7 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
   const executeSearch = (params: { query: string; limit?: number }, deprecated: boolean) => {
     const target = runtime;
     return withActiveOperation(target, async () => {
+      target.telemetry.recordSearchAttempt();
       if (!target.initialized) throw new Error(PUBLIC_ERRORS.unavailable);
       if (target.config?.enabled === false) throw new Error(PUBLIC_ERRORS.disabled);
       if (target.lifecycle === "dormant") beginInitialization(target);
@@ -523,6 +513,7 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
             undefined,
             "warming",
           );
+          target.telemetry.recordWarmingEmptySearch();
           return {
             content: [{ type: "text" as const, text: bounded.text }],
             details: deprecated
@@ -553,6 +544,8 @@ export function registerRepoContext(pi: ExtensionAPI, options: RegisterRepoConte
           result.error === undefined ? undefined : PUBLIC_ERRORS.searchResult,
           target.lifecycle,
         );
+        if (bounded.payload.fallbackEvidence.length > 0) target.telemetry.recordFallbackSearch();
+        if (bounded.payload.results.length > 0) target.telemetry.recordIndexedResultSearch();
         return {
           content: [{ type: "text" as const, text: bounded.text }],
           details: deprecated

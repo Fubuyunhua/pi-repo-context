@@ -219,7 +219,71 @@ it("keeps enabled sessions dormant until first search", async () => {
   expect(controller.status).not.toHaveBeenCalled();
 });
 
-it("shares lazy initialization and returns deterministic warming evidence when the budget expires", async () => {
+it("keeps the cold first search open until indexed evidence is ready without requiring a retry", async () => {
+  const target = harness();
+  const start = deferred();
+  const indexed: RepoMapRuntimeQuery = {
+    ...queryResult,
+    results: [
+      {
+        path: "src/cold.ts",
+        score: 1,
+        kind: "semantic",
+        matchedSymbols: ["coldNeedle"],
+        symbols: [],
+        dependencies: [],
+      },
+    ],
+  };
+  const controller = fakeController({
+    start: vi.fn(() => start.promise),
+    query: vi.fn(async () => indexed),
+  });
+  registerRepoContext(target.pi, {
+    resolveProjectState: async () => projectState,
+    loadConfig: async () => config,
+    runtimeFactory: () => controller,
+  });
+  await target.events.get("session_start")?.[0]({}, headlessContext);
+
+  let settled = false;
+  const search = target.tools.get("repo_context_search")?.execute("one", { query: "coldNeedle" }) as Promise<{
+    details: RepoMapRuntimeQuery;
+  }>;
+  void search.then(() => {
+    settled = true;
+  });
+  await vi.waitFor(() => expect(controller.start).toHaveBeenCalledOnce());
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  expect(controller.query).not.toHaveBeenCalled();
+
+  start.resolve();
+  const first = await search;
+  expect(first.details).toMatchObject({
+    lifecycle: "ready",
+    results: [{ path: "src/cold.ts", matchedSymbols: ["coldNeedle"] }],
+  });
+  expect(controller.query).toHaveBeenCalledOnce();
+  const status = (await target.tools.get("repo_context_status")?.execute()) as {
+    details: {
+      telemetry: {
+        searchAttemptCount: number;
+        warmingEmptySearchCount: number;
+        fallbackSearchCount: number;
+        indexedResultSearchCount: number;
+      };
+    };
+  };
+  expect(status.details.telemetry).toMatchObject({
+    searchAttemptCount: 1,
+    warmingEmptySearchCount: 0,
+    fallbackSearchCount: 0,
+    indexedResultSearchCount: 1,
+  });
+});
+
+it("shares lazy initialization and returns deterministic warming evidence when an injected budget expires", async () => {
   const target = harness();
   const start = deferred();
   const controller = fakeController({ start: vi.fn(() => start.promise) });
@@ -253,12 +317,18 @@ it("shares lazy initialization and returns deterministic warming evidence when t
   expect(second.details).toMatchObject({ lifecycle: "warming" });
   expect(first).not.toHaveProperty("isError");
   const warmingStatus = (await target.tools.get("repo_context_status")?.execute()) as {
-    details: { lifecycle: string; degraded: boolean; components: { repoMap: { lifecycle: string } } };
+    details: {
+      lifecycle: string;
+      degraded: boolean;
+      components: { repoMap: { lifecycle: string } };
+      telemetry: { searchAttemptCount: number; warmingEmptySearchCount: number };
+    };
   };
   expect(warmingStatus.details).toMatchObject({
     lifecycle: "warming",
     degraded: true,
     components: { repoMap: { lifecycle: "warming" } },
+    telemetry: { searchAttemptCount: 2, warmingEmptySearchCount: 2 },
   });
   expect(controller.status).not.toHaveBeenCalled();
 

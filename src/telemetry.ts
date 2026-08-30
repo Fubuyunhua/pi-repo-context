@@ -5,6 +5,10 @@ function finiteNonnegative(value: number): number {
 
 export interface RepoContextTelemetrySnapshot {
   initializationAttemptCount: number;
+  searchAttemptCount: number;
+  warmingEmptySearchCount: number;
+  fallbackSearchCount: number;
+  indexedResultSearchCount: number;
   warmupTimeoutCount: number;
   hydrationCount: number;
   hydrationDurationMsTotal: number;
@@ -39,6 +43,10 @@ export interface RepoContextTelemetrySnapshot {
 export class RepoContextTelemetry {
   #values: RepoContextTelemetrySnapshot = {
     initializationAttemptCount: 0,
+    searchAttemptCount: 0,
+    warmingEmptySearchCount: 0,
+    fallbackSearchCount: 0,
+    indexedResultSearchCount: 0,
     warmupTimeoutCount: 0,
     hydrationCount: 0,
     hydrationDurationMsTotal: 0,
@@ -75,6 +83,18 @@ export class RepoContextTelemetry {
   }
   recordInitializationAttempt(): void {
     this.#values.initializationAttemptCount += 1;
+  }
+  recordSearchAttempt(): void {
+    this.#values.searchAttemptCount += 1;
+  }
+  recordWarmingEmptySearch(): void {
+    this.#values.warmingEmptySearchCount += 1;
+  }
+  recordFallbackSearch(): void {
+    this.#values.fallbackSearchCount += 1;
+  }
+  recordIndexedResultSearch(): void {
+    this.#values.indexedResultSearchCount += 1;
   }
   recordWarmupTimeout(): void {
     this.#values.warmupTimeoutCount += 1;

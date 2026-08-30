@@ -10,11 +10,14 @@ Session startup resolves project state and configuration only. An enabled reposi
 search or explicit rebuild. Lifecycle (`pre-session | disabled | dormant | warming | ready | failed | stopping`) is
 reported separately from persisted repository freshness (`fresh | dirty | stale | unsupported`).
 
-The first search creates exactly one runtime initialization promise. Concurrent searches share it and wait through a
-fixed 250 ms waiter. If that logical budget expires, the Tool returns a normal degraded result with `warming` lifecycle,
-stale freshness, unavailable revision fields, and explicit retry/direct-filesystem fallback evidence. Initialization
-continues. JavaScript synchronous parsing cannot be preempted, so the budget is not a hard CPU cancellation deadline.
-A settled initialization failure is sanitized and remains a hard unavailable Tool error.
+The first search creates exactly one runtime initialization promise, and concurrent searches share it. As amended for
+issue #15, the production waiter keeps each original Tool call open until that shared initialization settles so a cold
+search can return indexed evidence without requiring a model retry. Session startup remains dormant and non-blocking.
+The injectable test waiter retains the bounded timeout path: if it reports a timeout, the Tool returns a normal degraded
+result with `warming` lifecycle, stale freshness, unavailable revision fields, and explicit retry/direct-filesystem
+fallback evidence while initialization continues. A settled initialization failure is sanitized and remains a hard
+unavailable Tool error. Bounded counters separately report search attempts, warming-empty responses, responses using
+fallback evidence, and responses returning indexed results.
 
 Status and doctor do not call runtime status before initialization completes. Rebuild, shutdown, and replacement sessions
 serialize behind initialization; each constructed controller is closed at most once, and disposed session epochs cannot

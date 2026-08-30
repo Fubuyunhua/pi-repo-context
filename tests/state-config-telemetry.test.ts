@@ -79,6 +79,10 @@ it("uses new schema-1 provenance and rejects legacy generators", async () => {
 it("exposes repository-only bounded telemetry", () => {
   const telemetry = new RepoContextTelemetry();
   telemetry.recordInitializationAttempt();
+  telemetry.recordSearchAttempt();
+  telemetry.recordWarmingEmptySearch();
+  telemetry.recordFallbackSearch();
+  telemetry.recordIndexedResultSearch();
   telemetry.recordWarmupTimeout();
   telemetry.recordHydration(1);
   telemetry.recordHydratedFastReuse();
@@ -90,6 +94,10 @@ it("exposes repository-only bounded telemetry", () => {
   const snapshot = telemetry.snapshot();
   expect(snapshot).toMatchObject({
     initializationAttemptCount: 1,
+    searchAttemptCount: 1,
+    warmingEmptySearchCount: 1,
+    fallbackSearchCount: 1,
+    indexedResultSearchCount: 1,
     warmupTimeoutCount: 1,
     hydrationCount: 1,
     hydrationDurationMsTotal: 1,
