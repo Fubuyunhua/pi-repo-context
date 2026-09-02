@@ -1,31 +1,110 @@
 # pi-repo-context
 
-Repository-aware code navigation extension for Pi.
+Repository-aware code navigation extension for [Pi](https://github.com/badlogic/pi-mono).
 
-`pi-repo-context` provides revision-aware TS/JS and Java indexing, MiniSearch, Git HEAD/dirty-workspace
-freshness, durable schema-1 generations, immutable snapshot handles, Repository Graph v1, and Resolver v1.
-It is independent of `pi-context-vault` and does not require that package to be installed.
+`pi-repo-context` provides revision-aware TypeScript/JavaScript and Java indexing, repository search, Git
+HEAD/dirty-workspace freshness, durable generations, immutable snapshots, Repository Graph v1, and Resolver v1. It is
+independent of `pi-context-vault`; you do not need to install that package.
 
-## Install
+## Features
 
-Verify that the reviewed immutable `v0.1.0` tag exists before using the exact release install command:
+- Search repository files and symbols with `repo_context_search`.
+- Track Git HEAD, dirty files, pending watcher updates, and index freshness.
+- Return bounded source evidence during cold startup and stale incremental updates.
+- Index TypeScript, JavaScript, and Java repositories.
+- Keep repository state isolated below `PI_CODING_AGENT_DIR`.
+- Perform no automatic prompt or repository-context injection.
+
+## Requirements
+
+- [Pi](https://github.com/badlogic/pi-mono) `0.84.1`
+- Node.js `>=22.19.0`
+- Git, when installing directly from GitHub
+
+> [!WARNING]
+> Pi extensions execute with your user account's full system permissions. Review the source before installing it.
+
+## Installation
+
+### Install the stable release for your user
+
+The recommended installation pins the reviewed `v0.1.0` Git tag:
 
 ```bash
-git ls-remote --exit-code --tags https://github.com/Fubuyunhua/pi-repo-context.git refs/tags/v0.1.0
 pi install git:github.com/Fubuyunhua/pi-repo-context@v0.1.0
 ```
 
-The tag's presence is the source of truth for release availability; documentation alone does not publish it. For local
-development without relying on a tag:
+This adds the package to your user settings and installs its dependencies under Pi's package directory. Start a new Pi
+session in a repository after installation.
+
+To verify the tag before installing it:
+
+```bash
+git ls-remote --exit-code --tags \
+  https://github.com/Fubuyunhua/pi-repo-context.git \
+  refs/tags/v0.1.0
+```
+
+### Install for one project
+
+From the project that should use Repo Context:
+
+```bash
+cd /path/to/your/project
+pi install git:github.com/Fubuyunhua/pi-repo-context@v0.1.0 -l
+```
+
+The `-l` option records the package in `.pi/settings.json` instead of your global Pi settings. You can commit that file
+when the whole team should use the extension; Pi will ask users to trust project-local configuration before loading it.
+
+### Try it without installing
+
+```bash
+pi -e git:github.com/Fubuyunhua/pi-repo-context@v0.1.0
+```
+
+This loads the extension only for the current Pi run.
+
+### Verify the installation
+
+Start Pi in the repository you want to search, then run:
+
+```text
+/repo-context status
+```
+
+The runtime initially remains `dormant`. The first `repo_context_search` call starts repository indexing automatically.
+Use `/repo-context rebuild` only when you explicitly want to rebuild the index.
+
+### Update or remove
+
+Git tags are pinned and do not automatically move to a newer release. To install a later version, replace the tag in the
+install command:
+
+```bash
+pi install git:github.com/Fubuyunhua/pi-repo-context@<new-tag>
+```
+
+To reconcile already-installed packages or remove this package:
+
+```bash
+pi update --extensions
+pi remove git:github.com/Fubuyunhua/pi-repo-context
+```
+
+### Run the latest source locally
+
+For development or testing unreleased `main`:
 
 ```bash
 git clone https://github.com/Fubuyunhua/pi-repo-context.git
 cd pi-repo-context
 npm ci
-pi -e ./extensions/index.ts
+pi -e .
 ```
 
-Repo Context `0.1.0` is Tool-first and performs **no automatic repository-context injection**. See the
+The immutable tag is the source of truth for a stable release; documentation alone does not publish one. Repo Context
+`0.1.0` is Tool-first and performs **no automatic repository-context injection**. See the
 [`v0.1.0` release record](docs/releases/v0.1.0.md).
 
 ## Tools
